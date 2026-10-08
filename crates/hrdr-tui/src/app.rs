@@ -2838,8 +2838,8 @@ impl App {
         }
     }
 
-    /// Abort the in-flight agent task, returning anything queued behind it to
-    /// the composer. Cancel stops: it never starts the next turn.
+    /// Abort the in-flight agent task, returning queued human input to the
+    /// composer and visibly discarding peers. Cancel never starts the next turn.
     fn cancel_turn(&mut self) {
         if let Some(handle) = self.turn_handle.take() {
             handle.abort();
@@ -2883,8 +2883,18 @@ impl App {
         // Leaving them on the queue instead would have them ride out silently on
         // whatever turn came next, minutes later. The composer is the one place
         // they are visible and under the user's control.
-        let pending = self.registry.pending(hrdr_agent::MAIN_KEY);
-        self.registry.clear_pending(hrdr_agent::MAIN_KEY);
+        let pending = self.registry.drain_pending(hrdr_agent::MAIN_KEY);
+        let peer_count = pending.iter().filter(|steer| steer.peer.is_some()).count();
+        if peer_count != 0 {
+            self.push_entry(Entry::system(format!(
+                "Discarded {peer_count} queued peer messages on cancellation."
+            )));
+        }
+        let pending: Vec<String> = pending
+            .into_iter()
+            .filter(|steer| steer.peer.is_none())
+            .map(|steer| steer.display)
+            .collect();
         if pending.is_empty() {
             self.push_entry(Entry::system(hrdr_app::cancel_message(0)));
             return;
@@ -3164,7 +3174,7 @@ impl App {
     /// was said to it rather than something waiting for the main agent.
     fn take_queued_into_input(&mut self) -> bool {
         let key = self.panes.active_pane().id.key();
-        let Some(steer) = self.registry.take_newest_pending(key) else {
+        let Some(steer) = self.registry.take_newest_human_pending(key) else {
             return false;
         };
         // The recalled text is a draft again, so keep the completion popup dormant

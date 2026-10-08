@@ -76,6 +76,8 @@ pub enum AgentEvent {
     /// conversation — the frontend shows it as a user message at this point, so
     /// display order matches the model's view.
     Steered(String),
+    /// An attributed message from another session, not human input.
+    PeerDelivered { sender: PeerIdentity, text: String },
     /// The agent's TODO list was updated by the `todo` tool. Carries the full
     /// new list so a frontend or event log reader can see the state without
     /// reaching into the shared Arc.
@@ -117,6 +119,8 @@ pub struct Steer {
     /// mention becomes bytes on the user message, not text. Empty for every
     /// text-only message, which is all of them until a frontend attaches one.
     pub attachments: Vec<hrdr_llm::media::Attachment>,
+    /// Present only for peer input; no human prompt processing is applied.
+    pub peer: Option<PeerIdentity>,
 }
 
 impl Steer {
@@ -127,6 +131,7 @@ impl Steer {
             display: text.clone(),
             sent: text,
             attachments: Vec::new(),
+            peer: None,
         }
     }
 
@@ -135,6 +140,7 @@ impl Steer {
             sent: sent.into(),
             display: display.into(),
             attachments: Vec::new(),
+            peer: None,
         }
     }
 

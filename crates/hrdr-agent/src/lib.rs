@@ -92,6 +92,8 @@ pub(crate) use turn_loop::{drain_stream, is_context_overflow};
 mod agent_impl;
 mod events;
 pub use events::*;
+mod peer;
+pub use peer::{PeerIdentity, PeerMessage};
 mod compaction;
 mod turn_state;
 pub use compaction::{CompactionReport, ShrinkStage, compaction_trigger, should_auto_compact};

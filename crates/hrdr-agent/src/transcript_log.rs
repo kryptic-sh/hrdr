@@ -87,6 +87,10 @@ pub enum Record {
     Notice {
         msg: String,
     },
+    PeerDelivered {
+        sender: crate::PeerIdentity,
+        text: String,
+    },
     Steered {
         text: String,
     },
@@ -134,6 +138,10 @@ impl Record {
                 ok: *ok,
             }),
             AgentEvent::Notice(n) => Some(Record::Notice { msg: n.clone() }),
+            AgentEvent::PeerDelivered { sender, text } => Some(Record::PeerDelivered {
+                sender: sender.clone(),
+                text: text.clone(),
+            }),
             AgentEvent::Steered(s) => Some(Record::Steered { text: s.clone() }),
             AgentEvent::Usage { .. }
             | AgentEvent::History(_)
@@ -176,6 +184,10 @@ impl Record {
                 ok: *ok,
             }),
             Record::Notice { msg } => Some(AgentEvent::Notice(msg.clone())),
+            Record::PeerDelivered { sender, text } => Some(AgentEvent::PeerDelivered {
+                sender: sender.clone(),
+                text: text.clone(),
+            }),
             Record::Steered { text } => Some(AgentEvent::Steered(text.clone())),
             Record::Error { msg } => Some(AgentEvent::Notice(msg.clone())),
             Record::End { .. } => None,

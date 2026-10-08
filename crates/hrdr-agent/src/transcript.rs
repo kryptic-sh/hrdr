@@ -670,7 +670,7 @@ pub fn apply_event(transcript: &mut Vec<Entry>, ev: &AgentEvent) -> TranscriptMu
                 mutation.include(Some(index));
             }
         }
-        AgentEvent::Notice(text) => {
+        AgentEvent::Notice(text) | AgentEvent::PeerDelivered { text, .. } => {
             let index = transcript.len();
             transcript.push(Entry::system(text.clone()));
             mutation.include(Some(index));

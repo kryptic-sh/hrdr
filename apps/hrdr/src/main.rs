@@ -1094,6 +1094,28 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
     Ok(())
 }
 
+#[test]
+fn peer_event_json_preserves_sender_and_distinguishes_human_input() {
+    let sender = hrdr_agent::PeerIdentity {
+        session_id: "peer-1".into(),
+        session_name: "review\n\u{1b}".into(),
+        cwd: "repo".into(),
+        agent: "reviewer".into(),
+    };
+    let encoded = event_json(&AgentEvent::PeerDelivered {
+        sender: sender.clone(),
+        text: "framed peer text".into(),
+    });
+    assert!(!encoded.contains(['\n', '\u{1b}']));
+    let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(value["type"], "peer");
+    assert_eq!(value["sender"], serde_json::to_value(sender).unwrap());
+    assert_eq!(value["text"], "framed peer text");
+    let human: serde_json::Value =
+        serde_json::from_str(&event_json(&AgentEvent::Steered("human".into()))).unwrap();
+    assert_eq!(human, serde_json::json!({"type": "steer", "text": "human"}));
+}
+
 /// One [`AgentEvent`] as a single-line JSON object (`hrdr run --json`).
 fn event_json(ev: &AgentEvent) -> String {
     use serde_json::json;
@@ -1117,6 +1139,9 @@ fn event_json(ev: &AgentEvent) -> String {
         AgentEvent::History(msgs) => json!({"type": "history", "messages": msgs.len()}),
         AgentEvent::Notice(text) => json!({"type": "notice", "text": text}),
         AgentEvent::Steered(text) => json!({"type": "steer", "text": text}),
+        AgentEvent::PeerDelivered { sender, text } => {
+            json!({"type": "peer", "sender": sender, "text": text})
+        }
         AgentEvent::TodoUpdated(todos) => json!({"type": "todo", "todos": todos}),
         AgentEvent::Usage {
             prompt_tokens,

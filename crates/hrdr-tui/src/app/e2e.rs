@@ -2165,6 +2165,92 @@ async fn a_restored_steer_lands_above_what_is_being_typed() {
     assert_eq!(h.app.editor.content(), "queued thought\nhalf-typed");
 }
 
+fn queued_peer(body: &str) -> hrdr_agent::Steer {
+    hrdr_agent::Steer::peer(hrdr_agent::PeerMessage {
+        sender: hrdr_agent::PeerIdentity {
+            session_id: "peer-session".into(),
+            session_name: "review".into(),
+            cwd: "repo".into(),
+            agent: "reviewer".into(),
+        },
+        body: body.into(),
+    })
+}
+
+#[tokio::test]
+async fn provenance_queue_recall_skips_peers_and_preserves_their_order() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    let first = queued_peer("first peer");
+    let second = queued_peer("second peer");
+    h.app.steering.lock().unwrap().extend([
+        hrdr_agent::Steer::plain("older human"),
+        first.clone(),
+        hrdr_agent::Steer::new("expanded human", "newer human"),
+        second.clone(),
+    ]);
+    h.press(KeyCode::Up);
+    assert_eq!(h.app.editor.content(), "newer human");
+    h.app.editor.set_content("");
+    h.press(KeyCode::Up);
+    assert_eq!(h.app.editor.content(), "older human");
+    h.app.editor.set_content("");
+    assert!(
+        !h.app.take_queued_into_input(),
+        "peer-only queues cannot be recalled"
+    );
+    assert_eq!(h.app.editor.content(), "");
+    for expected in [first, second] {
+        let actual = h.app.registry.take_pending(hrdr_agent::MAIN_KEY).unwrap();
+        assert_eq!(actual.peer, expected.peer);
+        assert_eq!(actual.sent, expected.sent);
+        assert_eq!(actual.display, expected.display);
+    }
+    assert!(h.app.pending().is_empty());
+}
+
+#[tokio::test]
+async fn provenance_queue_cancel_restores_only_humans_and_reports_discarded_peers() {
+    for human in [false, true] {
+        let mut h = Harness::new(vec![]).await;
+        h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+        {
+            let mut queue = h.app.steering.lock().unwrap();
+            queue.push_back(queued_peer("peer\u{1b}[2J"));
+            if human {
+                queue.push_back(hrdr_agent::Steer::new("expanded", "human draft"));
+            }
+            queue.push_back(queued_peer("another peer"));
+        }
+        h.app.editor.set_content("typing");
+        h.app.cancel_turn();
+        assert_eq!(
+            h.app.editor.content(),
+            if human {
+                "human draft\ntyping"
+            } else {
+                "typing"
+            }
+        );
+        assert!(
+            h.app.pending().is_empty(),
+            "cancellation drains all provenance"
+        );
+        let notice = h
+            .app
+            .transcript()
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::System(text) if text.contains("Discarded 2 queued peer messages") => {
+                    Some(text)
+                }
+                _ => None,
+            });
+        assert!(notice.is_some(), "peer discards must be visible");
+        assert!(!notice.unwrap().contains('\u{1b}'));
+    }
+}
+
 /// Up on an empty box takes a queued message back for editing — and TAKES it,
 /// rather than copying it.
 #[tokio::test]

@@ -45,6 +45,14 @@ static LIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// [`AgentRegistry::next_key`] start at 1, so this never collides.
 pub const MAIN_KEY: u64 = 0;
 
+/// Queue presentation preserves peer provenance without exposing terminal controls.
+pub(crate) fn pending_display(steer: &crate::Steer) -> String {
+    match &steer.peer {
+        Some(sender) => sender.presentation(&steer.display),
+        None => steer.display.clone(),
+    }
+}
+
 /// An agent's own record of what it has emitted, in order. Shared between the
 /// running agent (which appends) and a frontend (which replays).
 ///
@@ -617,7 +625,10 @@ impl AgentRegistry {
                 // user turns — each of which carries the full system prompt and
                 // tool definitions, and would be delivered as a separate
                 // round-trip — for a burst of lines that are really one thought.
-                if let Some(last) = q.back_mut() {
+                if let Some(last) = q.back_mut()
+                    && last.peer.is_none()
+                    && msg.peer.is_none()
+                {
                     last.display.push('\n');
                     last.display.push_str(&msg.display);
                     last.sent.push('\n');
@@ -633,7 +644,8 @@ impl AgentRegistry {
         });
     }
 
-    /// What is still waiting to reach agent `key`, as the user typed it.
+    /// What is still waiting to reach agent `key`, with peers attributed and
+    /// terminal-safe rather than presented as human input.
     pub fn pending(&self, key: u64) -> Vec<String> {
         self.with(|v| {
             v.iter()
@@ -642,7 +654,7 @@ impl AgentRegistry {
                     e.steering
                         .lock()
                         .ok()
-                        .map(|q| q.iter().map(|s| s.display.clone()).collect())
+                        .map(|q| q.iter().map(pending_display).collect())
                 })
                 .unwrap_or_default()
         })
@@ -657,36 +669,35 @@ impl AgentRegistry {
         })
     }
 
-    /// Take the message at the TAIL of agent `key`'s queue — the newest thing the
-    /// user said to it, and the one they are most likely to want back.
-    ///
-    /// The counterpart to [`Self::take_pending`], which takes the head because the
-    /// agent delivers in order. This end is for a frontend handing a queued message
-    /// back to the user to edit: taking it off the queue is what stops the edited
-    /// copy from being sent twice.
-    pub fn take_newest_pending(&self, key: u64) -> Option<crate::Steer> {
+    /// Take the newest human message for editing, leaving every peer queued.
+    /// Unlike [`Self::take_pending`], this skips peer deliveries rather than
+    /// converting an agent's words into a human draft.
+    pub fn take_newest_human_pending(&self, key: u64) -> Option<crate::Steer> {
+        self.with(|v| {
+            v.iter().find(|e| e.key == key).and_then(|e| {
+                e.steering.lock().ok().and_then(|mut q| {
+                    let index = q.iter().rposition(|steer| steer.peer.is_none())?;
+                    q.remove(index)
+                })
+            })
+        })
+    }
+
+    /// Atomically take all queued messages, retaining provenance for the caller
+    /// to distinguish human drafts from peer deliveries.
+    pub fn drain_pending(&self, key: u64) -> Vec<crate::Steer> {
         self.with(|v| {
             v.iter()
                 .find(|e| e.key == key)
-                .and_then(|e| e.steering.lock().ok().and_then(|mut q| q.pop_back()))
+                .and_then(|e| e.steering.lock().ok().map(|mut q| q.drain(..).collect()))
+                .unwrap_or_default()
         })
     }
 
     /// Drop everything queued for agent `key`, returning how many were discarded
     /// (a cancelled turn must not leak them into the next one).
     pub fn clear_pending(&self, key: u64) -> usize {
-        self.with(|v| {
-            v.iter()
-                .find(|e| e.key == key)
-                .and_then(|e| {
-                    e.steering.lock().ok().map(|mut q| {
-                        let n = q.len();
-                        q.clear();
-                        n
-                    })
-                })
-                .unwrap_or(0)
-        })
+        self.drain_pending(key).len()
     }
 
     /// After a turn ends: if another message is already queued for `key`, keep the
@@ -1662,6 +1673,73 @@ mod tests {
             live.pending(1),
             vec!["next".to_string()],
             "the message is left for the next run to drain, not popped here"
+        );
+    }
+
+    fn peer_steer(sender: &str, body: &str) -> crate::Steer {
+        crate::Steer::peer(crate::PeerMessage {
+            sender: crate::PeerIdentity {
+                session_id: sender.into(),
+                session_name: sender.into(),
+                cwd: "repo".into(),
+                agent: "reviewer".into(),
+            },
+            body: body.into(),
+        })
+    }
+
+    fn assert_separate_queue(first: crate::Steer, second: crate::Steer) {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        live.enqueue(1, first.clone());
+        live.enqueue(1, second.clone());
+        for expected in [first, second] {
+            let actual = live.take_pending(1).expect("each message stays queued");
+            assert_eq!(actual.peer, expected.peer);
+            assert_eq!(actual.display, expected.display);
+            assert_eq!(actual.sent, expected.sent);
+        }
+        assert!(live.take_pending(1).is_none());
+    }
+
+    #[test]
+    fn provenance_queue_human_then_peer() {
+        assert_separate_queue(crate::Steer::plain("human"), peer_steer("a", "peer"));
+    }
+
+    #[test]
+    fn provenance_queue_peer_then_human() {
+        assert_separate_queue(peer_steer("a", "peer"), crate::Steer::plain("human"));
+    }
+
+    #[test]
+    fn provenance_queue_different_peers() {
+        assert_separate_queue(peer_steer("a", "first"), peer_steer("b", "second"));
+    }
+
+    #[test]
+    fn provenance_queue_same_peer_stays_separate() {
+        assert_separate_queue(peer_steer("a", "first"), peer_steer("a", "second"));
+    }
+
+    #[test]
+    fn provenance_queue_display_is_attributed_and_terminal_safe() {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        live.enqueue(
+            1,
+            peer_steer("sender\u{1b}[2J\u{202e}", "body\r\u{1b}[2J\u{202e}"),
+        );
+        let pending = live.pending(1);
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].contains("Peer message — not human input"));
+        assert!(pending[0].contains("sender"));
+        assert!(pending[0].contains("reviewer"));
+        assert!(pending[0].contains("body"));
+        assert!(!pending[0].contains(['\r', '\u{1b}', '\u{202e}']));
+        assert_eq!(
+            live.take_pending(1).unwrap().display,
+            "body\r\u{1b}[2J\u{202e}"
         );
     }
 

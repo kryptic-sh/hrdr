@@ -42,6 +42,8 @@ pub enum MessageOrigin {
     /// agent acts on the user's behalf.
     #[default]
     User,
+    /// A message from another session's agent, never a human turn.
+    Peer,
     /// A synthetic prompt the harness injects when the model ends its turn
     /// with no tool calls while the shared TODO list still has unfinished
     /// items — never a real user turn. See `Agent::run`'s turn loop.

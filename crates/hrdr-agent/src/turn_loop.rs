@@ -961,6 +961,19 @@ impl Agent {
         opening: bool,
         on_event: &mut F,
     ) -> Result<()> {
+        if let Some(sender) = msg.peer {
+            let text = PeerMessage {
+                sender: sender.clone(),
+                body: msg.sent,
+            }
+            .framed();
+            on_event(AgentEvent::PeerDelivered {
+                sender,
+                text: text.clone(),
+            });
+            self.push_user_message(text, MessageOrigin::Peer);
+            return Ok(());
+        }
         let mut sent = msg.sent;
         // The user's original text, before any hook/recall augmentation — recall
         // keys on what the user actually typed, not the expanded form.

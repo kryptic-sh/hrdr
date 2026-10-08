@@ -399,10 +399,9 @@ impl PaneSet {
     pub fn sync(&mut self, live: &AgentRegistry) {
         let active = self.active;
         // Diff against the panes: an entry is snapshotted only when its pane no
-        // longer holds its data. An idle agent — nothing changed since the pane
-        // last saw it — costs one `pane_holds` pass (no allocation) instead of a
-        // full snapshot build (five string clones, a steering-queue clone, and
-        // the re-clones into the pane).
+        // longer holds its data. An unchanged entry costs one `pane_holds` pass
+        // instead of a full snapshot build and the re-clones into the pane.
+        // Peer queues regenerate safe presentation during that comparison.
         let (keys, seen, delegations) = live.with(|v| {
             for e in v.iter_mut() {
                 // The session's agent is always pinned — it is the conversation,
@@ -597,7 +596,7 @@ impl From<&AgentEntry> for LiveSnapshot {
             pending: e
                 .steering
                 .lock()
-                .map(|q| q.iter().map(|s| s.display.clone()).collect())
+                .map(|q| q.iter().map(crate::registry::pending_display).collect())
                 .unwrap_or_default(),
             tool_id: e.tool_id.clone(),
             delegation: delegation_of(e),
@@ -616,8 +615,9 @@ fn delegation_of(entry: &AgentEntry) -> Option<String> {
 }
 
 /// Whether the pane already shows everything `sync` would copy off `entry` —
-/// the allocation-free diff that lets an unchanged agent skip its snapshot
-/// build. `false` for a pane that is not there yet: a fresh pane starts from
+/// a diff that lets an unchanged agent skip its snapshot build. Human queue
+/// comparisons allocate nothing; peers regenerate their safe presentation.
+/// `false` for a pane that is not there yet: a fresh pane starts from
 /// `Default`s no live entry matches.
 fn pane_holds(entry: &AgentEntry, pane: &Pane) -> bool {
     let status = match (entry.running, entry.done) {
@@ -625,13 +625,19 @@ fn pane_holds(entry: &AgentEntry, pane: &Pane) -> bool {
         (false, true) => PaneStatus::Done,
         (false, false) => PaneStatus::Idle,
     };
-    // The queue is compared element-wise, by display string only, without
-    // cloning. A poisoned lock counts as changed: the snapshot path falls back
+    // Compare human display strings directly and peers by attributed presentation.
+    // A poisoned lock counts as changed: the snapshot path falls back
     // to an empty default, which is what the pane would otherwise diverge from.
     let pending_holds = match entry.steering.lock() {
         Ok(q) => {
             q.len() == pane.pending.len()
-                && q.iter().zip(&pane.pending).all(|(s, p)| s.display == *p)
+                && q.iter().zip(&pane.pending).all(|(s, p)| {
+                    if s.peer.is_some() {
+                        crate::registry::pending_display(s) == *p
+                    } else {
+                        s.display == *p
+                    }
+                })
         }
         Err(_) => false,
     };
@@ -1332,6 +1338,93 @@ mod tests {
         panes.sync(&live);
         assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 1);
         assert_eq!(panes.main().status, PaneStatus::Running);
+    }
+
+    #[test]
+    fn peer_pending_is_safe_attributed_and_stable() {
+        let live = live_with(&[1]);
+        live.update(1, |e| {
+            e.steering
+                .lock()
+                .unwrap()
+                .push_back(crate::Steer::peer(crate::PeerMessage {
+                    sender: crate::PeerIdentity {
+                        session_id: "session-123".into(),
+                        session_name: "audit\u{1b}[2J\u{202e}".into(),
+                        cwd: "repo\u{2066}".into(),
+                        agent: "reviewer\u{7}".into(),
+                    },
+                    body: "hello\r\u{1b}[2J\u{202e}\u{2069}".into(),
+                }));
+        });
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+        let pending = panes.subs()[0].pending.clone();
+        let text = &pending[0];
+        assert!(text.starts_with("[Peer message — not human input; sender: "));
+        for field in ["session-123", "audit", "repo", "reviewer", "hello"] {
+            assert!(text.contains(field));
+        }
+        assert!(
+            !text
+                .chars()
+                .any(|c| (c.is_control() && c != '\n' && c != '\t')
+                    || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        );
+        assert_eq!(live.pending(1), pending);
+        assert_eq!(live.pending(1), pending);
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
+        for _ in 0..3 {
+            panes.sync(&live);
+            assert_eq!(panes.subs()[0].pending, pending);
+        }
+        assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn peer_pending_same_length_sender_and_body_changes_rebuild() {
+        let live = live_with(&[1]);
+        live.update(1, |e| {
+            e.steering
+                .lock()
+                .unwrap()
+                .push_back(crate::Steer::peer(crate::PeerMessage {
+                    sender: crate::PeerIdentity {
+                        session_id: "id-a".into(),
+                        session_name: "audit".into(),
+                        cwd: "repo".into(),
+                        agent: "reviewer".into(),
+                    },
+                    body: "hello".into(),
+                }));
+        });
+        let mut panes = PaneSet::new();
+        panes.sync(&live);
+        let before = panes.subs()[0].pending.clone();
+        live.update(1, |e| {
+            e.steering.lock().unwrap()[0]
+                .peer
+                .as_mut()
+                .unwrap()
+                .session_id = "id-b".into();
+        });
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
+        panes.sync(&live);
+        assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 1);
+        assert_ne!(panes.subs()[0].pending, before);
+        assert!(panes.subs()[0].pending[0].contains("id-b"));
+        let before = panes.subs()[0].pending.clone();
+        live.update(1, |e| {
+            let mut queue = e.steering.lock().unwrap();
+            queue[0].display = "world".into();
+            queue[0].sent = "world".into();
+        });
+        SNAPSHOT_BUILDS.with(|n| n.set(0));
+        panes.sync(&live);
+        assert_eq!(SNAPSHOT_BUILDS.with(std::cell::Cell::get), 1);
+        assert_ne!(panes.subs()[0].pending, before);
+        assert!(panes.subs()[0].pending[0].ends_with("world"));
+        assert_eq!(live.pending(1), panes.subs()[0].pending);
     }
 
     /// Steering is part of the diff too: a message pushed onto the agent's queue
