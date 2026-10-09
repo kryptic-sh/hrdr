@@ -826,9 +826,14 @@ fn created_cache() -> &'static Mutex<HashMap<PathBuf, u64>> {
 impl Session {
     /// Save as `<cwd-slug>/<id>.json` (the cwd comes from `self.cwd`); returns
     /// the written path.
-    pub fn save(&self, id: &str) -> Result<PathBuf> {
+    pub fn save(&self, id: &str, unix_style_paths: bool) -> Result<PathBuf> {
         let dir = session_dir(&self.state.cwd);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "creating {}",
+                hrdr_tools::display_path(&dir, unix_style_paths)
+            )
+        })?;
         let path = dir.join(format!("{}.json", sanitize_name(id)));
         // Autosave rebuilds a fresh `Session` per write; keep the original
         // creation time from the file being overwritten — from the in-process
@@ -874,11 +879,16 @@ impl Session {
             &crate::attachment_store::blob_dir(&path),
             &self.state.messages,
             &attachments,
+            unix_style_paths,
         )?;
         let json = serde_json::to_string(&self.body(created, attachments))
             .context("serializing session")?;
-        crate::write_atomic(&path, json.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
+        crate::write_atomic(&path, json.as_bytes()).with_context(|| {
+            format!(
+                "writing {}",
+                hrdr_tools::display_path(&path, unix_style_paths)
+            )
+        })?;
         // If retention had compressed this session, the plaintext we just wrote
         // is now the live copy — drop the stale `<id>.json.zst` so the two don't
         // coexist (and so a listing/load never picks the outdated compressed one).
@@ -908,10 +918,14 @@ impl Session {
     /// no cwd-slug id scheme and no open-lock, unlike [`Self::save`]). Creates
     /// parent dirs. Preserves `created` across rewrites via the same
     /// created-cache [`Self::save`] uses.
-    pub fn save_to_path(&self, path: &Path) -> Result<()> {
+    pub fn save_to_path(&self, path: &Path, unix_style_paths: bool) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating {}",
+                    hrdr_tools::display_path(parent, unix_style_paths)
+                )
+            })?;
         }
         // Keep the original creation time from any file being overwritten — from
         // the in-process cache when known (see `created_cache`), else one fallback
@@ -951,12 +965,17 @@ impl Session {
             &crate::attachment_store::blob_dir(path),
             &self.state.messages,
             &attachments,
+            unix_style_paths,
         )?;
         // Compact, not pretty — see the note in `save`.
         let json = serde_json::to_string(&self.body(created, attachments))
             .context("serializing session")?;
-        crate::write_atomic(path, json.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
+        crate::write_atomic(path, json.as_bytes()).with_context(|| {
+            format!(
+                "writing {}",
+                hrdr_tools::display_path(path, unix_style_paths)
+            )
+        })?;
         Ok(())
     }
 
@@ -1128,7 +1147,11 @@ impl Session {
     /// fork's jsonl too, so the copy opens with the same conversation on screen.
     ///
     /// Returns `(new_id, forked_session, fork_lock)`.
-    pub fn fork(cwd: &str, source_path: &Path) -> Result<(String, Session, SessionLock)> {
+    pub fn fork(
+        cwd: &str,
+        source_path: &Path,
+        unix_style_paths: bool,
+    ) -> Result<(String, Session, SessionLock)> {
         // Read the source's current on-disk snapshot WITHOUT taking its lock.
         let mut state = Self::load_path(source_path)
             .with_context(|| format!("reading {}", source_path.display()))?
@@ -1146,7 +1169,7 @@ impl Session {
         state.name = format!("{base} (fork)");
         state.id = None;
         state.cwd = cwd.to_string();
-        let outcome = crate::save_session(&state)?
+        let outcome = crate::save_session(&state, unix_style_paths)?
             .context("forked session had no user message to persist")?;
         let lock = outcome
             .open_lock
@@ -1637,14 +1660,17 @@ pub fn mint_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>>
 /// comes from `state.id` when the session already has one, otherwise a fresh
 /// collision-free id is derived from its name (see [`crate::unique_session_id`])
 /// and reported back as `first_save`.
-pub fn save_session(state: &SessionState) -> anyhow::Result<Option<SaveOutcome>> {
+pub fn save_session(
+    state: &SessionState,
+    unix_style_paths: bool,
+) -> anyhow::Result<Option<SaveOutcome>> {
     let Some(outcome) = mint_session(state)? else {
         return Ok(None);
     };
     // `persisted` consumes the state; `save_session` only holds a reference
     // (this is the once-per-session first-save path, not the per-round one), so
     // clone here.
-    Session::new(state.clone().persisted()).save(&outcome.id)?;
+    Session::new(state.clone().persisted()).save(&outcome.id, unix_style_paths)?;
     // The reservation is dropped here, and its Drop is the SOLE release of the
     // reservation lock (`.{id}.lock`, distinct from the open-lock): it removes
     // the lock only while the file still names this process's pid. That
@@ -1869,7 +1895,7 @@ mod tests {
             done: true,
         })];
         Session::new(s.clone())
-            .save_to_path(&path)
+            .save_to_path(&path, true)
             .expect("save_to_path writes the file and creates parent dirs");
         assert!(path.exists(), "the explicit-path file was written");
 
@@ -1950,7 +1976,7 @@ mod tests {
                 context_window: Some(1000),
                 ..Default::default()
             };
-            Session::new(st.clone()).save("round-trip").unwrap();
+            Session::new(st.clone()).save("round-trip", true).unwrap();
 
             let back = Session::load(&cwd, "round-trip").unwrap().state;
             // The transcript lives in the sibling jsonl, not the `.json`; `save`
@@ -1990,7 +2016,7 @@ mod tests {
                 updated: 1_700_000_000,
                 state: st.clone(),
             };
-            let path = original.save("cache-created").unwrap();
+            let path = original.save("cache-created", true).unwrap();
             assert_eq!(
                 Session::load_path(&path).unwrap().created,
                 1_700_000_000,
@@ -2011,7 +2037,7 @@ mod tests {
                 fresh.created, 1_700_000_000,
                 "sanity: Session::new did not coincidentally mint the same time"
             );
-            fresh.save("cache-created").unwrap();
+            fresh.save("cache-created", true).unwrap();
 
             let back = Session::load_path(&path).unwrap();
             assert_eq!(
@@ -2142,7 +2168,9 @@ mod tests {
                 .to_string();
             let (id, _res) = unique_session_id(&cwd, "chat");
             assert_eq!(id, "chat");
-            Session::new(state("chat", &cwd)).save("chat").unwrap();
+            Session::new(state("chat", &cwd))
+                .save("chat", true)
+                .unwrap();
             let (id, _res) = unique_session_id(&cwd, "chat");
             assert_eq!(id, "chat-2");
         });
@@ -2167,7 +2195,9 @@ mod tests {
             assert!(lock.exists(), "lock file exists after reservation");
 
             // Save leaves the lock in place; the guard releases it.
-            Session::new(state("cleanup", &cwd)).save(&id).unwrap();
+            Session::new(state("cleanup", &cwd))
+                .save(&id, true)
+                .unwrap();
             assert!(lock.exists(), "save must not remove the reservation lock");
             drop(reservation);
             assert!(!lock.exists(), "the reservation drop removed the lock");
@@ -2214,7 +2244,9 @@ mod tests {
             // is the Reservation guard's pid-guarded Drop, not `save`'s job
             // (a save that deleted the lock by path would delete a lock a second
             // instance had reclaimed).
-            Session::new(st.persisted()).save(&outcome.id).unwrap();
+            Session::new(st.persisted())
+                .save(&outcome.id, true)
+                .unwrap();
             assert!(lock.exists(), "save must not remove the reservation lock");
             // Dropping the outcome (with its reservation) releases it, and only
             // because the lock still names this process's pid.
@@ -2275,7 +2307,7 @@ mod tests {
             let cwd = tmp.path().join("p");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
-            Session::new(state("big", &cwd)).save("big").unwrap();
+            Session::new(state("big", &cwd)).save("big", true).unwrap();
             let path = session_dir(&cwd).join("big.json");
 
             // Stretch the file past the limit by appending junk.
@@ -2304,7 +2336,9 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            Session::new(state("small", &cwd)).save("small").unwrap();
+            Session::new(state("small", &cwd))
+                .save("small", true)
+                .unwrap();
             let loaded = Session::load(&cwd, "small").unwrap();
             assert_eq!(loaded.state.name, "small");
         });
@@ -2327,7 +2361,7 @@ mod tests {
                 .to_string();
             let mut st = state("Chat", &cwd);
             st.named_by_user = true;
-            Session::new(st).save("rt").unwrap();
+            Session::new(st).save("rt", true).unwrap();
             let json = session_file_path(&cwd, "rt");
             age_file(&json, 100_000);
             let before = std::fs::metadata(&json).unwrap().modified().unwrap();
@@ -2369,21 +2403,23 @@ mod tests {
 
             // (a) auto-named, older than a month → purged.
             Session::new(state("old-auto", &cwd))
-                .save("old-auto")
+                .save("old-auto", true)
                 .unwrap();
             age_file(&session_file_path(&cwd, "old-auto"), month + 1000);
             // (b) user-named, older than a month → kept, but compressed.
             let mut named = state("kept", &cwd);
             named.named_by_user = true;
-            Session::new(named).save("old-named").unwrap();
+            Session::new(named).save("old-named", true).unwrap();
             age_file(&session_file_path(&cwd, "old-named"), month + 1000);
             // (c) auto-named, older than a week but not a month → compressed only.
             Session::new(state("weekish", &cwd))
-                .save("weekish")
+                .save("weekish", true)
                 .unwrap();
             age_file(&session_file_path(&cwd, "weekish"), week + 1000);
             // (d) fresh → untouched.
-            Session::new(state("fresh", &cwd)).save("fresh").unwrap();
+            Session::new(state("fresh", &cwd))
+                .save("fresh", true)
+                .unwrap();
 
             sweep_sessions(Some(week), Some(month));
 
@@ -2421,12 +2457,12 @@ mod tests {
                 .to_string();
             let mut st = state("Chat", &cwd);
             st.named_by_user = true;
-            Session::new(st.clone()).save("resume").unwrap();
+            Session::new(st.clone()).save("resume", true).unwrap();
             let json = session_file_path(&cwd, "resume");
             compress_session_file(&json).unwrap();
             assert!(json.with_extension("json.zst").exists());
             // Resuming then autosaving rewrites plaintext and drops the stale `.zst`.
-            Session::new(st).save("resume").unwrap();
+            Session::new(st).save("resume", true).unwrap();
             assert!(json.exists(), "plaintext rewritten");
             assert!(
                 !json.with_extension("json.zst").exists(),
@@ -2444,7 +2480,7 @@ mod tests {
                 .to_string();
             let mut st = state("Chat", &cwd);
             st.named_by_user = true;
-            Session::new(st).save("resume").unwrap();
+            Session::new(st).save("resume", true).unwrap();
             let json = session_file_path(&cwd, "resume");
             compress_session_file(&json).unwrap();
             let zst = json.with_extension("json.zst");
@@ -2471,7 +2507,9 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             let month = 30 * 24 * 60 * 60;
-            Session::new(state("busy", &cwd)).save("busy").unwrap();
+            Session::new(state("busy", &cwd))
+                .save("busy", true)
+                .unwrap();
             let json = session_file_path(&cwd, "busy");
             age_file(&json, month + 1000);
             // A live instance holds the open-lock; the sweep must not touch it.
@@ -2494,7 +2532,9 @@ mod tests {
             // `subagents/` dir with a marker — the sibling data the escape would
             // wipe. The crafted file below is a zstd-compressed copy of the real
             // session's body, so it parses as a valid auto-named session.
-            Session::new(state("kept", &cwd)).save("kept").unwrap();
+            Session::new(state("kept", &cwd))
+                .save("kept", true)
+                .unwrap();
             let dir = session_dir(&cwd);
             let subagents = dir.join("subagents");
             std::fs::create_dir_all(&subagents).unwrap();
@@ -2535,7 +2575,9 @@ mod tests {
             // A genuine hrdr-written session (sanitized id) old enough to purge,
             // with the sibling transcript and the subagents dir it owns — both
             // must go with it, so the round-trip guard is not too broad.
-            Session::new(state("gone", &cwd)).save("gone").unwrap();
+            Session::new(state("gone", &cwd))
+                .save("gone", true)
+                .unwrap();
             age_file(&session_file_path(&cwd, "gone"), month + 1000);
             let transcript = session_transcript_path(&cwd, "gone");
             std::fs::write(&transcript, "transcript").unwrap();
@@ -2570,7 +2612,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             Session::new(state("Before Rename", &cwd))
-                .save("renamed")
+                .save("renamed", true)
                 .unwrap();
 
             let first = list_sessions();
@@ -2582,7 +2624,7 @@ mod tests {
             // Overwrite the same file with a different name: a fresh write,
             // so its mtime moves and the cached entry must not be reused.
             Session::new(state("After Rename", &cwd))
-                .save("renamed")
+                .save("renamed", true)
                 .unwrap();
 
             let second = list_sessions();
@@ -2611,7 +2653,7 @@ mod tests {
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
             Session::new(state("My Chat", &cwd))
-                .save("my-chat")
+                .save("my-chat", true)
                 .unwrap();
             let (id, s) = resolve_session(&cwd, "my-chat").unwrap();
             assert_eq!(id, "my-chat");
@@ -2627,7 +2669,7 @@ mod tests {
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
             Session::new(state("Work Session", &cwd))
-                .save("work")
+                .save("work", true)
                 .unwrap();
             let (id, s) = resolve_session(&cwd, "WORK SESSION").expect("case-insensitive match");
             assert_eq!(id, "work");
@@ -2645,8 +2687,12 @@ mod tests {
             let a = cwd_a.to_str().unwrap().to_string();
             let b = cwd_b.to_str().unwrap().to_string();
 
-            Session::new(state("Alpha A", &a)).save("alpha").unwrap();
-            Session::new(state("Alpha B", &b)).save("alpha").unwrap();
+            Session::new(state("Alpha A", &a))
+                .save("alpha", true)
+                .unwrap();
+            Session::new(state("Alpha B", &b))
+                .save("alpha", true)
+                .unwrap();
 
             let (_, s) = resolve_session(&a, "alpha").unwrap();
             assert_eq!(
@@ -2883,7 +2929,7 @@ mod tests {
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
             Session::new(state("My Chat", &cwd))
-                .save("my-chat")
+                .save("my-chat", true)
                 .unwrap();
             let path = session_file_path(&cwd, "my-chat");
 
@@ -2911,7 +2957,7 @@ mod tests {
             let cwd = cwd.to_str().unwrap().to_string();
             // A first save creates the session directory (and the file).
             Session::new(state("My Chat", &cwd))
-                .save("my-chat")
+                .save("my-chat", true)
                 .unwrap();
             let sdir = session_dir(&cwd);
 
@@ -2928,7 +2974,7 @@ mod tests {
             // pid-guarded Drops (`SessionLock`/`Reservation`), never by `save`
             // deleting by path.
             Session::new(state("My Chat", &cwd))
-                .save("my-chat")
+                .save("my-chat", true)
                 .unwrap();
             assert!(
                 open_lock.exists(),
@@ -2957,7 +3003,7 @@ mod tests {
             // A source session with real content.
             let mut src = state("Orig", &cwd);
             src.messages = vec![Message::user("keep me"), Message::assistant("sure")];
-            Session::new(src).save("orig").unwrap();
+            Session::new(src).save("orig", true).unwrap();
             let source_path = session_file_path(&cwd, "orig");
             // Give the source a real display transcript too, as a busy live
             // session would have: a sibling `orig.jsonl` the fork must carry.
@@ -2976,7 +3022,7 @@ mod tests {
             let source_open_lock = sdir.join(".orig.open.lock");
             assert!(source_open_lock.exists());
 
-            let (new_id, forked, fork_lock) = Session::fork(&cwd, &source_path).unwrap();
+            let (new_id, forked, fork_lock) = Session::fork(&cwd, &source_path, true).unwrap();
 
             // Distinct id, forked name, content copied.
             assert_ne!(new_id, "orig", "fork gets a fresh id");
@@ -3038,11 +3084,13 @@ mod tests {
             let cwd = tmp.path().join("p");
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
-            Session::new(state("Orig", &cwd)).save("orig").unwrap();
+            Session::new(state("Orig", &cwd))
+                .save("orig", true)
+                .unwrap();
             let source_path = session_file_path(&cwd, "orig");
 
-            let (id1, _s1, _l1) = Session::fork(&cwd, &source_path).unwrap();
-            let (id2, _s2, _l2) = Session::fork(&cwd, &source_path).unwrap();
+            let (id1, _s1, _l1) = Session::fork(&cwd, &source_path, true).unwrap();
+            let (id2, _s2, _l2) = Session::fork(&cwd, &source_path, true).unwrap();
             assert_ne!(id1, id2, "a second fork does not collide with the first");
         });
     }
@@ -3059,7 +3107,9 @@ mod tests {
             let cwd = cwd.to_str().unwrap().to_string();
 
             // Write a valid session.
-            Session::new(state("good", &cwd)).save("good").unwrap();
+            Session::new(state("good", &cwd))
+                .save("good", true)
+                .unwrap();
 
             // Write an unparseable file next to it.
             let dir = session_dir(&cwd);
@@ -3132,6 +3182,122 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn session_write_path_style_errors() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join(r"raw\cwd").display().to_string();
+            let session = Session::new(state("write diagnostics", &cwd));
+            let dir = session_dir(&cwd);
+            std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+            std::fs::write(&dir, "blocked").unwrap();
+            let blocked = tmp.path().join(r"blocked\parent");
+            std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+            std::fs::write(&blocked, "blocked").unwrap();
+            let explicit = blocked.join("child/session.json");
+            for style in [true, false] {
+                assert_eq!(
+                    session.save("write", style).unwrap_err().to_string(),
+                    format!("creating {}", hrdr_tools::display_path(&dir, style))
+                );
+                assert_eq!(
+                    session
+                        .save_to_path(&explicit, style)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "creating {}",
+                        hrdr_tools::display_path(explicit.parent().unwrap(), style)
+                    )
+                );
+            }
+            let cwd = tmp.path().join(r"target\cwd").display().to_string();
+            let mut st = state("target", &cwd);
+            st.id = Some("write".into());
+            let path = session_file_path(&cwd, "write");
+            std::fs::create_dir_all(&path).unwrap();
+            let session = Session::new(st.clone());
+            for style in [true, false] {
+                let expected = format!("writing {}", hrdr_tools::display_path(&path, style));
+                assert_eq!(
+                    session.save("write", style).unwrap_err().to_string(),
+                    expected
+                );
+                assert_eq!(
+                    session.save_to_path(&path, style).unwrap_err().to_string(),
+                    expected
+                );
+                assert_eq!(
+                    save_session(&st, style)
+                        .err()
+                        .expect("save must fail")
+                        .to_string(),
+                    expected
+                );
+                assert!(path.is_dir());
+            }
+            st.messages[0].attachments = vec![png(2, "blocked.png")];
+            let blobs = crate::attachment_store::blob_dir(&path);
+            std::fs::write(&blobs, "blocked").unwrap();
+            let session = Session::new(st.clone());
+            for style in [true, false] {
+                let expected = format!("creating {}", hrdr_tools::display_path(&blobs, style));
+                assert_eq!(
+                    session.save("write", style).unwrap_err().to_string(),
+                    expected
+                );
+                assert_eq!(
+                    session.save_to_path(&path, style).unwrap_err().to_string(),
+                    expected
+                );
+                assert_eq!(
+                    save_session(&st, style)
+                        .err()
+                        .expect("blob save must fail")
+                        .to_string(),
+                    expected
+                );
+                assert_eq!(std::fs::read_to_string(&blobs).unwrap(), "blocked");
+            }
+        });
+    }
+
+    #[test]
+    fn session_write_path_style_preserves_payload_and_target() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join(r"raw\cwd").display().to_string();
+            let st = state_with("identity", &cwd, vec![png(9, r"raw\image.png")]);
+            let session = Session::new(st.clone());
+            let refs = crate::attachment_store::attachment_refs(&st.messages);
+            let expected =
+                serde_json::to_value(session.body(session.created, refs.clone())).unwrap();
+            let path = session_file_path(&cwd, "identity");
+            let explicit = tmp.path().join(r"raw\child").join("snapshot.json");
+            for style in [true, false] {
+                assert_eq!(session.save("identity", style).unwrap(), path);
+                session.save_to_path(&explicit, style).unwrap();
+                for target in [&path, &explicit] {
+                    let actual: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
+                    assert_eq!(actual, expected);
+                    let loaded = Session::load_path(target).unwrap();
+                    assert_eq!(loaded.state.cwd, cwd);
+                    assert_eq!(
+                        serde_json::to_value(&loaded.state.messages).unwrap(),
+                        serde_json::to_value(&st.messages).unwrap()
+                    );
+                    assert_eq!(
+                        rendered(&loaded.state.messages[0]),
+                        rendered(&st.messages[0])
+                    );
+                    assert_eq!(
+                        crate::attachment_store::attachment_refs(&loaded.state.messages),
+                        refs
+                    );
+                }
+            }
+        });
+    }
+
     /// The whole point of the slice: bytes attached before a save are the same
     /// bytes, rendering the same blocks, after a resume.
     #[test]
@@ -3151,7 +3317,7 @@ mod tests {
                 .map(|a| a.bytes().to_vec())
                 .collect();
 
-            Session::new(st).save("att").unwrap();
+            Session::new(st).save("att", true).unwrap();
             let back = Session::load(&cwd, "att").unwrap();
 
             let m = &back.state.messages[0];
@@ -3201,7 +3367,7 @@ mod tests {
             second.attachments = vec![png(7, "second.png")];
             st.messages.push(second);
 
-            Session::new(st).save("dup").unwrap();
+            Session::new(st).save("dup", true).unwrap();
             assert_eq!(blobs_in(&cwd).len(), 1, "identical bytes → one blob");
 
             let back = Session::load(&cwd, "dup").unwrap();
@@ -3233,7 +3399,9 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            let path = Session::new(state("Chat", &cwd)).save("plain").unwrap();
+            let path = Session::new(state("Chat", &cwd))
+                .save("plain", true)
+                .unwrap();
 
             let json = std::fs::read_to_string(&path).unwrap();
             assert!(
@@ -3284,7 +3452,7 @@ mod tests {
             let mut st = state_with("Chat", &cwd, vec![png(3, "gone.png")]);
             st.messages[0].content =
                 Some("what is this\n\n--- Attached files ---\nImage 1: gone.png\n".into());
-            let path = Session::new(st).save("lost").unwrap();
+            let path = Session::new(st).save("lost", true).unwrap();
 
             // Delete the one blob, by name, exactly as a `rm` on the store would.
             let blobs = blobs_in(&cwd);
@@ -3314,7 +3482,7 @@ mod tests {
 
             // Saving again records no reference for it, so a second resume has
             // nothing left to lose and does not annotate the text twice.
-            Session::new(back.state.clone()).save("lost").unwrap();
+            Session::new(back.state.clone()).save("lost", true).unwrap();
             let again = Session::load(&cwd, "lost").unwrap();
             assert!(again.state.attachment_losses.is_empty());
             assert_eq!(again.state.messages[0].content.as_deref(), Some(text));
@@ -3331,7 +3499,7 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             let path = Session::new(state_with("Chat", &cwd, vec![png(5, "bad.png")]))
-                .save("corrupt")
+                .save("corrupt", true)
                 .unwrap();
             let name = blobs_in(&cwd).remove(0);
             // Still a valid PNG header, still the right length — only the checksum
@@ -3375,13 +3543,13 @@ mod tests {
             let mut only_mine = Message::user("mine");
             only_mine.attachments = vec![png(2, "only-mine.png")];
             doomed.messages.push(only_mine);
-            Session::new(doomed).save("doomed").unwrap();
+            Session::new(doomed).save("doomed", true).unwrap();
 
             // User-named → survives the purge (it is compressed instead), and
             // references the same image bytes as the doomed one.
             let mut keeper = state_with("keeper", &cwd, vec![png(1, "shared.png")]);
             keeper.named_by_user = true;
-            Session::new(keeper).save("keeper").unwrap();
+            Session::new(keeper).save("keeper", true).unwrap();
 
             let shared = crate::AttachmentRef::of(&png(1, "x.png")).sha256;
             let orphan = crate::AttachmentRef::of(&png(2, "x.png")).sha256;
@@ -3471,7 +3639,7 @@ mod tests {
 
             let started = std::time::Instant::now();
             Session::new(state_with("Chat", &cwd, vec![png(1, "shot.png")]))
-                .save("att")
+                .save("att", true)
                 .unwrap();
             let elapsed = started.elapsed();
 
@@ -3513,7 +3681,9 @@ mod tests {
             let _held = crate::attachment_store::lock_blob_store(&dir).unwrap();
 
             let started = std::time::Instant::now();
-            Session::new(state("Chat", &cwd)).save("plain").unwrap();
+            Session::new(state("Chat", &cwd))
+                .save("plain", true)
+                .unwrap();
             let elapsed = started.elapsed();
 
             // The same timing assertion from the other side (see the note there):
@@ -3540,7 +3710,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         Session::new(state_with("Child", "/tmp", vec![png(3, "shot.png")]))
-            .save_to_path(&path)
+            .save_to_path(&path, true)
             .unwrap();
         let elapsed = started.elapsed();
 
@@ -3571,7 +3741,7 @@ mod tests {
                 .to_string();
             let month = 30 * 24 * 60 * 60;
             Session::new(state_with("doomed", &cwd, vec![png(1, "a.png")]))
-                .save("doomed")
+                .save("doomed", true)
                 .unwrap();
             let digest = crate::AttachmentRef::of(&png(1, "a.png")).sha256;
             std::fs::write(session_dir(&cwd).join("broken.json"), "not valid json").unwrap();
@@ -3764,7 +3934,7 @@ mod roundtrip_audit {
                 .to_string();
             // Save the snapshot (messages + metadata, no transcript).
             let st = state("Jsonl Rebuild", &cwd);
-            Session::new(st).save("jsonl-rebuild").unwrap();
+            Session::new(st).save("jsonl-rebuild", true).unwrap();
 
             // Write the sibling transcript as the live path would: a user turn, a
             // reply, and a tool call with args + result.
@@ -3913,7 +4083,7 @@ mod roundtrip_audit {
 
             let mut st = state("Reasoning", &cwd);
             st.messages.push(assistant);
-            Session::new(st).save("reasoning").unwrap();
+            Session::new(st).save("reasoning", true).unwrap();
 
             let back = Session::load(&cwd, "reasoning").unwrap().state;
             assert_eq!(
@@ -3938,7 +4108,7 @@ mod roundtrip_audit {
 
             let mut st = state("Thinking", &cwd);
             st.messages.push(assistant);
-            Session::new(st).save("thinking").unwrap();
+            Session::new(st).save("thinking", true).unwrap();
 
             let back = Session::load(&cwd, "thinking").unwrap().state;
             assert_eq!(

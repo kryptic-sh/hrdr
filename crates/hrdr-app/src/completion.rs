@@ -552,7 +552,7 @@ mod tests {
         hrdr_test_support::with_test_env(|tmp| {
             let cwd = tmp.path().join("proj").to_string_lossy().to_string();
             crate::Session::new(state("First", &cwd))
-                .save("first")
+                .save("first", true)
                 .unwrap();
             assert_eq!(vals("/resume fir"), vec!["first"]);
 
@@ -567,7 +567,7 @@ mod tests {
             // …a session saved mid-typing (same prefix) is picked up by the
             // change signature, not hidden behind the memo.
             crate::Session::new(state("Second", &cwd))
-                .save("second")
+                .save("second", true)
                 .unwrap();
             assert_eq!(vals("/resume sec"), vec!["second"]);
 

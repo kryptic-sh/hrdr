@@ -856,8 +856,8 @@ mod tests {
                 name: "wrong identity".to_string(),
                 ..Default::default()
             });
-            let saved = session.save("path-style-lookup").unwrap();
-            let other = decoy.save("path-style-lookup").unwrap();
+            let saved = session.save("path-style-lookup", true).unwrap();
+            let other = decoy.save("path-style-lookup", true).unwrap();
             assert_ne!(saved, other);
             for style in [true, false] {
                 let mut host = TestHost::new(cwd.clone());
@@ -1059,7 +1059,7 @@ mod tests {
                     messages: vec![hrdr_agent::Message::user("hi")],
                     ..Default::default()
                 };
-                crate::Session::new(state).save("path-style").unwrap();
+                crate::Session::new(state).save("path-style", true).unwrap();
                 let path = crate::session_file_path(&cwd.to_string_lossy(), "path-style");
                 let broken = path.parent().unwrap().join("broken.json");
                 std::fs::write(&broken, "{{{").unwrap();

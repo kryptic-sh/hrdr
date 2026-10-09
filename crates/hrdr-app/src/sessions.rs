@@ -135,7 +135,9 @@ mod tests {
             std::fs::create_dir(&cwd).unwrap();
             let cwd = cwd.to_str().unwrap().to_string();
 
-            Session::new(state("valid", &cwd)).save("valid").unwrap();
+            Session::new(state("valid", &cwd))
+                .save("valid", true)
+                .unwrap();
             // Derive the session directory from a public path helper (the private
             // `session_dir` used before the move now lives in hrdr-agent).
             let dir = crate::session_file_path(&cwd, "valid")
@@ -167,7 +169,9 @@ mod tests {
                 .join(r"literal\name")
                 .to_string_lossy()
                 .into_owned();
-            Session::new(state("valid", &cwd)).save("valid").unwrap();
+            Session::new(state("valid", &cwd))
+                .save("valid", true)
+                .unwrap();
             let path = crate::session_file_path(&cwd, "valid");
             let broken = path.parent().unwrap().join("broken.json");
             std::fs::write(&broken, "{{{").unwrap();
@@ -202,12 +206,16 @@ mod tests {
     /// (importantly) no file is written.
     #[test]
     fn save_session_skips_conversations_with_no_user_message() {
-        assert!(save_session(&SessionState::default()).unwrap().is_none());
+        assert!(
+            save_session(&SessionState::default(), true)
+                .unwrap()
+                .is_none()
+        );
         let assistant_only = SessionState {
             messages: vec![hrdr_agent::Message::assistant("hi there")],
             ..Default::default()
         };
-        assert!(save_session(&assistant_only).unwrap().is_none());
+        assert!(save_session(&assistant_only, true).unwrap().is_none());
     }
 
     #[test]

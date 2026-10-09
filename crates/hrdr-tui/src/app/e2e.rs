@@ -2593,6 +2593,52 @@ async fn history_snapshot_persists_the_session_mid_turn() {
     );
 }
 
+#[tokio::test]
+async fn session_write_path_style_save_done_keeps_spawn_preference() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let cwd = h.app.current_cwd();
+    let id = "path-style-failure";
+    h.app.state_mut().id = Some(id.into());
+    let path = hrdr_app::session_file_path(&cwd, id);
+    std::fs::create_dir_all(&path).unwrap();
+    for style in [true, false] {
+        h.app.cfg.unix_style_paths = style;
+        h.app
+            .persist_mid_turn(vec![hrdr_agent::Message::user(r"raw\message")]);
+        assert!(h.app.save_in_flight);
+        h.app
+            .persist_mid_turn(vec![hrdr_agent::Message::user(r"pending\message")]);
+        assert!(h.app.pending_save.is_some());
+        h.app.cfg.unix_style_paths = !style;
+        h.wait_for("first failed save", |msg| {
+            matches!(msg, TurnMsg::SaveDone(_))
+        })
+        .await;
+        assert_eq!(
+            h.app.session_save_error.as_deref(),
+            Some(format!("writing {}", hrdr_tools::display_path(&path, style)).as_str())
+        );
+        assert!(h.app.save_in_flight, "pending snapshot was promoted");
+        assert!(h.app.pending_save.is_none());
+        h.wait_for("pending failed save", |msg| {
+            matches!(msg, TurnMsg::SaveDone(_))
+        })
+        .await;
+        assert_eq!(
+            h.app.session_save_error.as_deref(),
+            Some(format!("writing {}", hrdr_tools::display_path(&path, !style)).as_str())
+        );
+        assert!(!h.app.save_in_flight);
+        assert_eq!(h.app.state().cwd, cwd);
+        assert_eq!(
+            h.app.state().messages[0].content.as_deref(),
+            Some(r"pending\message")
+        );
+        assert!(path.is_dir());
+    }
+}
+
 /// A `/resume` of a session another live instance holds open refuses to open it
 /// directly, but arms an offer to open a forked copy — and pressing `f` mints
 /// the copy, swaps it in as the active session, and leaves the busy original
@@ -2611,7 +2657,7 @@ async fn a_busy_resume_offers_a_fork_that_f_accepts() {
         messages: vec![hrdr_agent::Message::user("hello there")],
         ..Default::default()
     };
-    let outcome = hrdr_app::save_session(&st).unwrap().unwrap();
+    let outcome = hrdr_app::save_session(&st, true).unwrap().unwrap();
     let busy_id = outcome.id.clone();
     // The other instance's grip on the source — keep it held for the whole test.
     let _other = outcome.open_lock.expect("first save takes the open-lock");
@@ -2677,7 +2723,7 @@ async fn a_busy_resume_offer_is_cancelled_by_any_other_key() {
         messages: vec![hrdr_agent::Message::user("hello there")],
         ..Default::default()
     };
-    let outcome = hrdr_app::save_session(&st).unwrap().unwrap();
+    let outcome = hrdr_app::save_session(&st, true).unwrap().unwrap();
     let busy_id = outcome.id.clone();
     let _other = outcome.open_lock.expect("first save takes the open-lock");
     let path = hrdr_app::session_file_path(&cwd, &busy_id);

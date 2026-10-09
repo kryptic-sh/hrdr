@@ -45,8 +45,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/export` overwrite refusals and `/edit` success notices also style their path
   labels without changing export targets or editor arguments. Wire-log rotation
   warnings retain a structured raw path until the agent renders the notice with
-  its active preference; other warning text remains verbatim. Access checks, LSP
-  protocol paths, and diagnostic message text remain unchanged. Stale-read
+  its active preference; other warning text remains verbatim. Session and
+  attachment-blob write failures also honor the setting. In-flight saves retain
+  their captured preference; pending saves use the preference when they start,
+  without adding presentation state to persisted session data. Access checks,
+  LSP protocol paths, and diagnostic message text remain unchanged. Stale-read
   errors preserve the original culprit command. Headline caches refresh on
   configuration reload, which also updates subsequent main-agent tool calls and
   newly spawned children; existing children retain their own setting. Unix

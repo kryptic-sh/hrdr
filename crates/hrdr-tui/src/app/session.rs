@@ -164,7 +164,7 @@ impl super::App {
             self.system(hrdr_app::RESUME_BUSY_MSG);
             return;
         }
-        match hrdr_app::Session::fork(&self.current_cwd(), path) {
+        match hrdr_app::Session::fork(&self.current_cwd(), path, self.unix_style_paths()) {
             Ok((new_id, session, lock)) => {
                 self.active_lock = Some(lock); // releases the previous session's lock
                 self.apply_session(new_id.clone(), session);
@@ -221,7 +221,7 @@ impl super::App {
         }
         // No id yet (near-unreachable — `reserve_session_id` runs at turn
         // start): mint + write synchronously, exactly as before.
-        let saved = hrdr_app::save_session(self.state());
+        let saved = hrdr_app::save_session(self.state(), self.unix_style_paths());
         if let Some(mut o) = self.record_session_save(saved) {
             // On the first save this session's id is minted and its open-lock is
             // taken — hold it. `None` on every later save, so this never clobbers.
@@ -359,7 +359,7 @@ impl super::App {
             return;
         }
         // No id yet: mint + write synchronously, unchanged.
-        let saved = hrdr_app::save_session(self.state());
+        let saved = hrdr_app::save_session(self.state(), self.unix_style_paths());
         if let Some(mut o) = self.record_session_save(saved) {
             // Hold the freshly-minted session's open-lock, if this was the mint.
             if let Some(lock) = o.open_lock.take() {
@@ -414,12 +414,13 @@ impl super::App {
         self.save_in_flight = true;
         let tx = self.tx.clone();
         let save_done = self.save_done.clone();
+        let unix_style_paths = self.unix_style_paths();
         tokio::spawn(async move {
             // `_reservation` is dropped when the task ends — after the write
             // attempt, whatever its outcome. On success `Session::save` already
             // removed the lock; on failure the drop cleans it up.
             let _reservation = reservation;
-            let res = hrdr_app::Session::new(snapshot.persisted()).save(&id);
+            let res = hrdr_app::Session::new(snapshot.persisted()).save(&id, unix_style_paths);
             let _ = tx
                 .send(TurnMsg::SaveDone(
                     res.map(|p| p.display().to_string())

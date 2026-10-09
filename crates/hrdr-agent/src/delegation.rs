@@ -224,6 +224,7 @@ struct RunSnapshot {
     model: crate::ModelRef,
     base_url: String,
     cwd: String,
+    unix_style_paths: bool,
 }
 
 impl RunSnapshot {
@@ -251,7 +252,7 @@ impl RunSnapshot {
             todos: Vec::new(),
             ..Default::default()
         };
-        let _ = crate::Session::new(state.persisted()).save_to_path(path);
+        let _ = crate::Session::new(state.persisted()).save_to_path(path, self.unix_style_paths);
     }
 }
 
@@ -423,6 +424,7 @@ async fn spawn_background(
         model: cfg.model.clone(),
         base_url: cfg.base_url.clone(),
         cwd: cfg.cwd.display().to_string(),
+        unix_style_paths: cfg.unix_style_paths,
     };
     // Build and register synchronously so `task_steer` can address the id as soon as
     // `task` returns; registration inside the spawned future races the caller.

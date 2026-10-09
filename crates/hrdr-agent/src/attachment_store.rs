@@ -226,11 +226,21 @@ pub fn attachment_refs(messages: &[Message]) -> Vec<MessageAttachments> {
 /// contents, so there is nothing a rewrite could change. Its mtime is refreshed
 /// instead, which costs one `utimes` and is what keeps a blob that is still in
 /// use out of reach of [`sweep_blobs`]'s grace window.
-pub fn write_blobs(dir: &Path, messages: &[Message], refs: &[MessageAttachments]) -> Result<()> {
+pub fn write_blobs(
+    dir: &Path,
+    messages: &[Message],
+    refs: &[MessageAttachments],
+    unix_style_paths: bool,
+) -> Result<()> {
     if refs.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| {
+        format!(
+            "creating {}",
+            hrdr_tools::display_path(dir, unix_style_paths)
+        )
+    })?;
     for entry in refs {
         let Some(message) = messages.get(entry.message) else {
             continue;
@@ -241,8 +251,12 @@ pub fn write_blobs(dir: &Path, messages: &[Message], refs: &[MessageAttachments]
                 let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
                 continue;
             }
-            crate::write_atomic(&path, a.bytes())
-                .with_context(|| format!("writing {}", path.display()))?;
+            crate::write_atomic(&path, a.bytes()).with_context(|| {
+                format!(
+                    "writing {}",
+                    hrdr_tools::display_path(&path, unix_style_paths)
+                )
+            })?;
         }
     }
     Ok(())
@@ -400,6 +414,37 @@ mod tests {
         m
     }
 
+    #[test]
+    fn blob_write_path_style_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join(r"raw\blocked");
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, "blocked").unwrap();
+        let messages = vec![user_with(vec![attachment(16, "shot.png")])];
+        let mut refs = attachment_refs(&messages);
+        for style in [true, false] {
+            assert_eq!(
+                write_blobs(&blocked, &messages, &refs, style)
+                    .unwrap_err()
+                    .to_string(),
+                format!("creating {}", hrdr_tools::display_path(&blocked, style))
+            );
+        }
+        let dir = tmp.path().join(r"raw\blobs");
+        // An oversized component forces a real write failure without permissions
+        // (which administrators can bypass) or platform-specific symlink rights.
+        refs[0].files[0].sha256 = "a".repeat(300);
+        let path = dir.join(&refs[0].files[0].sha256);
+        for style in [true, false] {
+            assert_eq!(
+                write_blobs(&dir, &messages, &refs, style)
+                    .unwrap_err()
+                    .to_string(),
+                format!("writing {}", hrdr_tools::display_path(&path, style))
+            );
+        }
+    }
+
     /// The reference's digest is the bytes' own SHA-256 — the same value the
     /// store has always derived by hashing them, now served from the
     /// attachment's construction-time digest.
@@ -420,7 +465,7 @@ mod tests {
         let b = attachment(16, "two.png");
         let messages = vec![user_with(vec![a]), user_with(vec![b])];
         let refs = attachment_refs(&messages);
-        write_blobs(dir.path(), &messages, &refs).unwrap();
+        write_blobs(dir.path(), &messages, &refs, true).unwrap();
         let files: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
@@ -436,7 +481,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let messages = vec![user_with(vec![attachment(16, "shot.png")])];
         let refs = attachment_refs(&messages);
-        write_blobs(dir.path(), &messages, &refs).unwrap();
+        write_blobs(dir.path(), &messages, &refs, true).unwrap();
         let digest = &refs[0].files[0].sha256;
         // Same length, different bytes — so only the checksum can catch it.
         let mut tampered = png(16);
@@ -461,7 +506,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let messages = vec![user_with(vec![attachment(64, "shot.png")])];
         let refs = attachment_refs(&messages);
-        write_blobs(dir.path(), &messages, &refs).unwrap();
+        write_blobs(dir.path(), &messages, &refs, true).unwrap();
         std::fs::write(dir.path().join(&refs[0].files[0].sha256), png(4)).unwrap();
         let mut restored = vec![Message::user("look")];
         let losses = resolve_attachments(dir.path(), &refs, &mut restored);
@@ -496,7 +541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let messages = vec![user_with(vec![attachment(16, "kept.png")])];
         let refs = attachment_refs(&messages);
-        write_blobs(dir.path(), &messages, &refs).unwrap();
+        write_blobs(dir.path(), &messages, &refs, true).unwrap();
         let kept = refs[0].files[0].sha256.clone();
 
         let dead = "b".repeat(64);
