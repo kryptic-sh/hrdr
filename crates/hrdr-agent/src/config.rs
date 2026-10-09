@@ -883,7 +883,7 @@ impl FileConfig {
     /// disables a whole subsystem. Documented sentinels (`request_timeout = 0`
     /// disables the timeout; a zero compaction reserve / preserve budget) are
     /// left to [`AgentConfig::validate_semantics`] or accepted outright.
-    pub(crate) fn validate(&self) -> Vec<String> {
+    pub(crate) fn validate(&self, unix_style_paths: bool) -> Vec<String> {
         let mut errors = Vec::new();
         let mut require_min1 = |value: Option<u64>, field: &str, what: &str| {
             if value == Some(0) {
@@ -934,6 +934,7 @@ impl FileConfig {
         // narrow the sandbox, so they are refused outright.
         for root in &self.sandbox_writable_roots {
             if !std::path::Path::new(root).is_absolute() {
+                let root = hrdr_tools::display_path(std::path::Path::new(root), unix_style_paths);
                 errors.push(format!(
                     "sandbox_writable_roots entries must be absolute paths: {root:?}"
                 ));
@@ -1188,6 +1189,12 @@ pub fn canonical_providers(
     out
 }
 
+fn diagnostic_path_style(root: &toml::Table) -> bool {
+    root.get("unix_style_paths")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true)
+}
+
 /// The startup refusal for a config naming ONE provider twice — `[providers.anthropic]`
 /// beside `[providers.claude]`, `[providers.codex]` beside `[providers.chatgpt]`, and
 /// so on. `Some(message)` names both spellings and the one name they fold onto.
@@ -1216,7 +1223,7 @@ pub fn provider_alias_collision_error(text: &str, path: &std::path::Path) -> Opt
                  they are two spellings of one provider, not two providers.\n  \
                  Keep one of them (`[providers.{canonical}]` is the canonical spelling) \
                  and delete the other.",
-                path.display(),
+                hrdr_tools::display_path(path, diagnostic_path_style(&root)),
             ));
         }
         seen.insert(canonical, name.clone());
@@ -1523,11 +1530,16 @@ pub fn config_file_errors(path: &std::path::Path) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    let style = text
+        .parse::<toml::Table>()
+        .as_ref()
+        .map(diagnostic_path_style)
+        .unwrap_or(true);
     match toml::from_str::<FileConfig>(&text) {
-        Ok(fc) => fc.validate(),
+        Ok(fc) => fc.validate(style),
         Err(e) => vec![format!(
             "{}: could not parse config file: {e}",
-            path.display()
+            hrdr_tools::display_path(path, style)
         )],
     }
 }
@@ -1565,6 +1577,17 @@ impl AgentConfig {
         }
     }
 
+    /// Reload using the active config's path style for diagnostics, even when
+    /// the incoming file requests a different style. Successful loads keep the
+    /// incoming setting.
+    pub fn reload_checked(unix_style_paths: bool) -> Result<Self> {
+        let (cfg, diags) = Self::load_diagnosed_with_style(Some(unix_style_paths));
+        match diags.error_message() {
+            Some(msg) => bail!(msg),
+            None => Ok(cfg),
+        }
+    }
+
     /// The one loader [`load`](Self::load) and [`load_checked`](Self::load_checked)
     /// delegate to: merge defaults ← file ← env and return the config alongside
     /// every problem found. Infallible — the config is always the best-effort
@@ -1572,6 +1595,10 @@ impl AgentConfig {
     /// what a hard [error](ConfigDiagnostics::errors) (refuse to start) versus a
     /// [warning](ConfigDiagnostics::warnings) (report and continue) should do.
     pub fn load_diagnosed() -> (Self, ConfigDiagnostics) {
+        Self::load_diagnosed_with_style(None)
+    }
+
+    fn load_diagnosed_with_style(diagnostic_style: Option<bool>) -> (Self, ConfigDiagnostics) {
         let mut cfg = Self::default();
         let mut diags = ConfigDiagnostics::default();
         // Read + parse the file directly (not via `read_config_file`, which folds a
@@ -1580,24 +1607,30 @@ impl AgentConfig {
         let file_spec = match config_file_path()
             .and_then(|p| std::fs::read_to_string(&p).ok().map(|text| (p, text)))
         {
-            Some((path, text)) => match toml::from_str::<FileConfig>(&text) {
-                Ok(fc) => {
-                    // File values are hard errors (see the module docs): reject
-                    // out-of-range ones by field, but still apply the rest so the
-                    // report is complete rather than first-error-wins.
-                    diags.errors.extend(fc.validate());
-                    let spec = fc.model.clone();
-                    cfg.apply_file(fc);
-                    spec
+            Some((path, text)) => {
+                let style = diagnostic_style.unwrap_or_else(|| {
+                    text.parse::<toml::Table>()
+                        .as_ref()
+                        .map(diagnostic_path_style)
+                        .unwrap_or(true)
+                });
+                match toml::from_str::<FileConfig>(&text) {
+                    Ok(fc) => {
+                        // Reject invalid fields but apply the rest for a complete report.
+                        diags.errors.extend(fc.validate(style));
+                        let spec = fc.model.clone();
+                        cfg.apply_file(fc);
+                        spec
+                    }
+                    Err(e) => {
+                        diags.errors.push(format!(
+                            "{}: could not parse config file: {e}",
+                            hrdr_tools::display_path(&path, style)
+                        ));
+                        None
+                    }
                 }
-                Err(e) => {
-                    diags.errors.push(format!(
-                        "{}: could not parse config file: {e}",
-                        path.display()
-                    ));
-                    None
-                }
-            },
+            }
             None => None,
         };
         // Env overrides are warnings: an invalid one is reported and the current
@@ -2385,6 +2418,80 @@ mod persistence_tests {
     use super::*;
 
     #[test]
+    fn config_diagnostic_path_style_preserves_parse_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(r"diagnostics\config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (setting, style) in [
+            ("unix_style_paths = true\n", true),
+            ("unix_style_paths = false\n", false),
+            ("", true),
+            ("unix_style_paths = 'false'\n", true),
+            ("unix_style_paths = false\nbroken = [\n", true),
+        ] {
+            let text = format!("{setting}max_tokens = 'C:\\reason\\unchanged'\n");
+            std::fs::write(&path, &text).unwrap();
+            let reason = toml::from_str::<FileConfig>(&text)
+                .err()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                config_file_errors(&path),
+                vec![format!(
+                    "{}: could not parse config file: {reason}",
+                    hrdr_tools::display_path(&path, style)
+                )],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_diagnostic_path_style_aliases_and_raw_roots() {
+        let path = std::path::Path::new(r"C:\config\config.toml");
+        for (setting, style) in [
+            ("unix_style_paths = true\n", true),
+            ("unix_style_paths = false\n", false),
+            ("", true),
+            ("unix_style_paths = 'false'\n", true),
+        ] {
+            let text = format!("{setting}[providers.claude]\n[providers.anthropic]\n");
+            let error = provider_alias_collision_error(&text, path).unwrap();
+            assert!(error.starts_with(&format!(
+                "hrdr: {} defines the same provider twice.",
+                hrdr_tools::display_path(path, style)
+            )));
+            assert!(
+                error.contains("[providers.anthropic] and [providers.claude] are both `claude`")
+            );
+        }
+        assert!(
+            provider_alias_collision_error("unix_style_paths = false\nbroken = [", path).is_none()
+        );
+        for style in [true, false] {
+            let root = r"relative\root";
+            let fc = FileConfig {
+                sandbox_writable_roots: vec![
+                    root.into(),
+                    std::env::current_dir()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ],
+                ..Default::default()
+            };
+            let label = hrdr_tools::display_path(std::path::Path::new(root), style);
+            assert_eq!(
+                fc.validate(style),
+                vec![format!(
+                    "sandbox_writable_roots entries must be absolute paths: {label:?}"
+                )]
+            );
+            assert_eq!(fc.sandbox_writable_roots[0], root);
+        }
+    }
+
+    #[test]
     fn config_mutation_path_style_create_failure() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("blocked");
@@ -2818,7 +2925,7 @@ mod sandbox_tests {
             ],
             ..Default::default()
         };
-        let errors = fc.validate();
+        let errors = fc.validate(true);
         assert_eq!(errors.len(), 2, "{errors:?}");
         for entry in ["relative/path", "~/.cargo"] {
             assert!(
@@ -2834,7 +2941,7 @@ mod sandbox_tests {
             sandbox_writable_roots: vec![ABSOLUTE_ROOT.to_string()],
             ..Default::default()
         };
-        assert!(fc.validate().is_empty());
+        assert!(fc.validate(true).is_empty());
     }
 
     /// **A key nobody recognises is an error, not a shrug.** Serde ignores
@@ -2881,7 +2988,7 @@ mod sandbox_tests {
     fn the_millisecond_spellings_are_rejected_with_the_converted_value() {
         let fc: FileConfig =
             toml::from_str("[[hooks]]\nrun = \"x\"\ntimeout_ms = 120000\n").unwrap();
-        let errors = fc.validate();
+        let errors = fc.validate(true);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("hooks.timeout_ms"), "{}", errors[0]);
         assert!(
@@ -2891,16 +2998,16 @@ mod sandbox_tests {
         );
 
         let fc: FileConfig = toml::from_str("[lsp]\nwait_ms = 2000\n").unwrap();
-        let errors = fc.validate();
+        let errors = fc.validate(true);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("wait_secs = 2"), "{}", errors[0]);
 
         // Sub-second values still name a usable floor rather than `= 0`.
         let fc: FileConfig = toml::from_str("[lsp]\nwait_ms = 500\n").unwrap();
         assert!(
-            fc.validate()[0].contains("wait_secs = 1"),
+            fc.validate(true)[0].contains("wait_secs = 1"),
             "{:?}",
-            fc.validate()
+            fc.validate(true)
         );
     }
 

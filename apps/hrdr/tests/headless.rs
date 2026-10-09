@@ -126,6 +126,53 @@ fn run_hrdr_inner_with_home(
     cmd.output().expect("spawn hrdr")
 }
 
+#[test]
+fn config_diagnostic_path_style_startup_refusals() {
+    let server = MockServer::start(vec![]);
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("hrdr/config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for (setting, style) in [
+        ("unix_style_paths = true\n", true),
+        ("unix_style_paths = false\n", false),
+        ("", true),
+        ("unix_style_paths = 'false'\n", true),
+        ("unix_style_paths = false\nbroken = [\n", true),
+    ] {
+        let text = format!("{setting}max_tokens = 'C:\\reason\\unchanged'\n");
+        std::fs::write(&path, &text).unwrap();
+        let out = run_hrdr_with_home(&server, home.path(), &["run", "unused"]);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        let errors = hrdr_agent::config_file_errors(&path);
+        assert_eq!(errors.len(), 1);
+        assert!(stderr.contains(&errors[0]), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "{}: could not parse config file:",
+                hrdr_tools::display_path(&path, style)
+            )),
+            "{stderr}"
+        );
+        if setting == "unix_style_paths = true\n"
+            || setting == "unix_style_paths = false\n"
+            || setting.is_empty()
+        {
+            assert!(stderr.contains(r"C:\reason\unchanged"), "{stderr}");
+        }
+    }
+    for style in [true, false] {
+        let text =
+            format!("unix_style_paths = {style}\n[providers.claude]\n[providers.anthropic]\n");
+        std::fs::write(&path, &text).unwrap();
+        let out = run_hrdr_with_home(&server, home.path(), &["run", "unused"]);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        let error = hrdr_agent::provider_alias_collision_error(&text, &path).unwrap();
+        assert_eq!(stderr.trim_end(), error);
+    }
+}
+
 /// A scripted plain-text turn: one text delta, a stop, the DONE sentinel.
 fn text_turn(text: &str) -> Chat {
     Chat::Sse(vec![

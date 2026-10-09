@@ -59,11 +59,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Credentials, canonical provider keys, and best-effort refresh behavior remain
   unchanged. Windows sandbox-wrapper spawn failures inherit the invoking tool's
   preference without rewriting executable arguments or captured child output.
-  Access checks, LSP protocol paths, and diagnostic message text remain
-  unchanged. Stale-read errors preserve the original culprit command. Headline
-  caches refresh on configuration reload, which also updates subsequent
-  main-agent tool calls and newly spawned children; existing children retain
-  their own setting. Unix rendering, stored tool arguments/results, file
+  Startup config diagnostics recover a boolean preference from valid TOML even
+  when other fields are invalid, defaulting to `true` otherwise. Failed reloads
+  use the active preference; successful reloads apply the new one. Config
+  filenames and invalid writable-root labels are styled without changing parser
+  excerpts or raw validation. Access checks, LSP protocol paths, and diagnostic
+  message text remain unchanged. Stale-read errors preserve the original culprit
+  command. Headline caches refresh on configuration reload, which also updates
+  subsequent main-agent tool calls and newly spawned children; existing children
+  retain their own setting. Unix rendering, stored tool arguments/results, file
   contents, and filesystem targets are unchanged. Other path presentation
   surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`

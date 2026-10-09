@@ -2857,7 +2857,7 @@ impl App {
     /// Re-load config and apply it. On an invalid file, keep the current
     /// settings and warn instead of resetting.
     fn apply_config_reload(&mut self, manual: bool) {
-        match AgentConfig::load_checked() {
+        match AgentConfig::reload_checked(self.cfg.unix_style_paths) {
             Ok(cfg) => {
                 self.apply_runtime_config(&cfg, &hrdr_app::UiConfig::load());
                 self.cfg = cfg;

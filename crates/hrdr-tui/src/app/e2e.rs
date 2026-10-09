@@ -9837,6 +9837,73 @@ async fn path_style_completion_nonpath_rows_stay_verbatim() {
 }
 
 #[tokio::test]
+async fn config_diagnostic_path_style_reload_failures_keep_active_state() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let path = hrdr_agent::config_file_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for active in [true, false] {
+        std::fs::write(&path, format!("unix_style_paths = {active}\n")).unwrap();
+        h.app.apply_config_reload(true);
+        let dir = h.app.dir.clone();
+        let bell = h.app.bell;
+        for manual in [true, false] {
+            for text in [
+                format!(
+                    "unix_style_paths = {}\nmax_tokens = 'C:\\reason\\unchanged'\n",
+                    !active
+                ),
+                "unix_style_paths = 'false'\n".into(),
+                "unix_style_paths = false\nbroken = [\n".into(),
+                format!(
+                    "unix_style_paths = {}\nsandbox_writable_roots = ['relative\\root']\n",
+                    !active
+                ),
+            ] {
+                std::fs::write(&path, &text).unwrap();
+                let expected = hrdr_agent::AgentConfig::reload_checked(active)
+                    .err()
+                    .unwrap();
+                let expected = hrdr_app::reload_invalid_message(&expected);
+                h.app.config_mtime = None;
+                if manual {
+                    h.submit("/reload").await;
+                } else {
+                    h.app.maybe_reload_config();
+                }
+                assert_eq!(h.app.toasts.last_body(), Some(expected.as_str()), "{text}");
+                assert_eq!(h.app.cfg.unix_style_paths, active);
+                assert_eq!(h.app.dir, dir);
+                assert_eq!(h.app.bell, bell);
+                assert_eq!(
+                    h.app.config_mtime,
+                    Some(std::fs::metadata(&path).unwrap().modified().unwrap())
+                );
+                let diagnostic = if text.contains("sandbox_writable_roots") {
+                    let label =
+                        hrdr_tools::display_path(std::path::Path::new(r"relative\root"), active);
+                    format!("sandbox_writable_roots entries must be absolute paths: {label:?}")
+                } else {
+                    format!(
+                        "{}: could not parse config file:",
+                        hrdr_tools::display_path(&path, active)
+                    )
+                };
+                assert!(expected.contains(&diagnostic), "{expected}");
+            }
+        }
+        std::fs::write(&path, format!("unix_style_paths = {}\n", !active)).unwrap();
+        h.app.config_mtime = None;
+        h.app.maybe_reload_config();
+        assert_eq!(h.app.cfg.unix_style_paths, !active);
+        assert_eq!(
+            h.app.config_mtime,
+            Some(std::fs::metadata(&path).unwrap().modified().unwrap())
+        );
+    }
+}
+
+#[tokio::test]
 async fn config_mutation_path_style_tui_forwarding_and_mtime() {
     let _home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;

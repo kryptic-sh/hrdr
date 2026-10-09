@@ -6423,7 +6423,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let errors = fc.validate();
+        let errors = fc.validate(true);
         for field in [
             "max_readonly_subagents",
             "max_write_subagents",
@@ -6454,7 +6454,7 @@ mod tests {
             compaction_reserved: Some(0), // valid: no reserve buffer
             ..Default::default()
         };
-        assert!(fc.validate().is_empty(), "{:?}", fc.validate());
+        assert!(fc.validate(true).is_empty(), "{:?}", fc.validate(true));
     }
 
     /// A context window that cannot fit its compaction reserve is a semantic
@@ -6531,7 +6531,7 @@ mod tests {
 
         // Rung 2 — config.toml.
         let fc: FileConfig = toml::from_str("max_attachment_bytes = 20000000\n").unwrap();
-        assert!(fc.validate().is_empty(), "{:?}", fc.validate());
+        assert!(fc.validate(true).is_empty(), "{:?}", fc.validate(true));
         cfg.apply_file(fc);
         assert_eq!(cfg.max_attachment_bytes, Some(20_000_000));
 

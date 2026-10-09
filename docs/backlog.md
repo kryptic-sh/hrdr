@@ -2513,37 +2513,15 @@ and **not** fixed.
 - **LSP `diagnostics_note` compares paths case-sensitively.** A model-supplied
   path whose case differs from the workspace root gets no diagnostics on a
   case-insensitive filesystem.
-- **Finish Windows path presentation — reported 2026-10-09.** Extend
-  `hrdr_tools::display_path` and the existing `unix_style_paths` boolean to ALL
-  remaining hrdr-rendered path values. The setting defaults to `true` (`/`);
-  `false` selects `\` on Windows, with Linux/macOS unchanged. Mutation success
-  and refusal labels (including stale-read errors), skipped-file lists, diff
-  paths, built-in filesystem tool headlines, read/search/listing labels and
-  filesystem provenance, shared sandbox/secret/swap guard labels, LSP labels,
-  overflow pointers, cwd chrome, session-picker cwd rows, command/status output,
-  reload/resume notices, default editor notices, session listings, login storage
-  notices, theme source labels, skill base-directory footers, and command/skill
-  discovery source labels already use it. Generated system-prompt cwd/sandbox
-  roots, skipped-AGENTS notices, and memory headings/pointers also use it and
-  refresh on style changes with memory enabled or disabled. Memory-tool fallback
-  listing roots and malformed-memory error paths also use it, as do profile
-  discovery/collision notices and delegation cwd refusals. Attachment
-  diagnostics, clipboard file-URI refusals, generated `@file` headers, and
-  attached directory labels also use it. File-completion popup labels restyle
-  without changing insertion values or ranking. Startup trust-screen and
-  headless jail-notice cwd labels also use it. Remaining work includes
-  lower-level storage/configuration errors and a final audit for missed UI
-  labels. Bootstrap policy awaits a decision: recover a correctly typed
-  preference from valid TOML when possible, otherwise default to `true`; retain
-  the active setting for failed live reloads. This is proposed, not implemented.
-  Live reload updates subsequent main-agent tool calls and newly spawned
-  children; existing children retain their own setting. Cwd/picker caches
-  restyle on reload. Keep this display-only: do not change filesystem targets or
-  literal Unix backslashes. Preserve unified-diff prefix semantics. Never
-  rewrite file bodies, user prose, or captured shell output. Cover both settings
-  and unchanged Unix behavior at each real rendering seam, including
-  config-to-agent wiring. Complete these presentation surfaces before moving to
-  the newly prioritized self-update tool.
+- **Path presentation verification follow-up.** Run the config-diagnostic
+  changes on Linux/macOS CI and finish the final consumer audit before declaring
+  every path surface covered. Startup diagnostics recover a typed preference
+  from valid TOML or default to `true`; failed reloads retain the active style.
+  The reload regression exercises manual dispatch and the mtime handler, not the
+  watcher/event loop; successful hot-reload notices and independently exact
+  reload parser reasons are not asserted. Preserve filesystem identities, Unix
+  literal backslashes, parser excerpts, protocol URIs, and captured shell
+  output.
 - **Unix completion filename identity:** `walk_files_gitignore` and
   `walk_files_fallback` in `hrdr-app/src/util.rs` unconditionally replace
   literal backslashes with `/` in matching/insertion candidates. This predates
