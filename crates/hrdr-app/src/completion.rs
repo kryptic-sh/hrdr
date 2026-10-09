@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `hrdr-agent::session`).
 struct ResumeSessionCache {
     prefix: String,
+    unix_style_paths: bool,
     signature: Vec<(String, SystemTime)>,
     sessions: Vec<crate::SessionMeta>,
 }
@@ -51,8 +52,9 @@ static RESUME_SESSION_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResumeS
     std::sync::OnceLock::new();
 
 /// The `/resume` session rows for `prefix`, served from the memo when the
-/// prefix and the sessions tree are unchanged.
-fn resume_sessions(prefix: &str) -> Vec<crate::SessionMeta> {
+/// prefix, path style and the sessions tree are unchanged. Completion currently
+/// displays only id/name, but the cached metadata also carries read diagnostics.
+fn resume_sessions(prefix: &str, unix_style_paths: bool) -> Vec<crate::SessionMeta> {
     let signature = resume_session_signature();
     let mut guard = RESUME_SESSION_CACHE
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -60,13 +62,15 @@ fn resume_sessions(prefix: &str) -> Vec<crate::SessionMeta> {
         .unwrap_or_else(|p| p.into_inner());
     if let Some(cached) = guard.as_ref()
         && cached.prefix == prefix
+        && cached.unix_style_paths == unix_style_paths
         && cached.signature == signature
     {
         return cached.sessions.clone();
     }
-    let sessions = crate::list_sessions();
+    let sessions = crate::list_sessions(unix_style_paths);
     *guard = Some(ResumeSessionCache {
         prefix: prefix.to_string(),
+        unix_style_paths,
         signature,
         sessions: sessions.clone(),
     });
@@ -280,7 +284,7 @@ pub fn arg_completions(
                 rows.push(("reset".to_string(), "back to the default".to_string()));
                 rows
             }
-            "resume" => resume_sessions(&input[..arg_start])
+            "resume" => resume_sessions(&input[..arg_start], unix_style_paths)
                 .into_iter()
                 .map(|m| (m.id, m.name))
                 .collect(),
@@ -574,6 +578,42 @@ mod tests {
             // A second call on the unchanged tree serves the memo.
             assert_eq!(vals("/resume sec"), vec!["second"]);
             assert_eq!(vals("/resume ").len(), 2);
+        });
+    }
+
+    #[test]
+    fn resume_completion_restyles_cached_errors_without_changing_rows() {
+        hrdr_test_support::with_test_env(|tmp| {
+            let cwd = tmp.path().join(r"raw\cwd").to_string_lossy().into_owned();
+            let path = crate::Session::new(state(r"Raw\name", &cwd))
+                .save("valid", true)
+                .unwrap();
+            let broken = path.parent().unwrap().join("broken.json");
+            let json = r#"{"version":"C:\\reason\\unchanged"}"#;
+            std::fs::write(&broken, json).unwrap();
+            let reason = serde_json::from_str::<crate::Session>(json)
+                .unwrap_err()
+                .to_string();
+            let rows = arg_completions("/resume ", &[], true).unwrap();
+            for style in [true, false, true] {
+                assert_eq!(arg_completions("/resume ", &[], style).unwrap(), rows);
+                let metas = resume_sessions("/resume ", style);
+                let bad = metas.iter().find(|m| m.id == "broken").unwrap();
+                assert_eq!(
+                    bad.error.as_deref(),
+                    Some(
+                        format!(
+                            "parsing {}: {reason}",
+                            hrdr_tools::display_path(&broken, style)
+                        )
+                        .as_str()
+                    )
+                );
+                let good = metas.iter().find(|m| m.id == "valid").unwrap();
+                assert_eq!(good.cwd, cwd);
+                assert_eq!(good.name, r"Raw\name");
+                assert_eq!(good.path, path);
+            }
         });
     }
 

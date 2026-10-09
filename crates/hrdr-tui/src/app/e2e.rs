@@ -2584,8 +2584,8 @@ async fn history_snapshot_persists_the_session_mid_turn() {
         .id
         .clone()
         .expect("the mid-turn snapshot assigned a session id");
-    let loaded =
-        hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written mid-turn");
+    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id, true)
+        .expect("session file written mid-turn");
     assert_eq!(
         loaded.state.messages.len(),
         snapshot.len(),
@@ -2701,9 +2701,9 @@ async fn a_busy_resume_offers_a_fork_that_f_accepts() {
     );
 
     // The busy original is untouched: still its old name, still locked.
-    let src = hrdr_app::Session::load(&cwd, &busy_id).expect("source file intact");
+    let src = hrdr_app::Session::load(&cwd, &busy_id, true).expect("source file intact");
     assert_eq!(src.state.name, "Other", "source not renamed by the fork");
-    match hrdr_app::Session::open_path(&path) {
+    match hrdr_app::Session::open_path(&path, true) {
         Err(hrdr_app::OpenError::Busy { .. }) => {}
         other => panic!("source's open-lock was disturbed: {other:?}"),
     }
@@ -2761,7 +2761,8 @@ async fn autosave_writes_the_state_and_it_loads_back_identically() {
         .id
         .clone()
         .expect("autosave assigned a session id");
-    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written");
+    let loaded =
+        hrdr_app::Session::load(&h.app.current_cwd(), &id, true).expect("session file written");
 
     // The transcript is rebuilt from the sibling jsonl — the fold of the agent's
     // event stream — so what persists is the model's own output: the user turn,
@@ -2836,7 +2837,7 @@ async fn session_save_lands_off_thread_after_the_turn() {
         !h.app.save_in_flight && h.app.pending_save.is_none(),
         "the coalescer drained every queued save"
     );
-    let loaded = hrdr_app::Session::load(&cwd, &id).expect("the save landed");
+    let loaded = hrdr_app::Session::load(&cwd, &id, true).expect("the save landed");
     assert!(
         loaded.state.messages.iter().any(|m| m
             .content
@@ -3610,7 +3611,7 @@ async fn resume_notices_do_not_accumulate() {
             .count()
     };
     let saved_notices = |id: &str, cwd: &str| {
-        hrdr_app::Session::load(cwd, id)
+        hrdr_app::Session::load(cwd, id, true)
             .unwrap()
             .state
             .transcript
@@ -3622,7 +3623,7 @@ async fn resume_notices_do_not_accumulate() {
 
     // Resume the session repeatedly, autosaving each time as a real run would.
     for round in 1..=3 {
-        let session = hrdr_app::Session::load(&cwd, &id).unwrap();
+        let session = hrdr_app::Session::load(&cwd, &id, true).unwrap();
         h.app.apply_session(id.clone(), session);
         h.app.autosave();
         // The resume's autosave is written off-thread; wait for it before
@@ -3703,7 +3704,7 @@ async fn clear_and_new_take_a_session_name() {
     );
     let cwd = h.app.current_cwd();
     assert_eq!(
-        hrdr_app::Session::load(&cwd, "project-x")
+        hrdr_app::Session::load(&cwd, "project-x", true)
             .unwrap()
             .state
             .name,
@@ -6952,7 +6953,7 @@ async fn reserve_session_id_defers_the_first_write_off_thread() {
         .expect("the id is claimed synchronously");
     // The write is off-thread; wait for it to land before reading the file.
     h.app.await_saves().await;
-    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id)
+    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id, true)
         .expect("session file written after the deferred save");
     assert_eq!(
         loaded
@@ -8139,7 +8140,8 @@ async fn cancelling_a_turn_autosaves_the_in_progress_transcript() {
         .id
         .clone()
         .expect("cancel_turn autosaved and assigned a session id");
-    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written");
+    let loaded =
+        hrdr_app::Session::load(&h.app.current_cwd(), &id, true).expect("session file written");
     assert!(
         loaded
             .state
@@ -8200,7 +8202,8 @@ async fn quitting_mid_turn_autosaves_the_in_progress_transcript() {
         .id
         .clone()
         .expect("quitting mid-turn autosaved and assigned a session id");
-    let loaded = hrdr_app::Session::load(&h.app.current_cwd(), &id).expect("session file written");
+    let loaded =
+        hrdr_app::Session::load(&h.app.current_cwd(), &id, true).expect("session file written");
     assert!(
         loaded
             .state
@@ -8716,7 +8719,7 @@ async fn bang_runs_a_user_shell_command_and_records_it() {
         .id
         .clone()
         .expect("the !command's autosave assigned a session id");
-    let loaded = hrdr_app::Session::load(&cwd, &id).expect("session file written on ToolEnd");
+    let loaded = hrdr_app::Session::load(&cwd, &id, true).expect("session file written on ToolEnd");
     assert!(
         loaded.state.messages.iter().any(|m| {
             m.content
@@ -9830,6 +9833,163 @@ async fn path_style_completion_nonpath_rows_stay_verbatim() {
 }
 
 #[tokio::test]
+async fn session_read_diagnostics_restyle_on_reload_without_rewriting_files() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let cwd = h.app.current_cwd();
+    let broken = hrdr_app::session_file_path(&cwd, "broken");
+    std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+    let json = r#"{"version":"C:\\reason\\unchanged"}"#;
+    std::fs::write(&broken, json).unwrap();
+    let reason = serde_json::from_str::<hrdr_app::Session>(json)
+        .unwrap_err()
+        .to_string();
+    let mtime = std::fs::metadata(&broken).unwrap().modified().unwrap();
+    h.app.session_selector = Some(crate::app::session_selector(hrdr_app::list_sessions(true)));
+    h.app.session_selector.as_mut().unwrap().push_char('b');
+    h.render();
+    for style in [false, true] {
+        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
+            .unwrap();
+        h.app.apply_config_reload(true);
+        let expected_path = hrdr_tools::display_path(&broken, style);
+        let expected = format!("parsing {expected_path}: {reason}");
+        let sel = h.app.session_selector.as_ref().unwrap();
+        assert_eq!(sel.filter, "b");
+        assert_eq!(sel.selected, 0);
+        let meta = sel.current().unwrap();
+        assert_eq!(meta.path, broken);
+        assert_eq!(meta.id, "broken");
+        assert_eq!(meta.error.as_deref(), Some(expected.as_str()));
+        h.render();
+        assert_eq!(
+            h.app.session_rows.as_ref().unwrap().rows[0].4.as_deref(),
+            Some(expected.as_str())
+        );
+        h.app.resume_locked_path("broken".into(), &broken);
+        assert_eq!(
+            h.app.toasts.last_body(),
+            Some(format!("can't load session broken: parsing {expected_path}").as_str())
+        );
+        h.app.fork_session("broken".into(), &broken);
+        assert_eq!(
+            h.app.toasts.last_body(),
+            Some(
+                format!("couldn't fork session broken: reading {expected_path}: {expected}")
+                    .as_str()
+            )
+        );
+        assert_eq!(h.app.current_cwd(), cwd);
+        assert!(h.app.state().id.is_none());
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), json);
+        assert_eq!(
+            std::fs::metadata(&broken).unwrap().modified().unwrap(),
+            mtime
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_style_reload_repairs_metadata_and_preserves_picker_snapshot() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let broken = h._tmp.path().join("broken.json");
+    std::fs::write(&broken, "{{{").unwrap();
+    let meta = |id: &str| hrdr_app::SessionMeta {
+        id: id.into(),
+        name: id.into(),
+        cwd: String::new(),
+        updated: 0,
+        path: h._tmp.path().join(format!("{id}.json")),
+        error: None,
+    };
+    let mut corrupt = meta("broken");
+    corrupt.name.clear();
+    corrupt.error = Some(format!(
+        "{:#}",
+        hrdr_app::Session::load_path(&broken, true).unwrap_err()
+    ));
+    let choices = vec![corrupt, meta("match-a"), meta("match-b"), meta("hidden")];
+    let paths: Vec<_> = choices.iter().map(|m| m.path.clone()).collect();
+    h.app.session_selector = Some(crate::app::session_selector(choices));
+    let sel = h.app.session_selector.as_mut().unwrap();
+    for c in "match".chars() {
+        sel.push_char(c);
+    }
+    sel.down();
+    assert_eq!(sel.selected, 1);
+    assert_eq!(sel.current().unwrap().path, paths[2]);
+    h.render();
+
+    let mut repaired = hrdr_app::Session::new(hrdr_app::SessionState {
+        name: "match repaired".into(),
+        cwd: h
+            ._tmp
+            .path()
+            .join("searchable-workspace")
+            .to_string_lossy()
+            .into_owned(),
+        ..Default::default()
+    });
+    repaired.updated = 1_700_000_000;
+    std::fs::write(&broken, serde_json::to_vec(&repaired).unwrap()).unwrap();
+    for style in [false, true] {
+        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
+            .unwrap();
+        h.app.apply_config_reload(true);
+        let sel = h.app.session_selector.as_ref().unwrap();
+        assert_eq!(sel.filter, "match");
+        assert_eq!(sel.current().unwrap().path, paths[2]);
+        let fixed = sel
+            .rows()
+            .find(|m| m.path == broken)
+            .expect("repaired name searchable");
+        assert_eq!(fixed.id, "broken");
+        assert_eq!(fixed.name, repaired.state.name);
+        assert_eq!(fixed.cwd, repaired.state.cwd);
+        assert_eq!(fixed.updated, repaired.updated);
+        assert_eq!(fixed.error, None);
+        h.render();
+        let row = &h.app.session_rows.as_ref().unwrap().rows[0];
+        assert_eq!(row.0, "broken");
+        assert_eq!(row.1, repaired.state.name);
+        assert_eq!(row.4, None);
+    }
+    let sel = h.app.session_selector.as_mut().unwrap();
+    while !sel.filter.is_empty() {
+        sel.backspace();
+    }
+    assert_eq!(
+        sel.rows().map(|m| m.path.clone()).collect::<Vec<_>>(),
+        paths
+    );
+    for c in "searchable-workspace".chars() {
+        sel.push_char(c);
+    }
+    assert_eq!(sel.rows().count(), 1);
+    assert_eq!(sel.current().unwrap().path, broken);
+    for c in "no-such-session".chars() {
+        sel.push_char(c);
+    }
+    assert!(sel.current().is_none());
+    let empty_filter = sel.filter.clone();
+    h.render();
+    hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(false)).unwrap();
+    h.app.apply_config_reload(true);
+    let sel = h.app.session_selector.as_mut().unwrap();
+    assert_eq!(sel.filter, empty_filter);
+    assert!(sel.current().is_none());
+    assert_eq!(sel.selected, 0);
+    while !sel.filter.is_empty() {
+        sel.backspace();
+    }
+    assert_eq!(
+        sel.rows().map(|m| m.path.clone()).collect::<Vec<_>>(),
+        paths
+    );
+}
+
+#[tokio::test]
 async fn path_style_reload_updates_cwd_chrome_and_warm_session_picker() {
     let _home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
@@ -10587,7 +10747,7 @@ async fn failed_model_switch_autosaves_billed_usage_with_rolled_back_history() {
         Some("original short tail")
     );
 
-    let saved = hrdr_app::Session::load(&h.app.current_cwd(), &id).unwrap();
+    let saved = hrdr_app::Session::load(&h.app.current_cwd(), &id, true).unwrap();
     assert_eq!(saved.state.model, outgoing);
     assert_eq!(saved.state.usage.tokens_in, 110);
     assert_eq!(saved.state.usage.tokens_out, 55);

@@ -106,7 +106,9 @@ impl super::App {
         // another hrdr window — falls through to a fresh start. Auto-resume never
         // hard-errors on a busy candidate: a jarring startup error is the wrong
         // UX; only an explicit `/resume` refuses.
-        if let Ok(Some((id, session, lock))) = hrdr_app::open_latest_session_for_cwd(&cwd) {
+        if let Ok(Some((id, session, lock))) =
+            hrdr_app::open_latest_session_for_cwd(&cwd, self.unix_style_paths())
+        {
             self.active_lock = Some(lock);
             self.auto_resume_state(session.state, id);
         }
@@ -121,7 +123,7 @@ impl super::App {
     /// the current session and its lock untouched. On success the old lock is
     /// dropped as the new one is stored.
     pub(super) fn resume_locked_path(&mut self, id: String, path: &std::path::Path) {
-        match hrdr_app::Session::open_path(path) {
+        match hrdr_app::Session::open_path(path, self.unix_style_paths()) {
             Ok((session, lock)) => {
                 // A running turn holds the agent lock; `apply_session` would
                 // reject the swap. Drop the freshly-taken lock and keep the

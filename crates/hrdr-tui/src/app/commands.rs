@@ -539,7 +539,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn begin_session_selector(&mut self) {
         // Every directory's sessions, newest first — the cwd column tells them
         // apart, and the fuzzy filter narrows by it too.
-        let sessions = hrdr_app::list_sessions();
+        let sessions = hrdr_app::list_sessions(self.app.unix_style_paths());
         if sessions.is_empty() {
             self.info(format!(
                 "no saved sessions yet in {}",

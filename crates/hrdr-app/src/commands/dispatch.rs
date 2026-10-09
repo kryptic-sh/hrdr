@@ -479,7 +479,11 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 host.info(RESUME_BUSY_MSG.to_string());
                 return true;
             }
-            match crate::resolve_session(&host.cwd().display().to_string(), &arg) {
+            match crate::resolve_session(
+                &host.cwd().display().to_string(),
+                &arg,
+                host.unix_style_paths(),
+            ) {
                 Some((id, session)) => host.resume(id, session),
                 None => host.info(format!("no session matching '{arg}' (see /resume)")),
             }
@@ -1062,16 +1066,33 @@ mod tests {
                 crate::Session::new(state).save("path-style", true).unwrap();
                 let path = crate::session_file_path(&cwd.to_string_lossy(), "path-style");
                 let broken = path.parent().unwrap().join("broken.json");
-                std::fs::write(&broken, "{{{").unwrap();
-                let error = crate::list_sessions()
-                    .into_iter()
-                    .find(|m| m.error.is_some())
-                    .unwrap()
-                    .error
-                    .unwrap();
-                for style in [true, false] {
+                let json = r#"{"version":"C:\\reason\\unchanged"}"#;
+                std::fs::write(&broken, json).unwrap();
+                let reason = serde_json::from_str::<crate::Session>(json)
+                    .unwrap_err()
+                    .to_string();
+                assert!(reason.contains(r"\\reason"));
+                for style in [true, false, true] {
+                    let error = format!(
+                        "parsing {}: {reason}",
+                        hrdr_tools::display_path(&broken, style)
+                    );
+                    assert_eq!(
+                        crate::list_sessions(style)
+                            .into_iter()
+                            .find(|m| m.error.is_some())
+                            .unwrap()
+                            .error,
+                        Some(error.clone())
+                    );
                     host.unix_style_paths = style;
                     host.begin_session_selector();
+                    assert!(
+                        host.info_log
+                            .last()
+                            .unwrap()
+                            .contains(&format!("broken — [unreadable: {error}]"))
+                    );
                     assert!(host.info_log.last().unwrap().contains(&format!(
                         "path-style — path-style  [{}]",
                         hrdr_tools::display_path(&cwd, style)

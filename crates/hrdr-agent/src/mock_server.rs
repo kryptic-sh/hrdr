@@ -6212,7 +6212,7 @@ async fn a_delegated_subagent_is_handed_the_image_it_was_given() {
         .map(|e| e.path())
         .find(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
         .expect("a sibling <stem>.json state file was written");
-    let session = crate::Session::load_path(&json_path).expect("the snapshot loads back");
+    let session = crate::Session::load_path(&json_path, true).expect("the snapshot loads back");
     assert!(
         session.state.attachment_losses.is_empty(),
         "nothing was lost on the way back: {:?}",
@@ -6524,7 +6524,7 @@ async fn background_subagent_persists_its_own_session_state() {
         .find(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
         .expect("a sibling <stem>.json state file was written");
 
-    let session = crate::Session::load_path(&json_path).expect("the snapshot loads back");
+    let session = crate::Session::load_path(&json_path, true).expect("the snapshot loads back");
     // The sub-agent's own turn is in the model-facing history.
     assert!(
         session

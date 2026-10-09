@@ -536,6 +536,21 @@ pub struct SessionMeta {
     pub error: Option<String>,
 }
 
+impl SessionMeta {
+    /// Read listing metadata without resolving transcript sidecars or attachment blobs.
+    pub fn read_path(path: &Path, unix_style_paths: bool) -> Result<Self> {
+        let session = Session::parse_path(path, unix_style_paths)?;
+        Ok(Self {
+            id: session_id_from_path(path).unwrap_or_default(),
+            name: session.state.name,
+            cwd: session.state.cwd,
+            updated: session.updated,
+            path: path.to_path_buf(),
+            error: None,
+        })
+    }
+}
+
 // ── Reservation guard ─────────────────────────────────────────────────────────
 
 /// An owned reservation guard that prevents two processes from claiming the
@@ -848,7 +863,8 @@ impl Session {
         let created = match cached {
             Some(c) => c,
             None => {
-                let c = Self::load_path(&path).map_or(self.created, |prev| prev.created);
+                let c = Self::load_path(&path, unix_style_paths)
+                    .map_or(self.created, |prev| prev.created);
                 if let Ok(mut cache) = created_cache().lock() {
                     cache.entry(path.clone()).or_insert(c);
                 }
@@ -937,7 +953,8 @@ impl Session {
         let created = match cached {
             Some(c) => c,
             None => {
-                let c = Self::load_path(path).map_or(self.created, |prev| prev.created);
+                let c = Self::load_path(path, unix_style_paths)
+                    .map_or(self.created, |prev| prev.created);
                 if let Ok(mut cache) = created_cache().lock() {
                     cache.entry(path.to_path_buf()).or_insert(c);
                 }
@@ -981,14 +998,14 @@ impl Session {
 
     /// Load `<cwd-slug>/<id>.json`; if that doesn't exist, try the compressed
     /// `<cwd-slug>/<id>.json.zst` (retention may have compressed an idle session).
-    pub fn load(cwd: &str, id: &str) -> Result<Session> {
+    pub fn load(cwd: &str, id: &str, unix_style_paths: bool) -> Result<Session> {
         let stem = sanitize_name(id);
         let json = session_dir(cwd).join(format!("{}.json", stem));
         let zst = session_dir(cwd).join(format!("{}.json.zst", stem));
         if json.exists() {
-            Self::load_path(&json)
+            Self::load_path(&json, unix_style_paths)
         } else {
-            Self::load_path(&zst)
+            Self::load_path(&zst, unix_style_paths)
         }
     }
 
@@ -1001,8 +1018,8 @@ impl Session {
     /// eliminate the TOCTOU race between stat and open. The limit is enforced
     /// on the metadata length *and* on the bytes actually read (in case the
     /// file grew between the checks).
-    pub fn load_path(path: &Path) -> Result<Session> {
-        let mut session = Self::parse_path(path)?;
+    pub fn load_path(path: &Path, unix_style_paths: bool) -> Result<Session> {
+        let mut session = Self::parse_path(path, unix_style_paths)?;
         // The transcript is no longer embedded in the `.json` (see
         // `SessionState::transcript`). Rebuild it from the sibling `<id>.jsonl` —
         // the append-only fold of the agent's event stream — through the SAME
@@ -1045,11 +1062,21 @@ impl Session {
     /// (`sweep_dir`) wants the unresolved form on its own — its mark phase only
     /// needs to know which digests are still spoken for, and resolving would pull
     /// every attachment in every surviving session into memory to learn it.
-    fn parse_path(path: &Path) -> Result<Session> {
-        let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    fn parse_path(path: &Path, unix_style_paths: bool) -> Result<Session> {
+        let f = std::fs::File::open(path).with_context(|| {
+            format!(
+                "opening {}",
+                hrdr_tools::display_path(path, unix_style_paths)
+            )
+        })?;
         let len = f
             .metadata()
-            .with_context(|| format!("reading metadata for {}", path.display()))?
+            .with_context(|| {
+                format!(
+                    "reading metadata for {}",
+                    hrdr_tools::display_path(path, unix_style_paths)
+                )
+            })?
             .len();
         // A `.json.zst` file is zstd-compressed (retention compressed an idle
         // session); decode it through the same output cap. The limit for a
@@ -1059,16 +1086,25 @@ impl Session {
         let is_compressed = path.extension().and_then(|e| e.to_str()) == Some("zst");
         let mut data = String::new();
         if is_compressed {
-            let dec = zstd::stream::read::Decoder::new(f)
-                .with_context(|| format!("opening zstd stream for {}", path.display()))?;
+            let dec = zstd::stream::read::Decoder::new(f).with_context(|| {
+                format!(
+                    "opening zstd stream for {}",
+                    hrdr_tools::display_path(path, unix_style_paths)
+                )
+            })?;
             dec.take(MAX_SESSION_FILE_BYTES + 1)
                 .read_to_string(&mut data)
-                .with_context(|| format!("decompressing {}", path.display()))?;
+                .with_context(|| {
+                    format!(
+                        "decompressing {}",
+                        hrdr_tools::display_path(path, unix_style_paths)
+                    )
+                })?;
         } else {
             if len > MAX_SESSION_FILE_BYTES {
                 anyhow::bail!(
                     "session file {} is {:.1} MiB, exceeds the {:.1} MiB limit",
-                    path.display(),
+                    hrdr_tools::display_path(path, unix_style_paths),
                     len as f64 / (1024.0 * 1024.0),
                     MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0),
                 );
@@ -1078,19 +1114,28 @@ impl Session {
             // cannot OOM the process.
             f.take(MAX_SESSION_FILE_BYTES + 1)
                 .read_to_string(&mut data)
-                .with_context(|| format!("reading {}", path.display()))?;
+                .with_context(|| {
+                    format!(
+                        "reading {}",
+                        hrdr_tools::display_path(path, unix_style_paths)
+                    )
+                })?;
         }
         // Reject the data if more bytes were present than allowed (take()
         // silently truncates past the limit, so we must check).
         if data.len() as u64 > MAX_SESSION_FILE_BYTES {
             anyhow::bail!(
                 "session file {} exceeds the {:.1} MiB limit",
-                path.display(),
+                hrdr_tools::display_path(path, unix_style_paths),
                 MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0),
             );
         }
-        let mut session: Session =
-            serde_json::from_str(&data).with_context(|| format!("parsing {}", path.display()))?;
+        let mut session: Session = serde_json::from_str(&data).with_context(|| {
+            format!(
+                "parsing {}",
+                hrdr_tools::display_path(path, unix_style_paths)
+            )
+        })?;
         session.state.id = session_id_from_path(path);
         Ok(session)
     }
@@ -1105,12 +1150,15 @@ impl Session {
     ///
     /// This is the ownership-taking counterpart to [`Self::load_path`], which
     /// stays lock-free for listing, preview and tests.
-    pub fn open_path(path: &Path) -> Result<(Session, SessionLock), OpenError> {
+    pub fn open_path(
+        path: &Path,
+        unix_style_paths: bool,
+    ) -> Result<(Session, SessionLock), OpenError> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let id = session_id_from_path(path).unwrap_or_else(|| "session".to_string());
         let lock = acquire_open_lock(dir, &id)
             .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
-        match Self::load_path(path) {
+        match Self::load_path(path, unix_style_paths) {
             Ok(session) => Ok((session, lock)),
             Err(e) => {
                 drop(lock); // release the lock we just took before surfacing the error
@@ -1121,8 +1169,12 @@ impl Session {
 
     /// [`Self::open_path`] keyed by `cwd` + `id` (the locked counterpart to
     /// [`Self::load`]).
-    pub fn open(cwd: &str, id: &str) -> Result<(Session, SessionLock), OpenError> {
-        Self::open_path(&session_file_path(cwd, id))
+    pub fn open(
+        cwd: &str,
+        id: &str,
+        unix_style_paths: bool,
+    ) -> Result<(Session, SessionLock), OpenError> {
+        Self::open_path(&session_file_path(cwd, id), unix_style_paths)
     }
 
     /// Open a **copy** of the session at `source_path` as a fresh, independently
@@ -1153,8 +1205,13 @@ impl Session {
         unix_style_paths: bool,
     ) -> Result<(String, Session, SessionLock)> {
         // Read the source's current on-disk snapshot WITHOUT taking its lock.
-        let mut state = Self::load_path(source_path)
-            .with_context(|| format!("reading {}", source_path.display()))?
+        let mut state = Self::load_path(source_path, unix_style_paths)
+            .with_context(|| {
+                format!(
+                    "reading {}",
+                    hrdr_tools::display_path(source_path, unix_style_paths)
+                )
+            })?
             .state;
         // Derive a fork name from the source's, falling back to a sensible base.
         let base = state.name.trim();
@@ -1188,7 +1245,7 @@ impl Session {
         }
         // Reload so the returned session reflects exactly what was written
         // (persisted transcript, id stamped from the filename).
-        let session = Self::load_path(&session_file_path(cwd, &outcome.id))
+        let session = Self::load_path(&session_file_path(cwd, &outcome.id), unix_style_paths)
             .with_context(|| format!("reloading forked session {}", outcome.id))?;
         Ok((outcome.id, session, lock))
     }
@@ -1198,13 +1255,13 @@ impl Session {
 /// first (by file id), then scans every directory — preferring the current
 /// `cwd` — matching the file id or the display `name` (case-insensitive, e.g.
 /// after `/rename`).
-pub fn resolve_session(cwd: &str, arg: &str) -> Option<(String, Session)> {
+pub fn resolve_session(cwd: &str, arg: &str, unix_style_paths: bool) -> Option<(String, Session)> {
     let id = sanitize_name(arg);
-    if let Ok(s) = Session::load(cwd, &id) {
+    if let Ok(s) = Session::load(cwd, &id, unix_style_paths) {
         return Some((id, s));
     }
     let cur = cwd_slug(cwd);
-    let mut metas = list_sessions();
+    let mut metas = list_sessions(unix_style_paths);
     // Stable sort keeps newest-first ordering within each group; current cwd
     // (key `false`) sorts ahead of the rest.
     metas.sort_by_key(|m| cwd_slug(&m.cwd) != cur);
@@ -1212,7 +1269,11 @@ pub fn resolve_session(cwd: &str, arg: &str) -> Option<(String, Session)> {
     metas
         .into_iter()
         .find(|m| m.name.eq_ignore_ascii_case(arg) || m.id.eq_ignore_ascii_case(arg))
-        .and_then(|m| Session::load_path(&m.path).ok().map(|s| (m.id, s)))
+        .and_then(|m| {
+            Session::load_path(&m.path, unix_style_paths)
+                .ok()
+                .map(|s| (m.id, s))
+        })
 }
 
 /// A collision-free file id (within `cwd`'s directory) derived from `name`:
@@ -1306,7 +1367,7 @@ fn meta_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, SessionMeta)>> {
 }
 
 /// Collect session files from one directory into `out`.
-fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
+fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>, unix_style_paths: bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1333,21 +1394,9 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
                 continue;
             }
         }
-        let id = session_id_from_path(&path).unwrap_or_default();
-        // The unresolved parse, not `load_path`: a listing wants three metadata
-        // fields, and resolving would read every attachment of every session in
-        // the store into memory — on every keystroke of a `/resume` argument —
-        // to produce a name, a cwd and a timestamp.
-        match Session::parse_path(&path) {
-            Ok(s) => {
-                let meta = SessionMeta {
-                    id,
-                    name: s.state.name,
-                    cwd: s.state.cwd,
-                    updated: s.updated,
-                    path: path.clone(),
-                    error: None,
-                };
+        // Listing metadata must not resolve transcript sidecars or attachment blobs.
+        match SessionMeta::read_path(&path, unix_style_paths) {
+            Ok(meta) => {
                 if let (Some(mtime), Ok(mut cache)) = (mtime, meta_cache().lock()) {
                     cache.insert(path, (mtime, meta.clone()));
                 }
@@ -1362,7 +1411,7 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 out.push(SessionMeta {
-                    id,
+                    id: session_id_from_path(&path).unwrap_or_default(),
                     name: String::new(),
                     cwd: String::new(),
                     updated: ts,
@@ -1376,17 +1425,17 @@ fn collect_sessions(dir: &Path, out: &mut Vec<SessionMeta>) {
 
 /// List saved sessions across every working directory, newest first. Also
 /// picks up legacy flat-layout files written directly under `sessions/`.
-pub fn list_sessions() -> Vec<SessionMeta> {
+pub fn list_sessions(unix_style_paths: bool) -> Vec<SessionMeta> {
     let base = sessions_dir();
     let mut out = Vec::new();
     // Legacy flat layout.
-    collect_sessions(&base, &mut out);
+    collect_sessions(&base, &mut out, unix_style_paths);
     // Per-cwd subdirectories.
     if let Ok(entries) = std::fs::read_dir(&base) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                collect_sessions(&path, &mut out);
+                collect_sessions(&path, &mut out, unix_style_paths);
             }
         }
     }
@@ -1486,7 +1535,8 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
             continue;
         };
         if want_purge {
-            match Session::load_path(&path) {
+            // Retention discards read errors; use the default diagnostic style.
+            match Session::load_path(&path, true) {
                 // Auto-named and old enough → purge outright, together with the
                 // session's derived data: its sibling transcript jsonl and its
                 // sub-agents' transcript dir. Otherwise deleting the `.json` orphans
@@ -1555,7 +1605,8 @@ fn collect_blob_garbage(dir: &Path) {
             continue;
         }
         // The unresolved parse: the mark phase needs the digests, not the bytes.
-        let Ok(session) = Session::parse_path(&path) else {
+        // GC discards read errors; use the default diagnostic style.
+        let Ok(session) = Session::parse_path(&path, true) else {
             return; // a session we cannot read may reference anything — do nothing
         };
         for entry in &session.state.attachment_refs {
@@ -1899,7 +1950,7 @@ mod tests {
             .expect("save_to_path writes the file and creates parent dirs");
         assert!(path.exists(), "the explicit-path file was written");
 
-        let loaded = Session::load_path(&path).expect("round-trips back");
+        let loaded = Session::load_path(&path, true).expect("round-trips back");
         assert_eq!(loaded.state.name, "Sub Agent");
         assert_eq!(loaded.state.cwd, "/tmp/proj");
         // Model context — what a relaunch resumes from — survives verbatim.
@@ -1978,7 +2029,7 @@ mod tests {
             };
             Session::new(st.clone()).save("round-trip", true).unwrap();
 
-            let back = Session::load(&cwd, "round-trip").unwrap().state;
+            let back = Session::load(&cwd, "round-trip", true).unwrap().state;
             // The transcript lives in the sibling jsonl, not the `.json`; `save`
             // wrote no jsonl here, so it comes back empty. Its own round-trip is
             // pinned by `roundtrip_audit::transcript_rebuilds_from_the_sibling_jsonl`.
@@ -2018,7 +2069,7 @@ mod tests {
             };
             let path = original.save("cache-created", true).unwrap();
             assert_eq!(
-                Session::load_path(&path).unwrap().created,
+                Session::load_path(&path, true).unwrap().created,
                 1_700_000_000,
                 "first save wrote the given created time"
             );
@@ -2039,7 +2090,7 @@ mod tests {
             );
             fresh.save("cache-created", true).unwrap();
 
-            let back = Session::load_path(&path).unwrap();
+            let back = Session::load_path(&path, true).unwrap();
             assert_eq!(
                 back.created, 1_700_000_000,
                 "the cached creation time survived even with the file gone"
@@ -2297,6 +2348,69 @@ mod tests {
         });
     }
 
+    #[test]
+    fn read_diagnostics_style_only_the_path_operand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(r"read\diagnostics");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.json");
+        let broken = dir.join("broken.json");
+        let json = r#"{"version":"C:\\reason\\unchanged"}"#;
+        std::fs::write(&broken, json).unwrap();
+        let json_reason = serde_json::from_str::<Session>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(json_reason.contains(r"\\reason"), "{json_reason}");
+        let compressed = dir.join("broken.json.zst");
+        std::fs::write(&compressed, b"not a zstd stream").unwrap();
+        let mut decoded = String::new();
+        let zstd_reason =
+            zstd::stream::read::Decoder::new(std::fs::File::open(&compressed).unwrap())
+                .unwrap()
+                .read_to_string(&mut decoded)
+                .unwrap_err()
+                .to_string();
+        let os_reason = std::fs::File::open(&missing).unwrap_err().to_string();
+        let invalid_utf8 = dir.join("invalid-utf8.json");
+        std::fs::write(&invalid_utf8, [0xff]).unwrap();
+        let read_reason = std::fs::read_to_string(&invalid_utf8)
+            .unwrap_err()
+            .to_string();
+        for style in [true, false] {
+            for (path, context, reason) in [
+                (&missing, "opening", &os_reason),
+                (&broken, "parsing", &json_reason),
+                (&compressed, "decompressing", &zstd_reason),
+                (&invalid_utf8, "reading", &read_reason),
+            ] {
+                let expected = format!(
+                    "{context} {}: {reason}",
+                    hrdr_tools::display_path(path, style)
+                );
+                assert_eq!(
+                    format!("{:#}", Session::load_path(path, style).unwrap_err()),
+                    expected
+                );
+                let Err(OpenError::Load(err)) = Session::open_path(path, style) else {
+                    panic!("an invalid file must fail to load after taking its lock");
+                };
+                assert_eq!(format!("{err:#}"), expected);
+                let id = session_id_from_path(path).unwrap();
+                let lock =
+                    acquire_open_lock(&dir, &id).expect("load failure releases the open-lock");
+                drop(lock);
+                let err = Session::fork("raw\\cwd", path, style).unwrap_err();
+                assert_eq!(
+                    format!("{err:#}"),
+                    format!(
+                        "reading {}: {expected}",
+                        hrdr_tools::display_path(path, style)
+                    )
+                );
+            }
+        }
+    }
+
     // ── file size limit ────────────────────────────────────────────────────────
 
     /// A session file exceeding `MAX_SESSION_FILE_BYTES` is rejected with a
@@ -2312,18 +2426,36 @@ mod tests {
 
             // Stretch the file past the limit by appending junk.
             let padding = " ".repeat(MAX_SESSION_FILE_BYTES as usize + 1);
-            std::fs::write(&path, padding).unwrap();
+            std::fs::write(&path, &padding).unwrap();
+            let compressed = path.with_extension("json.zst");
+            std::fs::write(
+                &compressed,
+                zstd::encode_all(padding.as_bytes(), 0).unwrap(),
+            )
+            .unwrap();
 
-            let err = Session::load_path(&path).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("100.0 MiB"),
-                "error mentions size limit: {msg}"
-            );
-            assert!(
-                msg.contains(&path.display().to_string()),
-                "error names the file: {msg}"
-            );
+            for style in [true, false] {
+                let err = Session::load_path(&path, style).unwrap_err();
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("100.0 MiB"),
+                    "error mentions size limit: {msg}"
+                );
+                assert!(
+                    msg.contains(&hrdr_tools::display_path(&path, style)),
+                    "error names the file: {msg}"
+                );
+                assert_eq!(
+                    Session::load_path(&compressed, style)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "session file {} exceeds the {:.1} MiB limit",
+                        hrdr_tools::display_path(&compressed, style),
+                        MAX_SESSION_FILE_BYTES as f64 / (1024.0 * 1024.0)
+                    )
+                );
+            }
         });
     }
 
@@ -2339,7 +2471,7 @@ mod tests {
             Session::new(state("small", &cwd))
                 .save("small", true)
                 .unwrap();
-            let loaded = Session::load(&cwd, "small").unwrap();
+            let loaded = Session::load(&cwd, "small", true).unwrap();
             assert_eq!(loaded.state.name, "small");
         });
     }
@@ -2384,7 +2516,7 @@ mod tests {
                 "compression preserves mtime (the purge clock)"
             );
             // Decodes transparently; id is derived without the `.json.zst` tail.
-            let loaded = Session::load_path(&zst).unwrap();
+            let loaded = Session::load_path(&zst, true).unwrap();
             assert_eq!(loaded.state.name, "Chat");
             assert!(loaded.state.named_by_user);
             assert_eq!(loaded.state.id.as_deref(), Some("rt"));
@@ -2442,7 +2574,10 @@ mod tests {
                 "fresh session untouched"
             );
             assert_eq!(
-                Session::load_path(&z("old-named")).unwrap().state.name,
+                Session::load_path(&z("old-named"), true)
+                    .unwrap()
+                    .state
+                    .name,
                 "kept"
             );
         });
@@ -2485,14 +2620,14 @@ mod tests {
             compress_session_file(&json).unwrap();
             let zst = json.with_extension("json.zst");
             let dir = session_dir(&cwd);
-            let (_, lock) = Session::open_path(&zst).unwrap();
+            let (_, lock) = Session::open_path(&zst, true).unwrap();
             // The lock is keyed on the real id — the name every other actor uses —
             // not the file_stem of the compressed path.
             assert!(dir.join(".resume.open.lock").exists());
             assert!(!dir.join(".resume-json.open.lock").exists());
             // A second open of the same session now contends on the same name.
             assert!(matches!(
-                Session::open_path(&zst),
+                Session::open_path(&zst, true),
                 Err(OpenError::Busy { .. })
             ));
             drop(lock);
@@ -2615,7 +2750,7 @@ mod tests {
                 .save("renamed", true)
                 .unwrap();
 
-            let first = list_sessions();
+            let first = list_sessions(true);
             assert!(
                 first.iter().any(|m| m.name == "Before Rename"),
                 "first listing sees the session: {first:?}"
@@ -2627,7 +2762,7 @@ mod tests {
                 .save("renamed", true)
                 .unwrap();
 
-            let second = list_sessions();
+            let second = list_sessions(true);
             assert!(
                 second.iter().any(|m| m.name == "After Rename"),
                 "second listing sees the rename, not a stale cached entry: {second:?}"
@@ -2643,7 +2778,7 @@ mod tests {
 
     #[test]
     fn resolve_session_returns_none_for_unknown_id() {
-        assert!(resolve_session("/nonexistent/path/xyz", "no-such-session").is_none());
+        assert!(resolve_session("/nonexistent/path/xyz", "no-such-session", true).is_none());
     }
 
     #[test]
@@ -2655,7 +2790,7 @@ mod tests {
             Session::new(state("My Chat", &cwd))
                 .save("my-chat", true)
                 .unwrap();
-            let (id, s) = resolve_session(&cwd, "my-chat").unwrap();
+            let (id, s) = resolve_session(&cwd, "my-chat", true).unwrap();
             assert_eq!(id, "my-chat");
             assert_eq!(s.state.name, "My Chat");
             assert_eq!(s.state.cwd, cwd);
@@ -2671,7 +2806,8 @@ mod tests {
             Session::new(state("Work Session", &cwd))
                 .save("work", true)
                 .unwrap();
-            let (id, s) = resolve_session(&cwd, "WORK SESSION").expect("case-insensitive match");
+            let (id, s) =
+                resolve_session(&cwd, "WORK SESSION", true).expect("case-insensitive match");
             assert_eq!(id, "work");
             assert_eq!(s.state.name, "Work Session");
         });
@@ -2694,12 +2830,12 @@ mod tests {
                 .save("alpha", true)
                 .unwrap();
 
-            let (_, s) = resolve_session(&a, "alpha").unwrap();
+            let (_, s) = resolve_session(&a, "alpha", true).unwrap();
             assert_eq!(
                 s.state.name, "Alpha A",
                 "current-cwd exact match takes precedence"
             );
-            let (_, s) = resolve_session(&b, "alpha").unwrap();
+            let (_, s) = resolve_session(&b, "alpha", true).unwrap();
             assert_eq!(s.state.name, "Alpha B");
         });
     }
@@ -2935,14 +3071,14 @@ mod tests {
 
             // Hold the open-lock, so open_path must refuse.
             let held = acquire_open_lock(&session_dir(&cwd), "my-chat").unwrap();
-            match Session::open_path(&path) {
+            match Session::open_path(&path, true) {
                 Err(OpenError::Busy { pid, .. }) => assert_eq!(pid, std::process::id()),
                 other => panic!("expected Busy, got {other:?}"),
             }
             drop(held);
 
             // Free now: open_path loads and hands back the guard.
-            let (session, _lock) = Session::open_path(&path).expect("opens when free");
+            let (session, _lock) = Session::open_path(&path, true).expect("opens when free");
             assert_eq!(session.state.name, "My Chat");
         });
     }
@@ -3059,20 +3195,20 @@ mod tests {
                 "fork's open-lock file was created"
             );
             let fork_path = session_file_path(&cwd, &new_id);
-            match Session::open_path(&fork_path) {
+            match Session::open_path(&fork_path, true) {
                 Err(OpenError::Busy { pid, .. }) => assert_eq!(pid, std::process::id()),
                 other => panic!("fork lock is not real — expected Busy, got {other:?}"),
             }
 
             // The SOURCE file and its open-lock are untouched.
             assert!(source_open_lock.exists(), "source open-lock left intact");
-            let reloaded = Session::load_path(&source_path).unwrap();
+            let reloaded = Session::load_path(&source_path, true).unwrap();
             assert_eq!(reloaded.state.name, "Orig", "source file not renamed");
             assert_eq!(reloaded.state.messages.len(), 2, "source content unchanged");
 
             drop(fork_lock);
             // Once the fork lock is released, the fork opens cleanly.
-            Session::open_path(&fork_path).expect("fork opens once its lock is freed");
+            Session::open_path(&fork_path, true).expect("fork opens once its lock is freed");
         });
     }
 
@@ -3115,7 +3251,7 @@ mod tests {
             let dir = session_dir(&cwd);
             std::fs::write(dir.join("corrupt.json"), "not valid json").unwrap();
 
-            let all = list_sessions();
+            let all = list_sessions(true);
             assert_eq!(all.len(), 2, "both valid and corrupt are listed");
             let good = all.iter().find(|m| m.id == "good").unwrap();
             assert!(good.error.is_none(), "valid session has no error");
@@ -3279,7 +3415,7 @@ mod tests {
                     let actual: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(target).unwrap()).unwrap();
                     assert_eq!(actual, expected);
-                    let loaded = Session::load_path(target).unwrap();
+                    let loaded = Session::load_path(target, style).unwrap();
                     assert_eq!(loaded.state.cwd, cwd);
                     assert_eq!(
                         serde_json::to_value(&loaded.state.messages).unwrap(),
@@ -3318,7 +3454,7 @@ mod tests {
                 .collect();
 
             Session::new(st).save("att", true).unwrap();
-            let back = Session::load(&cwd, "att").unwrap();
+            let back = Session::load(&cwd, "att", true).unwrap();
 
             let m = &back.state.messages[0];
             assert!(back.state.attachment_losses.is_empty(), "nothing was lost");
@@ -3370,7 +3506,7 @@ mod tests {
             Session::new(st).save("dup", true).unwrap();
             assert_eq!(blobs_in(&cwd).len(), 1, "identical bytes → one blob");
 
-            let back = Session::load(&cwd, "dup").unwrap();
+            let back = Session::load(&cwd, "dup", true).unwrap();
             assert!(back.state.attachment_losses.is_empty());
             let names: Vec<&str> = back
                 .state
@@ -3459,7 +3595,7 @@ mod tests {
             assert_eq!(blobs.len(), 1);
             std::fs::remove_file(crate::attachment_store::blob_dir(&path).join(&blobs[0])).unwrap();
 
-            let back = Session::load(&cwd, "lost").unwrap();
+            let back = Session::load(&cwd, "lost", true).unwrap();
             let m = &back.state.messages[0];
             assert!(
                 m.attachments.is_empty(),
@@ -3483,7 +3619,7 @@ mod tests {
             // Saving again records no reference for it, so a second resume has
             // nothing left to lose and does not annotate the text twice.
             Session::new(back.state.clone()).save("lost", true).unwrap();
-            let again = Session::load(&cwd, "lost").unwrap();
+            let again = Session::load(&cwd, "lost", true).unwrap();
             assert!(again.state.attachment_losses.is_empty());
             assert_eq!(again.state.messages[0].content.as_deref(), Some(text));
         });
@@ -3510,7 +3646,7 @@ mod tests {
             )
             .unwrap();
 
-            let back = Session::load(&cwd, "corrupt").unwrap();
+            let back = Session::load(&cwd, "corrupt", true).unwrap();
             assert_eq!(
                 back.state.attachment_losses,
                 vec![crate::AttachmentLoss {
@@ -3579,7 +3715,7 @@ mod tests {
                 "the purged session's own blob is collected; the shared one is not"
             );
             // And the survivor still resolves it.
-            let kept = Session::load(&cwd, "keeper").unwrap();
+            let kept = Session::load(&cwd, "keeper", true).unwrap();
             assert!(kept.state.attachment_losses.is_empty());
             assert_eq!(
                 kept.state.messages[0].attachments[0].bytes(),
@@ -3960,7 +4096,7 @@ mod roundtrip_audit {
             drop(w);
 
             // Load rebuilds the transcript from that jsonl.
-            let back = Session::load(&cwd, "jsonl-rebuild").unwrap().state;
+            let back = Session::load(&cwd, "jsonl-rebuild", true).unwrap().state;
             let kinds: Vec<&EntryKind> = back.transcript.iter().map(|e| &e.kind).collect();
             assert!(
                 matches!(
@@ -4085,7 +4221,7 @@ mod roundtrip_audit {
             st.messages.push(assistant);
             Session::new(st).save("reasoning", true).unwrap();
 
-            let back = Session::load(&cwd, "reasoning").unwrap().state;
+            let back = Session::load(&cwd, "reasoning", true).unwrap().state;
             assert_eq!(
                 back.messages.last().unwrap().responses_reasoning_items,
                 vec![item]
@@ -4110,7 +4246,7 @@ mod roundtrip_audit {
             st.messages.push(assistant);
             Session::new(st).save("thinking", true).unwrap();
 
-            let back = Session::load(&cwd, "thinking").unwrap().state;
+            let back = Session::load(&cwd, "thinking", true).unwrap().state;
             assert_eq!(
                 back.messages.last().unwrap().anthropic_thinking_blocks,
                 vec![block]

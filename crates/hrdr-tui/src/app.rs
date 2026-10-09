@@ -2784,6 +2784,38 @@ impl App {
         self.dir = display_dir_with_style(&self.dir_cwd, cfg.unix_style_paths);
         if self.cfg.unix_style_paths != cfg.unix_style_paths {
             self.completion_cache = None;
+            if let Some(mut sel) = self.session_selector.take() {
+                let filter = sel.filter.clone();
+                let selected_path = sel.current().map(|meta| meta.path.clone());
+                while !sel.filter.is_empty() {
+                    sel.backspace();
+                }
+                let sessions = sel
+                    .rows()
+                    .cloned()
+                    .map(|mut meta| {
+                        if meta.error.is_some() {
+                            match hrdr_app::SessionMeta::read_path(&meta.path, cfg.unix_style_paths)
+                            {
+                                Ok(refreshed) => return refreshed,
+                                Err(err) => meta.error = Some(format!("{err:#}")),
+                            }
+                        }
+                        meta
+                    })
+                    .collect();
+                let mut sel = session_selector(sessions);
+                for c in filter.chars() {
+                    sel.push_char(c);
+                }
+                let selected = sel
+                    .rows()
+                    .position(|meta| Some(&meta.path) == selected_path.as_ref())
+                    .unwrap_or(0);
+                sel.selected = selected;
+                self.session_selector = Some(sel);
+                self.session_rows = None;
+            }
             if let Some(sel) = &mut self.theme_selector {
                 sel.replace_theme_choices(hrdr_app::theme_choices(cfg.unix_style_paths));
             }

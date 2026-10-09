@@ -206,7 +206,13 @@ failures and a leak-guard timeout in
 `dropped_backpressured_write_releases_native_handle`; reduced-concurrency runs
 passed without test changes. These reports do not establish default-concurrency
 reliability. New write-label tests do not directly exercise no-ID TUI saves,
-fork write failures, or child snapshot wiring; those callers were inspected.
+fork write failures, or child snapshot wiring; those callers were inspected. The
+session-read slice's all-features ordinary workspace run reported
+`backpressure_write_timeout_releases_native_handle` failing with
+`pending native write retained its pipe handle: Elapsed(())`; its verification
+gate and separate enabled leak-guard run passed. This remains an uncorrected
+intermittent native-pipe test failure, not evidence of a session-read
+regression.
 
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four

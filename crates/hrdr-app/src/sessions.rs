@@ -20,15 +20,16 @@ use crate::Session;
 ///   rather than surfacing a jarring error; only an explicit `/resume` refuses.
 pub fn open_latest_session_for_cwd(
     cwd: &str,
+    unix_style_paths: bool,
 ) -> Result<Option<(String, Session, crate::SessionLock)>, crate::SessionBusy> {
     let cur = hrdr_agent::cwd_slug(cwd);
-    let Some(meta) = crate::list_sessions()
+    let Some(meta) = crate::list_sessions(unix_style_paths)
         .into_iter()
         .find(|m| hrdr_agent::cwd_slug(&m.cwd) == cur)
     else {
         return Ok(None);
     };
-    match Session::open_path(&meta.path) {
+    match Session::open_path(&meta.path, unix_style_paths) {
         Ok((session, lock)) => {
             if session.state.messages.len() > 1 {
                 Ok(Some((meta.id, session, lock)))
@@ -50,7 +51,7 @@ pub fn open_latest_session_for_cwd(
 /// Corrupt/unreadable sessions are shown with an `[error]` tag in place of
 /// the name and cwd, so they are visible rather than silently skipped.
 pub fn session_list_text(unix_style_paths: bool) -> String {
-    let sessions = crate::list_sessions();
+    let sessions = crate::list_sessions(unix_style_paths);
     if sessions.is_empty() {
         return format!(
             "no saved sessions in {}",
@@ -83,7 +84,7 @@ pub fn session_list_text(unix_style_paths: bool) -> String {
 /// Return diagnostic information about every corrupt/unreadable session file
 /// found in the sessions directory. Used by `/doctor` to report session health.
 pub fn session_diagnostics(unix_style_paths: bool) -> Vec<(String, String)> {
-    crate::list_sessions()
+    crate::list_sessions(unix_style_paths)
         .into_iter()
         .filter_map(|m| {
             m.error
@@ -174,16 +175,29 @@ mod tests {
                 .unwrap();
             let path = crate::session_file_path(&cwd, "valid");
             let broken = path.parent().unwrap().join("broken.json");
-            std::fs::write(&broken, "{{{").unwrap();
-            let raw = crate::list_sessions();
-            let error = raw
-                .iter()
-                .find(|m| m.error.is_some())
-                .unwrap()
-                .error
-                .clone()
-                .unwrap();
-            for style in [true, false] {
+            let json = r#"{"version":"C:\\reason\\unchanged"}"#;
+            std::fs::write(&broken, json).unwrap();
+            let reason = serde_json::from_str::<Session>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(reason.contains(r"\\reason"));
+            for style in [true, false, true] {
+                let raw = crate::list_sessions(style);
+                let error = format!(
+                    "parsing {}: {reason}",
+                    hrdr_tools::display_path(&broken, style)
+                );
+                assert_eq!(
+                    raw.iter()
+                        .find(|m| m.error.is_some())
+                        .unwrap()
+                        .error
+                        .as_deref(),
+                    Some(error.as_str())
+                );
+                assert!(
+                    session_list_text(style).contains(&format!("broken — [unreadable: {error}]"))
+                );
                 assert!(session_list_text(style).contains(&format!(
                     "valid — valid  [{}]",
                     hrdr_tools::display_path(std::path::Path::new(&cwd), style)
