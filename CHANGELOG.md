@@ -42,8 +42,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preference without changing trust decisions; the screen still sanitizes
   terminal controls after formatting. `/export` overwrite refusals and `/edit`
   success notices also style their path labels without changing export targets
-  or editor arguments. Access checks, LSP protocol paths, and diagnostic message
-  text remain unchanged. Stale-read errors preserve the original culprit
+  or editor arguments. Wire-log rotation warnings retain a structured raw path
+  until the agent renders the notice with its active preference; other warning
+  text remains verbatim. Access checks, LSP protocol paths, and diagnostic
+  message text remain unchanged. Stale-read errors preserve the original culprit
   command. Headline caches refresh on configuration reload, which also updates
   subsequent main-agent tool calls and newly spawned children; existing children
   retain their own setting. Unix rendering, stored tool arguments/results, file

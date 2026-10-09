@@ -371,6 +371,75 @@ impl Agent {
     }
 }
 
+#[tokio::test]
+async fn wire_log_rotation_notice_uses_agent_path_style() {
+    const CHILD: &str = "HRDR_TEST_WIRE_NOTICE";
+    let Ok(style) = std::env::var(CHILD) else {
+        for style in ["native", "unix"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("requests.log");
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(hrdr_llm::capped_read::MAX_LOG_FILE_BYTES)
+                .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mock_server::wire_log_rotation_notice_uses_agent_path_style",
+                    "--nocapture",
+                ])
+                .env(CHILD, style)
+                .env("HRDR_LOG_REQUESTS", &path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{style}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::metadata(hrdr_llm::sibling_with_suffix(&path, ".1"))
+                    .unwrap()
+                    .len(),
+                hrdr_llm::capped_read::MAX_LOG_FILE_BYTES
+            );
+        }
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start(vec![native_summary_response(hrdr_llm::Backend::OpenAi)]).await;
+    let mut cfg = test_cfg(server.base_url(), dir.path());
+    cfg.unix_style_paths = style == "unix";
+    let mut agent = Agent::new(cfg).unwrap();
+    let mut notices = Vec::new();
+    agent
+        .run_input("hello", |event| {
+            if let AgentEvent::Notice(text) = event {
+                notices.push(text);
+            }
+        })
+        .await
+        .unwrap();
+    let path = std::path::PathBuf::from(std::env::var_os("HRDR_LOG_REQUESTS").unwrap());
+    let rotated = hrdr_llm::sibling_with_suffix(&path, ".1");
+    let mib = hrdr_llm::capped_read::MAX_LOG_FILE_BYTES / (1024 * 1024);
+    let label = hrdr_tools::display_path(&rotated, style == "unix");
+    let expected = format!(
+        "request log reached {mib} MiB; rotated to {label} (keeping the newest {mib} MiB, at most {} MiB on disk)",
+        mib * 2
+    );
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|text| text.starts_with("request log reached"))
+            .collect::<Vec<_>>(),
+        vec![&expected]
+    );
+    assert!(hrdr_llm::take_client_warning().is_none());
+    assert!(std::fs::read_to_string(path).unwrap().contains("hello"));
+}
+
 /// `@file` expansion inlines a file's whole content into the outgoing
 /// message, so the model *has* read it — [`Agent::mark_files_read`] is how
 /// the frontend tells the read-before-edit guard that. Without it the model

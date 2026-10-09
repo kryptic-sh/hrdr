@@ -26,8 +26,8 @@ mod types;
 
 #[doc(hidden)]
 pub use client::{
-    Backend, ChatError, ChatErrorKind, ChatStream, Client, UNNAMED_MODEL, is_anthropic_backend,
-    is_local_host, serve_response, take_client_warning, url_host,
+    Backend, ChatError, ChatErrorKind, ChatStream, Client, ClientWarning, UNNAMED_MODEL,
+    is_anthropic_backend, is_local_host, serve_response, take_client_warning, url_host,
 };
 pub use fs::{
     owner_only_options, owner_only_options_no_follow, sibling_with_suffix, unique_sibling_path,

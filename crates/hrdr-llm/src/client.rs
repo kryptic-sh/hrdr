@@ -27,7 +27,29 @@ static REQUEST_LOG_STOPPED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// One-shot slot for a client-level warning (wire log rotated, an auth header
 /// stripped from `extra_headers`) awaiting delivery to the caller.
-static CLIENT_WARNING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static CLIENT_WARNING: OnceLock<Mutex<Option<ClientWarning>>> = OnceLock::new();
+
+/// A client warning with filesystem paths kept raw until presentation.
+#[derive(Debug)]
+pub enum ClientWarning {
+    Text(String),
+    WireLogRotated { path: PathBuf, mib: u64 },
+}
+
+impl ClientWarning {
+    /// Render only structured paths; arbitrary warning text is preserved verbatim.
+    pub fn render(self, display_path: impl FnOnce(&Path) -> String) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::WireLogRotated { path, mib } => format!(
+                "request log reached {mib} MiB; rotated to {} \
+                 (keeping the newest {mib} MiB, at most {} MiB on disk)",
+                display_path(&path),
+                mib * 2
+            ),
+        }
+    }
+}
 
 /// The open wire log together with its path, so [`log_wire`] can rotate the
 /// file in place (rename active → `<name>.1`, reopen a fresh active file).
@@ -38,7 +60,7 @@ struct WireLog {
 
 /// Take the one-shot client warning for delivery through the caller's normal
 /// event channel. This avoids writing stderr while a TUI owns the terminal.
-pub fn take_client_warning() -> Option<String> {
+pub fn take_client_warning() -> Option<ClientWarning> {
     CLIENT_WARNING
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -163,8 +185,12 @@ fn wire_log_over_cap(current: u64, line_len: u64, cap: u64) -> bool {
 /// `stop_reason` hrdr does not recognize, and that is a claim about the reply's
 /// completeness the user has to hear (see [`crate::anthropic::map_stop_reason`]).
 pub(crate) fn set_client_warning(msg: String) {
+    publish_client_warning(ClientWarning::Text(msg));
+}
+
+fn publish_client_warning(warning: ClientWarning) {
     if let Ok(mut pending) = CLIENT_WARNING.get_or_init(|| Mutex::new(None)).lock() {
-        *pending = Some(msg);
+        *pending = Some(warning);
     }
 }
 
@@ -222,12 +248,10 @@ pub(crate) fn log_wire(kind: &str, fields: impl FnOnce() -> serde_json::Value) {
             // so the warning is naturally throttled to once per rotation.
             match rotate_wire_log(&wire.path, &mut file) {
                 Ok(()) => {
-                    set_client_warning(format!(
-                        "request log reached {mib} MiB; rotated to {} \
-                         (keeping the newest {mib} MiB, at most {} MiB on disk)",
-                        crate::fs::sibling_with_suffix(&wire.path, ".1").display(),
-                        mib * 2
-                    ));
+                    publish_client_warning(ClientWarning::WireLogRotated {
+                        path: crate::fs::sibling_with_suffix(&wire.path, ".1"),
+                        mib,
+                    });
                 }
                 Err(_) => {
                     // Rotation failed: fall back to the historical stop-at-cap
@@ -4253,6 +4277,88 @@ mod tests {
             rotate_wire_log(path, file).expect("rotation should succeed");
         }
         file.write_all(line.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn wire_log_warning_keeps_raw_path_and_drains_once() {
+        const CHILD: &str = "HRDR_TEST_WIRE_WARNING";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "client::tests::wire_log_warning_keeps_raw_path_and_drains_once",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("HRDR_LOG_REQUESTS")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("requests.log");
+        let file = open_wire_log(&path).unwrap();
+        assert!(
+            REQUEST_LOG
+                .set(Some(WireLog {
+                    path: path.clone(),
+                    file: Mutex::new(file)
+                }))
+                .is_ok()
+        );
+        for label in ["native\\requests.log.1", "unix/requests.log.1"] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(MAX_LOG_FILE_BYTES)
+                .unwrap();
+            log_wire("test", || serde_json::json!({"value": "after rotation"}));
+            let warning = take_client_warning().expect("rotation publishes a warning");
+            let rotated = crate::fs::sibling_with_suffix(&path, ".1");
+            let ClientWarning::WireLogRotated { path: raw, mib } = &warning else {
+                panic!("rotation must publish a structured path");
+            };
+            assert_eq!(raw.as_os_str(), rotated.as_os_str());
+            assert_eq!(*mib, MAX_LOG_FILE_BYTES / (1024 * 1024));
+            assert_eq!(
+                std::fs::metadata(&rotated).unwrap().len(),
+                MAX_LOG_FILE_BYTES
+            );
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("after rotation")
+            );
+            let rendered = warning.render(|raw| {
+                assert_eq!(raw.as_os_str(), rotated.as_os_str());
+                label.to_string()
+            });
+            let mib = MAX_LOG_FILE_BYTES / (1024 * 1024);
+            assert_eq!(
+                rendered,
+                format!(
+                    "request log reached {mib} MiB; rotated to {label} (keeping the newest {mib} MiB, at most {} MiB on disk)",
+                    mib * 2
+                )
+            );
+            assert!(take_client_warning().is_none());
+            let text = "warning https://host/a and C:\\raw/path\nunchanged";
+            set_client_warning(text.to_string());
+            assert_eq!(
+                take_client_warning()
+                    .unwrap()
+                    .render(|_| panic!("text is not a path")),
+                text
+            );
+            assert!(take_client_warning().is_none());
+        }
     }
 
     #[test]

@@ -3058,7 +3058,8 @@ mod tests {
         );
 
         let warning = crate::client::take_client_warning()
-            .expect("an unrecognized stop_reason must raise a client warning");
+            .expect("an unrecognized stop_reason must raise a client warning")
+            .render(|_| panic!("stop-reason warning must not format a path"));
         assert!(
             warning.contains("nova_flare"),
             "the warning must name the reason hrdr did not recognize: {warning}"
@@ -3095,6 +3096,7 @@ mod tests {
             // costs nothing here, and a mapping that warned on everything still
             // fails — its warning names the stop reason.
             if let Some(warning) = crate::client::take_client_warning() {
+                let warning = warning.render(|path| path.display().to_string());
                 assert!(
                     !warning.contains("stop_reason"),
                     "stop_reason {stop:?} is recognized and must not warn: {warning}"

@@ -595,7 +595,9 @@ impl Agent {
                 )
                 .await?;
             if let Some(warning) = hrdr_llm::take_client_warning() {
-                on_event(AgentEvent::Notice(warning));
+                on_event(AgentEvent::Notice(warning.render(|path| {
+                    hrdr_tools::display_path(path, self.ctx.unix_style_paths)
+                })));
             }
             // The sandbox's own degradation channel: a shell command that ran
             // with less OS confinement than its mode promised says so here,
