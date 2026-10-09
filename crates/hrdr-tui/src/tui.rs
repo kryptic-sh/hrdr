@@ -70,7 +70,21 @@ fn sync_title<W: std::io::Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_title;
+    use super::{edited_file_message, terminal_title};
+
+    #[test]
+    fn edited_file_path_style_preserves_raw_path() {
+        let raw = r"nested\literal/file.md";
+        let path = std::path::PathBuf::from(raw);
+        for (style, windows_label) in [
+            (true, "nested/literal/file.md"),
+            (false, r"nested\literal\file.md"),
+        ] {
+            let label = if cfg!(windows) { windows_label } else { raw };
+            assert_eq!(edited_file_message(&path, style), format!("edited {label}"));
+            assert_eq!(path.as_os_str(), std::ffi::OsStr::new(raw));
+        }
+    }
 
     #[test]
     fn terminal_title_uses_session_name() {
@@ -266,10 +280,17 @@ fn open_file_in_editor(app: &mut App, terminal: &mut Tui, path: &std::path::Path
     resume_terminal(terminal)?;
     terminal.clear()?;
     match status {
-        Ok(_) => app.system(format!("edited {}", path.display())),
+        Ok(_) => app.system(edited_file_message(path, app.unix_style_paths())),
         Err(e) => app.system(format!("editor failed: {e}")),
     }
     Ok(())
+}
+
+fn edited_file_message(path: &std::path::Path, unix_style_paths: bool) -> String {
+    format!(
+        "edited {}",
+        hrdr_tools::display_path(path, unix_style_paths)
+    )
 }
 
 #[cfg(test)]

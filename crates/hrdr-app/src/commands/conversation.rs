@@ -11,6 +11,7 @@ pub fn export_conversation(
     msgs: &[Message],
     cwd: &Path,
     arg: &str,
+    unix_style_paths: bool,
 ) -> Result<(PathBuf, usize), String> {
     let mut json = false;
     let mut file: Option<&str> = None;
@@ -45,7 +46,7 @@ pub fn export_conversation(
     if path.exists() {
         return Err(format!(
             "refusing to overwrite existing file: {}",
-            path.display()
+            hrdr_tools::display_path(&path, unix_style_paths)
         ));
     }
     let content = if json {

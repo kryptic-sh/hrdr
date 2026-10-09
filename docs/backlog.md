@@ -192,7 +192,15 @@ build/smoke, Linux/macOS nextest, Windows leak guard, and dependency jobs
 passed. The streaming test still imposes a shorter receive-inactivity timeout
 despite intentional silence after the live-output cap; the log does not
 establish that the child would finish within its overall deadline. No test
-contract was changed.
+contract was changed. Twentieth-push run `37875336123` (`09b898a`) passed
+nextest, Clippy, and build/smoke on Windows/Linux/macOS, dependency checks, the
+Windows leak guard, and release-target builds. Linux/macOS ordinary tests under
+the leak guard still failed the same registration turnover test with
+`Kind(WouldBlock)`; the full pipeline remains red. During the export/editor
+label slice, an additional local leak-guard run reported
+`a_real_tool_round_keeps_the_scrolled_up_viewport` failing with
+`a turn event: Elapsed(())` and `A TEST LEAKED TEMPFILE DIRS INTO /tmp.`. The
+timeout and surviving directories have not been independently attributed.
 
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four

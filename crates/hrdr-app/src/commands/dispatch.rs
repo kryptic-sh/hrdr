@@ -146,8 +146,10 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 let msgs = agent.lock().await.messages_owned();
                 // The serialization and the fs write are blocking work; run
                 // them off the async worker.
-                match tokio::task::spawn_blocking(move || export_conversation(&msgs, &cwd, &arg))
-                    .await
+                match tokio::task::spawn_blocking(move || {
+                    export_conversation(&msgs, &cwd, &arg, unix_style_paths)
+                })
+                .await
                 {
                     Ok(Ok((path, lines))) => {
                         format!(
@@ -965,6 +967,36 @@ mod tests {
                 "{output}"
             );
             assert!(target.is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn export_overwrite_path_style_preserves_existing_bytes() {
+        for style in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut host = TestHost::new(dir.path().to_path_buf());
+            host.unix_style_paths = style;
+            let name = if cfg!(unix) {
+                r"literal\export.md"
+            } else {
+                "export.md"
+            };
+            let target = dir.path().join(name);
+            let original = b"existing transcript\r\n\0\xff";
+            std::fs::write(&target, original).unwrap();
+            assert!(dispatch(&mut host, &format!("/export {name}")));
+            settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+            assert_eq!(
+                *host.async_log.lock().unwrap(),
+                vec![format!(
+                    "export failed: refusing to overwrite existing file: {}",
+                    hrdr_tools::display_path(&target, style)
+                )]
+            );
+            if cfg!(unix) {
+                assert!(!dir.path().join("literal/export.md").exists());
+            }
         }
     }
 
