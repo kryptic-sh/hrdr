@@ -64,12 +64,17 @@ const CONFIRM: &[(&str, &str)] = &[
 ///
 /// Returns [`TrustChoice::Cancel`] when there is no terminal to ask on — the same
 /// answer as "I do not know what is being asked".
-pub fn ask_trust(cwd: &Path, logo: &str, theme: Option<&str>) -> TrustChoice {
+pub fn ask_trust(
+    cwd: &Path,
+    logo: &str,
+    theme: Option<&str>,
+    unix_style_paths: bool,
+) -> TrustChoice {
     let Ok(mut screen) = AskScreen::enter() else {
         return TrustChoice::Cancel;
     };
     let theme = Theme::load(theme);
-    let choice = run_menus(&mut screen.terminal, cwd, logo, &theme);
+    let choice = run_menus(&mut screen.terminal, cwd, logo, &theme, unix_style_paths);
     // `screen` drops here: alternate screen left, raw mode off, cursor back —
     // on every path out, including a panic in the loop.
     choice
@@ -105,44 +110,50 @@ impl Drop for AskScreen {
     }
 }
 
+fn trust_header(cwd: &Path, theme: &Theme, unix_style_paths: bool) -> Vec<Line<'static>> {
+    vec![
+        Line::raw(""),
+        Line::styled(
+            "hrdr has not been opened in this directory before:",
+            Style::default().fg(theme.assistant),
+        ),
+        Line::raw(""),
+        Line::styled(
+            format!(
+                "  {}",
+                hrdr_editor::sanitize_for_terminal(&hrdr_tools::display_path(
+                    cwd,
+                    unix_style_paths
+                ))
+            ),
+            Style::default().fg(theme.accent),
+        ),
+        Line::raw(""),
+        Line::styled(
+            "Its AGENTS.md and command files are instructions that reach the model,",
+            Style::default().fg(theme.dim),
+        ),
+        Line::styled(
+            "and its code is what any command you approve will run. Trust it only",
+            Style::default().fg(theme.dim),
+        ),
+        Line::styled(
+            "if you know where it came from.",
+            Style::default().fg(theme.dim),
+        ),
+        Line::raw(""),
+    ]
+}
+
 /// The question, then the confirmation, until one of them settles it.
 fn run_menus(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     cwd: &Path,
     logo: &str,
     theme: &Theme,
+    unix_style_paths: bool,
 ) -> TrustChoice {
-    let head = |theme: &Theme| {
-        vec![
-            Line::raw(""),
-            Line::styled(
-                "hrdr has not been opened in this directory before:",
-                Style::default().fg(theme.assistant),
-            ),
-            Line::raw(""),
-            Line::styled(
-                format!(
-                    "  {}",
-                    hrdr_editor::sanitize_for_terminal(&cwd.display().to_string())
-                ),
-                Style::default().fg(theme.accent),
-            ),
-            Line::raw(""),
-            Line::styled(
-                "Its AGENTS.md and command files are instructions that reach the model,",
-                Style::default().fg(theme.dim),
-            ),
-            Line::styled(
-                "and its code is what any command you approve will run. Trust it only",
-                Style::default().fg(theme.dim),
-            ),
-            Line::styled(
-                "if you know where it came from.",
-                Style::default().fg(theme.dim),
-            ),
-            Line::raw(""),
-        ]
-    };
+    let head = trust_header(cwd, theme, unix_style_paths);
     let confirm_head = |theme: &Theme| {
         vec![
             Line::raw(""),
@@ -160,7 +171,7 @@ fn run_menus(
 
     loop {
         // Default: cancel, the last entry.
-        match menu(terminal, logo, theme, &head(theme), ASK, ASK.len() - 1) {
+        match menu(terminal, logo, theme, &head, ASK, ASK.len() - 1) {
             Some(0) => match menu(terminal, logo, theme, &confirm_head(theme), CONFIRM, 1) {
                 Some(0) => return TrustChoice::Trusted,
                 // "no, go back" and Esc both return to the first question.
@@ -257,6 +268,40 @@ fn menu(
             },
             Ok(false) => {}
             Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn trust_path_header_renders_styles_and_sanitizes_controls() {
+        let raw = "C:\\work/mixed\\name\u{1b}[2J\u{7f}\u{85}";
+        for (style, windows_label) in [
+            (true, "C:/work/mixed/name·[2J··"),
+            (false, "C:\\work\\mixed\\name·[2J··"),
+        ] {
+            let head = trust_header(Path::new(raw), &Theme::default(), style);
+            let label = if cfg!(windows) {
+                windows_label
+            } else {
+                "C:\\work/mixed\\name·[2J··"
+            };
+            assert_eq!(head[3].to_string(), format!("  {label}"));
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(Paragraph::new(head), frame.area());
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..100)
+                .map(|x| buffer.cell((x, 3)).unwrap().symbol())
+                .collect();
+            assert_eq!(row.trim_end(), format!("  {label}"));
         }
     }
 }

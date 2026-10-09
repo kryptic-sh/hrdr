@@ -38,13 +38,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   setting without changing payloads, inlined identities, or listing selection.
   File-completion popup labels follow the current setting, including cached
   popups, while insertion text, matching, ranking, and nonpath rows stay
-  unchanged. Access checks, LSP protocol paths, and diagnostic message text
-  remain unchanged. Stale-read errors preserve the original culprit command.
-  Headline caches refresh on configuration reload, which also updates subsequent
-  main-agent tool calls and newly spawned children; existing children retain
-  their own setting. Unix rendering, stored tool arguments/results, file
-  contents, and filesystem targets are unchanged. Other path presentation
-  surfaces remain pending.
+  unchanged. Startup trust-screen and headless jail-notice cwd labels honor the
+  preference without changing trust decisions; the screen still sanitizes
+  terminal controls after formatting. Access checks, LSP protocol paths, and
+  diagnostic message text remain unchanged. Stale-read errors preserve the
+  original culprit command. Headline caches refresh on configuration reload,
+  which also updates subsequent main-agent tool calls and newly spawned
+  children; existing children retain their own setting. Unix rendering, stored
+  tool arguments/results, file contents, and filesystem targets are unchanged.
+  Other path presentation surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

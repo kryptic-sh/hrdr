@@ -790,7 +790,12 @@ async fn main() -> Result<()> {
     // The working directory decides whether this session may be steered by files
     // in it. Answered before anything reads `AGENTS.md` or a project command —
     // `Agent::new` does both, and the TUI builds one immediately.
-    match trust_gate(&config.cwd, cli.command.is_some(), ui.theme.as_deref()) {
+    match trust_gate(
+        &config.cwd,
+        cli.command.is_some(),
+        ui.theme.as_deref(),
+        config.unix_style_paths,
+    ) {
         TrustGate::Proceed => {}
         TrustGate::Jail => {
             // Both, and the second is not optional: `jail` floors at `write` for a
@@ -860,10 +865,19 @@ enum TrustGate {
 /// wrong: trusting by default makes the gate bypassable by adding a subcommand,
 /// and refusing to start breaks every script in a fresh checkout. Jailing is the
 /// third option — the script runs, on the restricted tool set, and says so.
-fn trust_gate(cwd: &std::path::Path, headless: bool, theme: Option<&str>) -> TrustGate {
-    trust_gate_with(cwd, headless, hrdr_agent::trust::is_trusted(cwd), |c| {
-        ask_to_trust(c, theme)
-    })
+fn trust_gate(
+    cwd: &std::path::Path,
+    headless: bool,
+    theme: Option<&str>,
+    unix_style_paths: bool,
+) -> TrustGate {
+    trust_gate_with(
+        cwd,
+        headless,
+        hrdr_agent::trust::is_trusted(cwd),
+        unix_style_paths,
+        |c| ask_to_trust(c, theme, unix_style_paths),
+    )
 }
 
 /// The decision itself, with the store read and the question already supplied —
@@ -873,6 +887,7 @@ fn trust_gate_with(
     cwd: &std::path::Path,
     headless: bool,
     trusted: bool,
+    unix_style_paths: bool,
     ask: impl FnOnce(&std::path::Path) -> hrdr_agent::trust::TrustChoice,
 ) -> TrustGate {
     use hrdr_agent::trust;
@@ -884,7 +899,7 @@ fn trust_gate_with(
         eprintln!(
             "hrdr: {} is not a trusted directory — running in jail mode (read-only, no shell).\n\
              hrdr: open hrdr here interactively once to decide.",
-            cwd.display()
+            hrdr_tools::display_path(cwd, unix_style_paths)
         );
         return TrustGate::Jail;
     }
@@ -917,8 +932,12 @@ fn trust_gate_with(
 /// on a Windows console without VT processing it reaches the screen as literal
 /// garbage. Drawing it there also shares the session's own theme and logo
 /// animation rather than keeping a second copy that could drift.
-fn ask_to_trust(cwd: &std::path::Path, theme: Option<&str>) -> hrdr_agent::trust::TrustChoice {
-    hrdr_tui::ask_trust(cwd, LOGO_ART, theme)
+fn ask_to_trust(
+    cwd: &std::path::Path,
+    theme: Option<&str>,
+    unix_style_paths: bool,
+) -> hrdr_agent::trust::TrustChoice {
+    hrdr_tui::ask_trust(cwd, LOGO_ART, theme, unix_style_paths)
 }
 
 /// Headless single-turn run. Default: reply text on stdout, tool/usage chrome
@@ -1203,7 +1222,7 @@ mod trust_gate_tests {
 
     #[test]
     fn a_trusted_directory_is_never_asked_about() {
-        let g = trust_gate_with(std::path::Path::new("/x"), false, true, never_asked);
+        let g = trust_gate_with(std::path::Path::new("/x"), false, true, true, never_asked);
         assert!(matches!(g, TrustGate::Proceed));
     }
 
@@ -1211,7 +1230,7 @@ mod trust_gate_tests {
     /// the two bad ones — the script runs, jailed, and stderr says why.
     #[test]
     fn headless_in_an_unknown_directory_jails_instead_of_asking() {
-        let g = trust_gate_with(std::path::Path::new("/x"), true, false, never_asked);
+        let g = trust_gate_with(std::path::Path::new("/x"), true, false, true, never_asked);
         assert!(matches!(g, TrustGate::Jail));
     }
 
@@ -1219,17 +1238,82 @@ mod trust_gate_tests {
     /// subcommand must not turn an answered directory into a jailed one.
     #[test]
     fn headless_still_honours_an_existing_answer() {
-        let g = trust_gate_with(std::path::Path::new("/x"), true, true, never_asked);
+        let g = trust_gate_with(std::path::Path::new("/x"), true, true, true, never_asked);
         assert!(matches!(g, TrustGate::Proceed));
     }
 
     #[test]
+    fn trust_path_headless_stderr() {
+        let cwd = r"C:\work/mixed\literal";
+        for (style, windows_label) in [
+            (true, "C:/work/mixed/literal"),
+            (false, r"C:\work\mixed\literal"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "trust_gate_tests::trust_path_headless_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HRDR_TRUST_PATH_STYLE", style.to_string())
+                .env("HRDR_TRUST_PATH_CWD", cwd)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{stderr}");
+            let label = if cfg!(windows) { windows_label } else { cwd };
+            assert_eq!(
+                stderr.replace("\r\n", "\n"),
+                format!(
+                    "hrdr: {label} is not a trusted directory — running in jail mode (read-only, no shell).\nhrdr: open hrdr here interactively once to decide.\n"
+                )
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated stderr child"]
+    fn trust_path_headless_child() {
+        let cwd = std::path::PathBuf::from(std::env::var_os("HRDR_TRUST_PATH_CWD").unwrap());
+        let style = std::env::var("HRDR_TRUST_PATH_STYLE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(matches!(
+            trust_gate_with(&cwd, true, false, style, never_asked),
+            TrustGate::Jail
+        ));
+    }
+
+    #[test]
+    fn trust_path_style_preserves_question_and_choice() {
+        let cwd = std::path::Path::new(r"C:\work/mixed\literal");
+        for style in [true, false] {
+            for choice in [TrustChoice::Untrusted, TrustChoice::Cancel] {
+                let mut asked = false;
+                let gate = trust_gate_with(cwd, false, false, style, |actual| {
+                    asked = true;
+                    assert_eq!(actual.as_os_str(), cwd.as_os_str());
+                    choice
+                });
+                assert!(asked);
+                assert!(matches!(
+                    (choice, gate),
+                    (TrustChoice::Untrusted, TrustGate::Jail)
+                        | (TrustChoice::Cancel, TrustGate::Stop)
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn declining_jails_and_cancelling_starts_nothing() {
-        let jailed = trust_gate_with(std::path::Path::new("/x"), false, false, |_| {
+        let jailed = trust_gate_with(std::path::Path::new("/x"), false, false, true, |_| {
             TrustChoice::Untrusted
         });
         assert!(matches!(jailed, TrustGate::Jail));
-        let stopped = trust_gate_with(std::path::Path::new("/x"), false, false, |_| {
+        let stopped = trust_gate_with(std::path::Path::new("/x"), false, false, true, |_| {
             TrustChoice::Cancel
         });
         assert!(matches!(stopped, TrustGate::Stop));

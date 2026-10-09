@@ -2497,16 +2497,20 @@ and **not** fixed.
   discovery/collision notices and delegation cwd refusals. Attachment
   diagnostics, clipboard file-URI refusals, generated `@file` headers, and
   attached directory labels also use it. File-completion popup labels restyle
-  without changing insertion values or ranking. Remaining work includes
-  startup/trust prompts and lower-level storage/configuration errors. Live
-  reload updates subsequent main-agent tool calls and newly spawned children;
-  existing children retain their own setting. Cwd/picker caches restyle on
-  reload. Keep this display-only: do not change filesystem targets or literal
-  Unix backslashes. Preserve unified-diff prefix semantics. Never rewrite file
-  bodies, user prose, or captured shell output. Cover both settings and
-  unchanged Unix behavior at each real rendering seam, including config-to-agent
-  wiring. Complete these presentation surfaces before moving to the newly
-  prioritized self-update tool.
+  without changing insertion values or ranking. Startup trust-screen and
+  headless jail-notice cwd labels also use it. Remaining work includes
+  lower-level storage/configuration errors and a final audit for missed UI
+  labels. Bootstrap policy awaits a decision: recover a correctly typed
+  preference from valid TOML when possible, otherwise default to `true`; retain
+  the active setting for failed live reloads. This is proposed, not implemented.
+  Live reload updates subsequent main-agent tool calls and newly spawned
+  children; existing children retain their own setting. Cwd/picker caches
+  restyle on reload. Keep this display-only: do not change filesystem targets or
+  literal Unix backslashes. Preserve unified-diff prefix semantics. Never
+  rewrite file bodies, user prose, or captured shell output. Cover both settings
+  and unchanged Unix behavior at each real rendering seam, including
+  config-to-agent wiring. Complete these presentation surfaces before moving to
+  the newly prioritized self-update tool.
 - **Unix completion filename identity:** `walk_files_gitignore` and
   `walk_files_fallback` in `hrdr-app/src/util.rs` unconditionally replace
   literal backslashes with `/` in matching/insertion candidates. This predates
