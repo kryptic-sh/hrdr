@@ -23,13 +23,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pickers and completions refresh on reload without changing stored theme specs.
   Skill base-directory footers follow the setting for both model loading and
   user invocation, without rewriting skill bodies or trailing instructions.
-  Access checks, LSP protocol paths, and diagnostic message text remain
-  unchanged. Stale-read errors preserve the original culprit command. Headline
-  caches refresh on configuration reload, which also updates subsequent
-  main-agent tool calls and newly spawned children; existing children retain
-  their own setting. Unix rendering, stored tool arguments/results, file
-  contents, and filesystem targets are unchanged. Other path presentation
-  surfaces remain pending.
+  Command/skill source labels retain raw discovery provenance and render with
+  the invocation's setting; open command pickers restyle cached rows on reload
+  without rewriting arbitrary source prose or rediscovering files. Access
+  checks, LSP protocol paths, and diagnostic message text remain unchanged.
+  Stale-read errors preserve the original culprit command. Headline caches
+  refresh on configuration reload, which also updates subsequent main-agent tool
+  calls and newly spawned children; existing children retain their own setting.
+  Unix rendering, stored tool arguments/results, file contents, and filesystem
+  targets are unchanged. Other path presentation surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

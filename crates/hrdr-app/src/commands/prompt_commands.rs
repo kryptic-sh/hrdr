@@ -47,10 +47,21 @@ pub struct PromptEntry {
     pub description: String,
     /// Where it came from (a home-shortened directory, or `built-in`).
     pub source: String,
+    /// Raw discovery path retained so an open picker can restyle its source.
+    pub source_path: Option<std::path::PathBuf>,
     pub kind: PromptEntryKind,
 }
 
 impl PromptEntry {
+    /// Refresh only the path-backed source; authored labels stay untouched.
+    pub fn restyle_source(&mut self, unix_style_paths: bool) {
+        self.source = hrdr_agent::display_discovery_source(
+            &self.source,
+            self.source_path.as_deref(),
+            unix_style_paths,
+        );
+    }
+
     /// The row's right-hand column: what it is, why it is unusable if it is, and
     /// its description. One definition so the TUI picker and the headless text
     /// listing say the same thing.
@@ -75,13 +86,18 @@ impl PromptEntry {
 /// showing up" is otherwise unanswerable from the UI. Both kinds of shadowing
 /// are marked: a command owning the name, and a higher-precedence skill root
 /// holding a bundle of the same name.
-pub fn prompt_entries(commands: &[Command], skills: &DiscoveredSkills) -> Vec<PromptEntry> {
+pub fn prompt_entries(
+    commands: &[Command],
+    skills: &DiscoveredSkills,
+    unix_style_paths: bool,
+) -> Vec<PromptEntry> {
     let mut out: Vec<PromptEntry> = commands
         .iter()
         .map(|c| PromptEntry {
             name: c.name.clone(),
             description: c.description.clone(),
             source: c.source.clone(),
+            source_path: c.source_path.clone(),
             kind: PromptEntryKind::Command,
         })
         .collect();
@@ -93,6 +109,7 @@ pub fn prompt_entries(commands: &[Command], skills: &DiscoveredSkills) -> Vec<Pr
         name: s.name.clone(),
         description: s.description.clone(),
         source: s.source.clone(),
+        source_path: s.source_path.clone(),
         kind: if shadowed_by_command(&s.name) {
             PromptEntryKind::ShadowedSkill("a command".to_string())
         } else {
@@ -106,14 +123,19 @@ pub fn prompt_entries(commands: &[Command], skills: &DiscoveredSkills) -> Vec<Pr
         name: s.name.clone(),
         description: s.description.clone(),
         source: s.source.clone(),
+        source_path: s.source_path.clone(),
         kind: PromptEntryKind::ShadowedSkill("a higher-precedence skill".to_string()),
     }));
     out.extend(skills.invalid.iter().map(|i| PromptEntry {
         name: i.name.clone(),
         description: String::new(),
         source: i.path.clone(),
+        source_path: i.source_path.clone(),
         kind: PromptEntryKind::InvalidSkill(i.reason.clone()),
     }));
+    for entry in &mut out {
+        entry.restyle_source(unix_style_paths);
+    }
     out
 }
 
@@ -193,6 +215,7 @@ mod tests {
             description: desc.to_string(),
             body: "…".to_string(),
             source: "test".to_string(),
+            source_path: None,
             args: Vec::new(),
             model_invocable: true,
         }
@@ -204,10 +227,64 @@ mod tests {
             description: desc.to_string(),
             body: "…".to_string(),
             source: "~/.claude/skills".to_string(),
+            source_path: None,
             base_dir: std::path::PathBuf::from("/home/me/.claude/skills").join(name),
             license: None,
             compatibility: None,
             metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn source_styles_cover_all_row_kinds_without_changing_authored_text() {
+        let root = std::path::PathBuf::from(r"/source/literal\name");
+        let mut c = command("git/commit", r"description\with/slashes");
+        c.source_path = Some(root.clone());
+        let mut s = skill("normal", r"skill\description/text");
+        s.source_path = Some(root.clone());
+        let mut shadowed = s.clone();
+        shadowed.name = "git/commit".into();
+        let discovery = DiscoveredSkills {
+            skills: vec![s.clone(), shadowed],
+            shadowed: vec![s],
+            invalid: vec![InvalidSkill {
+                name: "broken".into(),
+                path: "old file label".into(),
+                source_path: Some(root.join("SKILL.md")),
+                reason: r"reason\is/not/a/path".into(),
+            }],
+        };
+        let mut prose = command("prose", "");
+        prose.source = r"prose\is/not/a/path".into();
+        let commands = vec![c, prose];
+        let original = (commands.clone(), discovery.clone());
+        for style in [false, true, false] {
+            let rows = prompt_entries(&commands, &discovery, style);
+            let expected = if cfg!(windows) {
+                if style {
+                    "/source/literal/name"
+                } else {
+                    r"\source\literal\name"
+                }
+            } else {
+                r"/source/literal\name"
+            };
+            for index in [0, 2, 3, 4] {
+                assert_eq!(rows[index].source, expected);
+                assert_eq!(rows[index].source_path.as_ref(), Some(&root));
+            }
+            assert_eq!(rows[1].source, commands[1].source);
+            assert_eq!(rows[1].detail(), commands[1].source);
+            let sep = if cfg!(windows) && !style { '\\' } else { '/' };
+            assert_eq!(rows[5].source, format!("{expected}{sep}SKILL.md"));
+            assert_eq!(rows[5].detail(), r"invalid skill: reason\is/not/a/path");
+            assert_eq!(rows[0].name, "git/commit");
+            assert_eq!(rows[0].detail(), commands[0].description);
+            assert_eq!(
+                prompt_completions(":git/", &commands, &discovery.skills),
+                vec![(":git/commit".into(), commands[0].description.clone())]
+            );
+            assert_eq!((&commands, &discovery), (&original.0, &original.1));
         }
     }
 
@@ -291,6 +368,7 @@ mod tests {
                 skills: vec![skill("pdf-fill", "fill in a PDF form")],
                 ..Default::default()
             },
+            true,
         );
         let hay = entries
             .iter()
@@ -324,9 +402,11 @@ mod tests {
                 invalid: vec![InvalidSkill {
                     name: "broken".to_string(),
                     path: "~/.claude/skills/broken/SKILL.md".to_string(),
+                    source_path: None,
                     reason: "missing `description`".to_string(),
                 }],
             },
+            true,
         );
         let by = |name: &str| entries.iter().find(|e| e.name == name).unwrap();
         assert_eq!(by("ship").kind, PromptEntryKind::Command);

@@ -3856,6 +3856,7 @@ mod tests {
             description: description.to_string(),
             body: "THE BODY".to_string(),
             source: "~/secret/place".to_string(),
+            source_path: None,
             args: Vec::new(),
             model_invocable: true,
         }
@@ -3998,6 +3999,7 @@ mod tests {
             description: description.to_string(),
             body: "THE BODY".to_string(),
             source: "~/secret/place".to_string(),
+            source_path: None,
             base_dir: std::path::PathBuf::from("/secret/place/skills").join(name),
             license: None,
             compatibility: None,

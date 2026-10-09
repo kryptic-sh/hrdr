@@ -39,7 +39,7 @@ pub use chatgpt_models::{
     chatgpt_model_catalog, parse_catalog,
 };
 mod paths;
-pub use paths::{cwd_slug, display_dir, display_dir_with_style};
+pub use paths::{cwd_slug, display_dir, display_dir_with_style, display_discovery_source};
 mod commands;
 pub use commands::{
     Command, builtin_commands, command_match_key, discover_commands, expand_body, expand_command,
@@ -4505,6 +4505,7 @@ mod tests {
             description: "fill in a PDF form".to_string(),
             body: "Body.".to_string(),
             source: "test".to_string(),
+            source_path: None,
             base_dir: std::path::PathBuf::from("/tmp/skills/pdf-fill"),
             license: None,
             compatibility: None,

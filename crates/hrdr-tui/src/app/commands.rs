@@ -489,6 +489,7 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
         let entries = hrdr_app::prompt_entries(
             &hrdr_app::discover_commands(&cwd, project),
             &hrdr_app::discover_skills(&cwd, project),
+            self.app.unix_style_paths(),
         );
         self.app.command_selector = Some(super::command_selector(entries));
     }

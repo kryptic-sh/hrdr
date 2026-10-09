@@ -70,6 +70,8 @@ pub struct Command {
     pub body: String,
     /// Where it came from, for the `/commands` listing (home-shortened dir).
     pub source: String,
+    /// Raw discovery root, absent for parser-provided labels and built-ins.
+    pub source_path: Option<PathBuf>,
     /// Candidate argument values (frontmatter `args:`, comma-separated or
     /// `[a, b]`), offered by the completion popup after `:name `.
     pub args: Vec<String>,
@@ -194,7 +196,8 @@ pub fn discover_commands(cwd: &Path, project: crate::prompt::ProjectInstructions
             let Some(name) = namespaced_name(&dir, path) else {
                 continue;
             };
-            if let Some(command) = parse_command_file(&text, &name, &crate::display_dir(&dir)) {
+            if let Some(mut command) = parse_command_file(&text, &name, &crate::display_dir(&dir)) {
+                command.source_path = Some(dir.clone());
                 found.push(command);
             }
         }
@@ -264,6 +267,7 @@ pub fn parse_command_file(text: &str, derived_name: &str, source: &str) -> Optio
         description: fm.description.unwrap_or_default(),
         body: body.to_string(),
         source: source.to_string(),
+        source_path: None,
         args: fm.args,
         model_invocable: fm.model_invocable,
     })
@@ -542,7 +546,11 @@ impl hrdr_tools::Tool for CommandTool {
             "Command `{}` (source: {}) — instructions from the user or this project; follow them \
              for this task.\n\n{}",
             command.name,
-            command.source,
+            crate::display_discovery_source(
+                &command.source,
+                command.source_path.as_deref(),
+                ctx.unix_style_paths
+            ),
             expand_body(command, arguments)
         );
         Ok(hrdr_tools::truncate_saved(
@@ -582,8 +590,110 @@ mod tests {
             description: desc.to_string(),
             body: body.to_string(),
             source: "test".to_string(),
+            source_path: None,
             args: Vec::new(),
             model_invocable: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_sources_follow_each_invocation_style_without_rewriting_labels() {
+        use hrdr_tools::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let command_root = dir.path().join(".hrdr").join("commands");
+        let skill_root = dir.path().join(".hrdr").join("skills");
+        let base = skill_root.join("group").join("source-style");
+        std::fs::create_dir_all(command_root.join("git")).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        let body = r"Keep authored\body/unchanged";
+        let description = r"Keep authored\description/unchanged";
+        std::fs::write(command_root.join("git").join("commit.md"), body).unwrap();
+        let skill_text =
+            format!("---\nname: source-style\ndescription: {description}\n---\n{body}");
+        std::fs::write(base.join("SKILL.md"), &skill_text).unwrap();
+        let mut commands = discover_commands(dir.path(), crate::ProjectInstructions::Load);
+        let mut skills =
+            crate::discover_skills(dir.path(), crate::ProjectInstructions::Load).skills;
+        let prose = r"User prose\not/a/path";
+        commands.push(parse_command_file(body, "prose", prose).unwrap());
+        skills.push(
+            crate::skills::parse_skill_file(
+                "---\nname: prose\ndescription: prose\n---\nBody",
+                "prose",
+                prose,
+                &base,
+            )
+            .unwrap(),
+        );
+        assert!(commands.last().unwrap().source_path.is_none());
+        assert!(skills.last().unwrap().source_path.is_none());
+        assert!(builtin_commands().iter().all(|c| c.source_path.is_none()));
+        let raw_commands = commands.clone();
+        let raw_skills = skills.clone();
+        assert_eq!(
+            commands
+                .iter()
+                .find(|c| c.name == "git/commit")
+                .unwrap()
+                .source_path
+                .as_ref(),
+            Some(&command_root)
+        );
+        assert_eq!(
+            skills
+                .iter()
+                .find(|s| s.name == "source-style")
+                .unwrap()
+                .source_path
+                .as_ref(),
+            Some(&skill_root)
+        );
+        let command_tool = CommandTool {
+            commands: Arc::new(Mutex::new(commands)),
+        };
+        let skill_tool = crate::skills::SkillTool {
+            skills: Arc::new(Mutex::new(skills)),
+        };
+        let mut ctx = hrdr_tools::ToolContext::new(dir.path().to_path_buf());
+        for style in [false, true, false] {
+            ctx.unix_style_paths = style;
+            for (tool, name, root, prefix) in [
+                (
+                    &command_tool as &dyn Tool,
+                    "git/commit",
+                    &command_root,
+                    "Command",
+                ),
+                (
+                    &skill_tool as &dyn Tool,
+                    "source-style",
+                    &skill_root,
+                    "Skill",
+                ),
+            ] {
+                let out = tool
+                    .execute(serde_json::json!({"name": name}), &ctx)
+                    .await
+                    .unwrap();
+                assert!(
+                    out.starts_with(&format!(
+                        "{prefix} `{name}` (source: {})",
+                        crate::display_dir_with_style(root, style)
+                    )),
+                    "{out}"
+                );
+                assert!(out.contains(body));
+                let out = tool
+                    .execute(serde_json::json!({"name": "prose"}), &ctx)
+                    .await
+                    .unwrap();
+                assert!(
+                    out.starts_with(&format!("{prefix} `prose` (source: {prose})")),
+                    "{out}"
+                );
+            }
+            assert_eq!(*command_tool.commands.lock().unwrap(), raw_commands);
+            assert_eq!(*skill_tool.skills.lock().unwrap(), raw_skills);
         }
     }
 

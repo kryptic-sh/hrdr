@@ -416,6 +416,7 @@ mod tests {
             description: String::new(),
             body: "…".to_string(),
             source: "test".to_string(),
+            source_path: None,
             args: vec!["staging".to_string(), "production".to_string()],
             model_invocable: true,
         }];

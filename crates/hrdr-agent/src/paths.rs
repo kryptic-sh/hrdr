@@ -54,6 +54,18 @@ pub fn display_dir_with_style(dir: &Path, unix_style_paths: bool) -> String {
     hrdr_tools::display_path(Path::new(&display_dir(dir)), unix_style_paths)
 }
 
+/// Render a discovery source only when discovery supplied its raw path.
+pub fn display_discovery_source(
+    label: &str,
+    path: Option<&Path>,
+    unix_style_paths: bool,
+) -> String {
+    path.map_or_else(
+        || label.to_string(),
+        |path| display_dir_with_style(path, unix_style_paths),
+    )
+}
+
 /// Collapse `home` at a path boundary in `path` to `~`. A prefix match alone
 /// isn't enough: `home = /home/mx` would strip the `/home/mx` off
 /// `/home/mxaddict/proj` too, collapsing it to the bogus `~addict/proj`. Only

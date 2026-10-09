@@ -205,6 +205,21 @@ pub(crate) fn command_selector(entries: Vec<PromptEntry>) -> CommandSelector {
     Selector::new(entries, prompt_entry_haystack, filter_prompt_entries)
 }
 
+impl Selector<PromptEntry> {
+    /// Restyle the cached snapshot without conflating duplicate names.
+    pub(crate) fn restyle_sources(&mut self, unix_style_paths: bool) {
+        let current = self.filtered.get(self.selected).copied();
+        for entry in &mut self.choices {
+            entry.restyle_source(unix_style_paths);
+        }
+        self.haystacks = self.choices.iter().map(prompt_entry_haystack).collect();
+        self.filtered = (self.filter_fn)(&self.haystacks, &self.filter);
+        self.selected = current
+            .and_then(|current| self.filtered.iter().position(|&i| i == current))
+            .unwrap_or(0);
+    }
+}
+
 pub(crate) type LoginProviderSelector = Selector<LoginProviderChoice>;
 pub(crate) fn login_provider_selector(choices: Vec<LoginProviderChoice>) -> LoginProviderSelector {
     Selector::new(choices, login_provider_haystack, filter_login_providers)

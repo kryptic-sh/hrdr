@@ -383,6 +383,7 @@ pub trait CommandHost {
         let entries = crate::prompt_entries(
             &crate::discover_commands(&cwd, project),
             &crate::discover_skills(&cwd, project),
+            self.unix_style_paths(),
         );
         let mut s = format!(
             "{} commands and skills (invoke with :name [arguments]):",

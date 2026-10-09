@@ -2787,6 +2787,9 @@ impl App {
             if let Some(sel) = &mut self.theme_selector {
                 sel.replace_theme_choices(hrdr_app::theme_choices(cfg.unix_style_paths));
             }
+            if let Some(sel) = &mut self.command_selector {
+                sel.restyle_sources(cfg.unix_style_paths);
+            }
         }
         crate::ui::clear_transcript_cache();
         // Effort and the compaction thresholds are the *agent's* — it publishes them
@@ -3750,6 +3753,124 @@ mod tests {
             assert_eq!(
                 app.active_completions().unwrap().items[0].1,
                 hrdr_agent::display_dir_with_style(&dir, style)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_restyles_warm_command_picker_without_rediscovery() {
+        use hrdr_app::CommandHost;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".hrdr");
+        let commands = root.join("commands");
+        let skills = root.join("skills");
+        let shadowed = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("style-reload.md"), "Body").unwrap();
+        let description = r"Keep description\with/slashes";
+        std::fs::write(
+            commands.join("described.md"),
+            format!("---\ndescription: {description}\n---\nBody"),
+        )
+        .unwrap();
+        for dir in [&skills, &shadowed] {
+            let base = dir.join("group").join("style-reload");
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::write(
+                base.join("SKILL.md"),
+                "---\nname: style-reload\ndescription: skill description\n---\nBody",
+            )
+            .unwrap();
+        }
+        let invalid = skills.join("broken");
+        std::fs::create_dir_all(&invalid).unwrap();
+        std::fs::write(invalid.join("SKILL.md"), "Invalid").unwrap();
+        let mut cfg = AgentConfig {
+            model: "local://test-model".parse().unwrap(),
+            cwd: tmp.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            unix_style_paths: false,
+            ..Default::default()
+        };
+        let ui = hrdr_app::UiConfig {
+            auto_resume: false,
+            ..Default::default()
+        };
+        let mut app = App::new(cfg.clone(), ui.clone(), "logo").unwrap();
+        super::commands::TuiHost { app: &mut app }.begin_command_selector();
+        app.editor.set_content(":described");
+        assert_eq!(
+            app.active_completions().unwrap().items,
+            vec![(":described".into(), description.into())]
+        );
+        let sel = app.command_selector.as_mut().unwrap();
+        let initial = sel.rows().cloned().collect::<Vec<_>>();
+        for c in "style-reload".chars() {
+            sel.push_char(c);
+        }
+        sel.down();
+        sel.down();
+        assert_eq!(sel.current().unwrap().source_path.as_ref(), Some(&shadowed));
+        // A warm picker must restyle its snapshot, not scan the disk again.
+        std::fs::write(commands.join("late-arrival.md"), "Late").unwrap();
+        for style in [true, false] {
+            cfg.unix_style_paths = style;
+            app.apply_runtime_config(&cfg, &ui);
+            app.cfg = cfg.clone();
+            let sel = app.command_selector.as_mut().unwrap();
+            assert_eq!(sel.filter, "style-reload");
+            assert_eq!(sel.selected, 2);
+            assert_eq!(sel.current().unwrap().source_path.as_ref(), Some(&shadowed));
+            while !sel.filter.is_empty() {
+                sel.backspace();
+            }
+            let rows = sel.rows().collect::<Vec<_>>();
+            assert_eq!(rows.len(), initial.len());
+            for (row, original) in rows.iter().zip(&initial) {
+                assert_eq!(row.source_path, original.source_path);
+                assert_eq!(row.name, original.name);
+                assert_eq!(row.description, original.description);
+                assert_eq!(row.kind, original.kind);
+                assert_eq!(
+                    row.source,
+                    hrdr_agent::display_discovery_source(
+                        &original.source,
+                        original.source_path.as_deref(),
+                        style
+                    )
+                );
+            }
+            let command = rows
+                .iter()
+                .find(|r| r.name == "style-reload" && r.kind == hrdr_app::PromptEntryKind::Command)
+                .unwrap();
+            assert_eq!(
+                command.detail(),
+                hrdr_agent::display_dir_with_style(&commands, style)
+            );
+            let broken = rows.iter().find(|r| r.name == "broken").unwrap();
+            assert_eq!(broken.source_path.as_ref(), Some(&invalid.join("SKILL.md")));
+            assert_eq!(
+                broken.source,
+                hrdr_agent::display_dir_with_style(&invalid.join("SKILL.md"), style)
+            );
+            let query = hrdr_agent::display_dir_with_style(&shadowed, style);
+            for c in query.chars() {
+                sel.push_char(c);
+            }
+            assert_eq!(sel.rows().count(), 1, "refreshed source haystack: {query}");
+            assert_eq!(sel.current().unwrap().source_path.as_ref(), Some(&shadowed));
+            while !sel.filter.is_empty() {
+                sel.backspace();
+            }
+            for c in "style-reload".chars() {
+                sel.push_char(c);
+            }
+            sel.down();
+            sel.down();
+            assert_eq!(
+                app.active_completions().unwrap().items,
+                vec![(":described".into(), description.into())]
             );
         }
     }

@@ -70,6 +70,8 @@ pub struct Skill {
     pub body: String,
     /// Which root it came from, for the `/commands` listing (home-shortened).
     pub source: String,
+    /// Raw discovery root, absent for parser-provided labels.
+    pub source_path: Option<PathBuf>,
     /// The directory holding the `SKILL.md` — absolute, and the anchor every
     /// relative path inside the body (`scripts/x.py`, `references/spec.md`)
     /// resolves against. Named in the tool's output for exactly that reason.
@@ -95,6 +97,8 @@ pub struct InvalidSkill {
     pub name: String,
     /// The offending `SKILL.md`, home-shortened for display.
     pub path: String,
+    /// Raw offending file, when supplied by discovery.
+    pub source_path: Option<PathBuf>,
     /// Why it was skipped, in one line.
     pub reason: String,
 }
@@ -218,7 +222,10 @@ pub fn discover_skills(
                 continue;
             };
             match parse_skill_file(&text, dir_name, &source, base_dir) {
-                Ok(skill) => found.push(skill),
+                Ok(mut skill) => {
+                    skill.source_path = Some(dir.clone());
+                    found.push(skill);
+                }
                 // Silent on stderr on purpose, like `discover_commands`: this runs
                 // inside the TUI, so writing there would corrupt the display. The
                 // reason travels in the returned list instead, which is what the
@@ -226,6 +233,7 @@ pub fn discover_skills(
                 Err(reason) => out.invalid.push(InvalidSkill {
                     name: dir_name.to_string(),
                     path: crate::display_dir(path),
+                    source_path: Some(path.to_path_buf()),
                     reason,
                 }),
             }
@@ -319,6 +327,7 @@ pub fn parse_skill_file(
         description,
         body: body.trim().to_string(),
         source: source.to_string(),
+        source_path: None,
         base_dir: base_dir.to_path_buf(),
         license: scalar("license"),
         compatibility: scalar("compatibility"),
@@ -478,7 +487,11 @@ impl hrdr_tools::Tool for SkillTool {
             "Skill `{}` (source: {}) — a procedure bundle from the user or this project; follow \
              it for this task.\n\n{}",
             skill.name,
-            skill.source,
+            crate::display_discovery_source(
+                &skill.source,
+                skill.source_path.as_deref(),
+                ctx.unix_style_paths
+            ),
             skill_prompt(skill, "", ctx.unix_style_paths)
         );
         Ok(hrdr_tools::truncate_saved(
@@ -722,6 +735,7 @@ mod tests {
             description: "the command".to_string(),
             body: "Run the command.".to_string(),
             source: "test".to_string(),
+            source_path: None,
             args: Vec::new(),
             model_invocable: true,
         }];
@@ -730,6 +744,7 @@ mod tests {
             description: "the skill".to_string(),
             body: "Run the skill.".to_string(),
             source: "test".to_string(),
+            source_path: None,
             base_dir: PathBuf::from("/tmp/skills/ship"),
             license: None,
             compatibility: None,
@@ -756,6 +771,7 @@ mod tests {
             description: "audit it".to_string(),
             body: "Audit the tree. $ARGUMENTS".to_string(),
             source: "test".to_string(),
+            source_path: None,
             base_dir: PathBuf::from("/tmp/skills/audit"),
             license: None,
             compatibility: None,
@@ -787,6 +803,7 @@ mod tests {
             description: "fill a pdf".to_string(),
             body: "Run scripts/fill.py.".to_string(),
             source: "~/.claude/skills".to_string(),
+            source_path: None,
             base_dir: PathBuf::from("/home/me/.claude/skills/pdf-fill"),
             license: None,
             compatibility: None,
@@ -829,6 +846,7 @@ mod tests {
             description: r"Keep description\with/slashes".into(),
             body: r"Run scripts\fill.py and scripts/fill.py. $ARGUMENTS".into(),
             source: r"source\with/slashes".into(),
+            source_path: None,
             base_dir: PathBuf::from(r"/tmp/literal\name/skill"),
             license: None,
             compatibility: None,
@@ -892,6 +910,7 @@ mod tests {
                 description: "fill a pdf".to_string(),
                 body: "Body.".to_string(),
                 source: "test".to_string(),
+                source_path: None,
                 base_dir: PathBuf::from("/tmp/skills/pdf-fill"),
                 license: None,
                 compatibility: None,
@@ -1064,6 +1083,7 @@ mod tests {
                 description: "a very long procedure".to_string(),
                 body: body.clone(),
                 source: "test".to_string(),
+                source_path: None,
                 base_dir: PathBuf::from("/tmp/skills/long"),
                 license: None,
                 compatibility: None,
