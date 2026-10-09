@@ -533,6 +533,212 @@ fn buffer_to_string(buf: &Buffer) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn idle_logo_redraws_on_timer_only_while_its_glyphs_are_visible() {
+    use crate::tui::{Wake, wait_for_event};
+    use std::time::{Duration, Instant};
+
+    let mut h = Harness::new(vec![]).await;
+    let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+    let mut events = futures_util::stream::pending();
+    let mut ticker = tokio::time::interval(Duration::from_millis(ui::SPINNER_FRAME_MS));
+    let deadline = Duration::from_secs(3);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(h.app.logo_visible);
+
+    // Consume the interval's immediate first tick before measuring periodic
+    // redraws. Both input sources stay pending throughout these waits.
+    assert!(matches!(
+        tokio::time::timeout(
+            deadline,
+            wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker)
+        )
+        .await
+        .expect("visible logo must wake the production event wait"),
+        Wake::Animation
+    ));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let logo_colors = |buf: &Buffer| {
+        buf.content
+            .chunks(buf.area.width as usize)
+            .flat_map(|row| &row[..row.len() - 1])
+            .filter(|cell| cell.symbol() == "█")
+            .map(|cell| cell.fg)
+            .collect::<Vec<_>>()
+    };
+    let initial = logo_colors(term.backend().buffer());
+    assert!(
+        !initial.is_empty(),
+        "the draw must contain actual logo cells"
+    );
+    let started = Instant::now();
+    let mut draws = 0;
+    let mut changed = false;
+    while started.elapsed() < deadline && (draws < 2 || !changed) {
+        assert!(matches!(
+            tokio::time::timeout(
+                deadline,
+                wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker)
+            )
+            .await
+            .expect("periodic animation wake without keyboard input"),
+            Wake::Animation
+        ));
+        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        draws += 1;
+        changed |= logo_colors(term.backend().buffer()) != initial;
+    }
+    assert!(
+        draws >= 2 && changed,
+        "periodic draws must change logo foregrounds"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(ui::SPINNER_FRAME_MS));
+
+    h.app
+        .push_entry(Entry::now(EntryKind::Notice("offscreen\n".repeat(80))));
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(!h.app.logo_visible);
+    assert!(logo_colors(term.backend().buffer()).is_empty());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(ui::SPINNER_FRAME_MS * 3),
+            wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker),
+        )
+        .await
+        .is_err(),
+        "an offscreen logo must not wake the loop"
+    );
+
+    // Existing non-logo animations still enable the same timer wait.
+    for compacting in [true, false] {
+        h.app
+            .registry
+            .update(hrdr_agent::MAIN_KEY, |e| e.compacting = compacting);
+        *h.app.todos.lock().unwrap() = if compacting {
+            Vec::new()
+        } else {
+            vec![hrdr_agent::Todo {
+                id: 1,
+                content: "working".into(),
+                status: "in_progress".into(),
+                evidence: None,
+            }]
+        };
+        term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        assert!(!h.app.logo_visible);
+        assert!(matches!(
+            tokio::time::timeout(
+                deadline,
+                wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker)
+            )
+            .await
+            .expect("non-logo animation still wakes the loop"),
+            Wake::Animation
+        ));
+    }
+    h.app.todos.lock().unwrap().clear();
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(h.app.logo_visible, "scrolling back restores eligibility");
+    let mut empty = Terminal::new(TestBackend::new(0, 0)).unwrap();
+    empty.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        !h.app.logo_visible,
+        "an empty frame clears the previous visibility"
+    );
+}
+
+#[tokio::test]
+async fn idle_logo_overlay_occlusion_controls_production_wait() {
+    use crate::tui::{Wake, wait_for_event};
+    use std::time::Duration;
+
+    let mut h = Harness::new(vec![]).await;
+    let mut events = futures_util::stream::pending();
+    let mut ticker = tokio::time::interval(Duration::from_millis(ui::SPINNER_FRAME_MS));
+    let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let glyphs = |buf: &Buffer| {
+        buf.content
+            .chunks(buf.area.width as usize)
+            .flat_map(|row| &row[..row.len() - 1])
+            .filter(|cell| cell.symbol() == "█")
+            .count()
+    };
+    assert!(glyphs(term.backend().buffer()) > 0);
+    h.type_str("/help");
+    h.press(KeyCode::Enter);
+    assert!(h.app.popup.is_some());
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert_eq!(glyphs(term.backend().buffer()), 0);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(ui::SPINNER_FRAME_MS * 3),
+            wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker),
+        )
+        .await
+        .is_err(),
+        "a fully covered logo must not wake the production wait"
+    );
+    assert!(!h.app.logo_visible);
+
+    // Painting the same symbols over the logo does not preserve its provenance.
+    h.app.popup.as_mut().unwrap().text = "█".repeat(82).repeat(20);
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(glyphs(term.backend().buffer()) > 0);
+    assert!(!h.app.logo_visible);
+    assert!(!h.app.spinner_live());
+
+    // The centered popup leaves the logo's left columns exposed on a wide frame.
+    let mut wide = Terminal::new(TestBackend::new(140, 30)).unwrap();
+    h.app.popup.as_mut().unwrap().text = "overlay".into();
+    wide.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    let partial = glyphs(wide.backend().buffer());
+    assert!(partial > 0);
+    assert!(h.app.logo_visible);
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker),
+        )
+        .await
+        .expect("uncovered logo glyphs must keep animating"),
+        Wake::Animation
+    ));
+    h.app.popup = None;
+    wide.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(glyphs(wide.backend().buffer()) > partial);
+}
+
+#[tokio::test]
+async fn logo_visibility_excludes_details_whitespace_and_clipped_columns() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.logo = "██";
+    h.app
+        .push_entry(Entry::now(EntryKind::Notice("tail\n".repeat(80))));
+    let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    h.app.scroll_offset = h.app.max_scroll;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(h.app.logo_visible);
+    h.app.scroll_offset = h.app.max_scroll - 2;
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(buffer_to_string(term.backend().buffer()).contains("provider"));
+    assert!(!h.app.logo_visible, "header details are not logo glyphs");
+
+    h.app.scroll_offset = h.app.max_scroll;
+    h.app.logo = "   ";
+    term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(!h.app.logo_visible, "whitespace cannot animate");
+    h.app.logo = TEST_LOGO;
+    for (width, visible) in [(2, false), (8, true)] {
+        let mut narrow = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        h.app.scroll_offset = usize::MAX;
+        narrow.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+        assert_eq!(h.app.logo_visible, visible, "width {width}");
+    }
+}
+
 /// A block's padding row may carry the left bar (`┃`). Strip it before asking
 /// whether the row is blank.
 fn without_bar(row: &str) -> &str {
@@ -6734,7 +6940,12 @@ async fn the_agent_list_switches_the_focused_agent() {
     click_at(&mut h.app, 3, sub_y);
     assert_eq!(h.app.panes.active(), hrdr_app::PaneId(1));
 
+    h.app.logo_visible = true;
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
+    assert!(
+        !h.app.logo_visible,
+        "switching panes clears main's logo visibility"
+    );
     let screen = buffer_to_string(term.backend().buffer());
     assert!(
         screen.contains("reading the codebase"),

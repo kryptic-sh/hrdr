@@ -153,10 +153,16 @@ push each verified slice to `main` before proceeding to the next slice.
     executable-in-use replacement and terminal handoff as well as Unix restart
     behavior. A failed build/install must leave the current instance usable; a
     failed restart must leave a recoverable session and actionable diagnostics.
-    Resolve installation source/root, verification requirements, and restart
-    recovery protocol before implementation. Test actual process replacement,
-    version identity, automatic turn continuation, exact goal/TODO preservation,
-    and failure recovery on the supported platform matrix.
+    Approved on 2026-10-09: build the current clean working copy on `main`,
+    requiring its commit to match live `origin/main` and successful GitHub CI
+    for that exact hash in the origin repository (forks supported). Install into
+    the default user Cargo location. No permanent launcher: if Windows refuses
+    safe executable promotion, abort and keep the current instance usable. After
+    committed handoff, recover from durable state rather than letting both
+    processes continue. Resolve the detailed recovery protocol before
+    implementation. Test actual process replacement, version identity, automatic
+    turn continuation, exact goal/TODO preservation, and failure recovery on the
+    supported platform matrix.
 12. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
@@ -182,15 +188,12 @@ rejection were not exercised; retain those as security coverage gaps. Transport
 CI run `37799426844` passed after rerunning its unprovisioned macOS Clippy job;
 that result does not cover later registration/runtime changes.
 
-CI follow-up: run `37916451624` (`8c00e34c`) passed all platform nextest jobs
-and Linux ordinary tests after the test corrections. macOS ordinary tests
-instead failed the unchanged immediate directory-count bound in
-`socket_only_turnover_stays_bounded_with_live_survivor`. Retained duplicate
-handles demonstrably delay close-only lock release; that mechanism is covered by
-an owner-unlock regression, but its role in this CI failure is unproven. Confirm
-the correction on macOS before declaring the matrix green. Actual fork
-inheritance, foreign-PID guard destruction, and unlock/stderr failure injection
-remain untested.
+CI run `37922581404` (`82f51778`) passed Windows/Linux/macOS nextest, ordinary
+tests under leak guards, Clippy, build/smoke, dependency checks, and
+release-target builds after the streaming fixture and lock-lifetime corrections.
+The duplicate-handle regression demonstrates delayed close-only release, not
+proof of the earlier macOS failure's cause. Actual fork inheritance, foreign-PID
+guard destruction, and unlock/stderr failure injection remain untested.
 
 During the export/editor label slice, an additional local leak-guard run
 reported `a_real_tool_round_keeps_the_scrolled_up_viewport` failing with
@@ -2526,13 +2529,11 @@ and **not** fixed.
   tests. If not fixable in hrdr, record the verified limitation and reason here,
   including any external setting/workaround and unverified reproduction gaps. Do
   not attribute the cause to Alacritty without evidence.
-- **Logo animation stalls in Windows 11 Terminal — reported 2026-10-09.** The
-  header's animated hrdr logo does not animate until the user types. Trace timer
-  ticks, idle event polling, redraw scheduling, and animation cache keys;
-  reproduce without keyboard events. Verify expected idle animation behavior
-  before fixing it and test timer-driven redraws. Keep this distinct from cursor
-  flicker unless evidence establishes a shared cause; record any reproduction
-  limitation or external-terminal blocker.
+- **Idle logo verification gaps:** Timer-driven redraw and modal/completion
+  occlusion are covered through the production event wait and TestBackend.
+  Visual behavior in Windows Terminal/Alacritty was not reproduced. Toast-stack
+  occlusion is not included in visibility tracking; wide/combining glyph
+  clipping and the additional header-visibility pass's cost remain unmeasured.
 - **The Job Object is assigned after spawn.** A descendant forked in that window
   escapes the tree kill; documented in the `proc` module docs. The race-free
   form (`CREATE_SUSPENDED` → assign → resume) is awkward through tokio.

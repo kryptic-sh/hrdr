@@ -536,6 +536,8 @@ pub(crate) struct App {
     /// Persistent clock anchor for the header's logo animation. Captured once:
     /// re-anchoring per frame would pin the animation's tick at 0.
     pub(crate) header_anchor: Instant,
+    /// Whether the last draw's transcript viewport contained logo glyphs.
+    pub(crate) logo_visible: bool,
     /// Per-message timestamp style: none / relative / exact (`/timestamps`).
     /// Status-bar mode: none / truncate / wrap (`/statusbar`).
     pub(crate) statusbar_mode: StatusBarMode,
@@ -973,6 +975,7 @@ impl App {
             theme,
             logo,
             header_anchor: Instant::now(),
+            logo_visible: false,
             statusbar_mode,
             dir,
             dir_cwd: cwd_for_commands.clone(),
@@ -2303,10 +2306,12 @@ impl App {
     /// visible pane's model is generating, or the agent is compacting), a turn
     /// in flight on any pane (running tool blocks, streaming reasoning, and the
     /// agent switcher's running rows), a running `!command` (its open tool
-    /// block), or an in-progress todo row. The run loop polls its spinner
-    /// ticker only while this is true, so an idle screen stops redrawing at
-    /// ~8.3 Hz.
+    /// block), an in-progress todo row, or logo glyphs in the last viewport.
+    /// The run loop polls its ticker only while this is true.
     pub(crate) fn spinner_live(&self) -> bool {
+        if self.logo_visible {
+            return true;
+        }
         let pane = self.panes.active_pane();
         // The loader on the visible pane — the one animated element that can be
         // live while the registry reports nothing running: a `/compact` on an

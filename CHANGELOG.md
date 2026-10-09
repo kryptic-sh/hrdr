@@ -101,6 +101,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Visible header logos animate while the session is idle.** The TUI timer
+  includes visible logo glyphs without invalidating transcript caches. Offscreen
+  logos and logos fully covered by modal/completion overlays do not enable idle
+  redraws; partially exposed logos continue animating.
 - **IPC lock release follows its owning guard's lifetime.** Mutation and
   generation locks explicitly unlock in their acquiring process when dropped, so
   surviving duplicate handles do not retain them after owner cleanup. Listener

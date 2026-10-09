@@ -102,6 +102,27 @@ mod tests {
     }
 }
 
+pub(crate) enum Wake {
+    Input(Option<std::io::Result<Event>>),
+    Message(crate::app::TurnMsg),
+    Animation,
+}
+
+/// The event wait shared by the terminal driver and headless rendering tests.
+pub(crate) async fn wait_for_event(
+    app: &App,
+    events: &mut (impl futures_util::Stream<Item = std::io::Result<Event>> + Unpin),
+    rx: &mut tokio::sync::mpsc::Receiver<crate::app::TurnMsg>,
+    ticker: &mut tokio::time::Interval,
+) -> Wake {
+    tokio::select! {
+        event = events.next() => Wake::Input(event),
+        Some(msg) = rx.recv() => Wake::Message(msg),
+        // An offscreen logo must not keep an idle transcript redrawing.
+        _ = ticker.tick(), if app.spinner_live() => Wake::Animation,
+    }
+}
+
 /// Drive `app` against the terminal until it quits: draw, then await terminal
 /// input, agent messages, config-file changes, or a spinner tick.
 pub(crate) async fn run_loop(
@@ -192,8 +213,8 @@ pub(crate) async fn run_loop(
             break;
         }
 
-        tokio::select! {
-            maybe_ev = events.next() => match maybe_ev {
+        match wait_for_event(app, &mut events, &mut rx, &mut ticker).await {
+            Wake::Input(maybe_ev) => match maybe_ev {
                 Some(Ok(Event::Key(key))) => match app.on_key(key) {
                     // Leaving the alt screen for `$EDITOR` resets the cursor
                     // shape; forget ours so the next frame asks for it again.
@@ -215,7 +236,7 @@ pub(crate) async fn run_loop(
                 Some(Ok(_)) => {}
                 Some(Err(_)) | None => break,
             },
-            Some(msg) = rx.recv() => {
+            Wake::Message(msg) => {
                 app.on_turn_msg(msg);
                 // Drain any further messages that arrived in the same burst so
                 // fast-streaming endpoints don't cause 100+ full redraws/sec —
@@ -224,11 +245,7 @@ pub(crate) async fn run_loop(
                     app.on_turn_msg(msg);
                 }
             }
-            // Polled only while something animated is on screen: with the guard
-            // false the arm is disabled and the interval is never polled, so it
-            // does not advance — the loop blocks on real events instead of
-            // redrawing the idle frame at ~8.3 Hz forever.
-            _ = ticker.tick(), if app.spinner_live() => {}
+            Wake::Animation => {}
         }
     }
     Ok(())
