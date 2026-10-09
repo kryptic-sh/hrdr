@@ -166,39 +166,15 @@ rejection were not exercised; retain those as security coverage gaps. Transport
 CI run `37799426844` passed after rerunning its unprovisioned macOS Clippy job;
 that result does not cover later registration/runtime changes.
 
-Registration CI run `37816556829` failed Unix ordinary workspace tests in
-`socket_only_turnover_stays_bounded_with_live_survivor`: `Listener::bind`
-returned `WouldBlock` during turnover. Unix nextest passed. Trace the lock
-holder if necessary and, with approval of the test-contract correction, use
-existing bounded `retry_busy` around ordinary binds while retaining deliberate
-contention assertions. The Windows test job independently failed the streaming
-deadline test below. Runtime CI run `37821267488` (`52caee9`) repeated those
-Unix `WouldBlock` and Windows streaming-timeout failures. Linux/macOS nextest,
-all platform Clippy/build/smoke jobs, and dependency checks passed, but the full
-matrix is not green. Do not describe the full feature as cross-platform
-verified. Fifth-push check `37846228890` (`9f3690b`) passed nextest, Clippy,
-build/smoke on Windows/Linux/macOS and the Windows leak guard. Linux/macOS
-ordinary tests under the leak guard still failed on the same registration
-`WouldBlock`; the bounded-retry test correction remains approval-blocked.
-Tenth-push run `37855182787` (`b707018`) also failed Windows nextest in
-`bang_command_output_is_capped_while_streaming_not_just_at_the_end` with
-`timed out waiting for shell events`. macOS ordinary tests additionally hit
-`WouldBlock` in `mutation_lock_blocks_independent_handles_and_registration`. The
-registration and streaming test-contract corrections still await approval.
-Fifteenth-push run `37867044400` (`56d30d5`) repeated the Windows streaming
-receive timeout and Linux/macOS ordinary-suite `WouldBlock` in
-`socket_only_turnover_stays_bounded_with_live_survivor`. Platform Clippy and
-build/smoke, Linux/macOS nextest, Windows leak guard, and dependency jobs
-passed. The streaming test still imposes a shorter receive-inactivity timeout
-despite intentional silence after the live-output cap; the log does not
-establish that the child would finish within its overall deadline. No test
-contract was changed. Twentieth-push run `37875336123` (`09b898a`) passed
-nextest, Clippy, and build/smoke on Windows/Linux/macOS, dependency checks, the
-Windows leak guard, and release-target builds. Linux/macOS ordinary tests under
-the leak guard still failed the same registration turnover test with
-`Kind(WouldBlock)`; the full pipeline remains red. During the export/editor
-label slice, an additional local leak-guard run reported
-`a_real_tool_round_keeps_the_scrolled_up_viewport` failing with
+CI follow-up: thirtieth-push run `37912493951` (`af2f59d2`) failed the Windows
+streaming receive timeout and Linux/macOS ordinary-suite registration turnover
+`Kind(WouldBlock)`. Linux/macOS nextest and the new completion identity
+regressions passed; all platform Clippy/build/smoke, dependency jobs, and the
+Windows leak guard passed. Confirm the approved test corrections on the next CI
+run before declaring the full matrix green.
+
+During the export/editor label slice, an additional local leak-guard run
+reported `a_real_tool_round_keeps_the_scrolled_up_viewport` failing with
 `a turn event: Elapsed(())` and `A TEST LEAKED TEMPFILE DIRS INTO /tmp.`. The
 timeout and surviving directories have not been independently attributed. The
 session-write label slice also reported default-nextest shell/watch timeout
@@ -214,12 +190,8 @@ gate and separate enabled leak-guard run passed. This remains an uncorrected
 intermittent native-pipe test failure, not evidence of a session-read
 regression.
 
-Twenty-fifth-push run `37884707688` (`2c696028`) again failed only Linux/macOS
-leak-guard jobs on registration turnover `Kind(WouldBlock)`. All platform
-nextest, Clippy, build/smoke, dependency checks, Windows leak guard, and
-release-target builds passed. The proposed registration retry change still
-awaits approval. Config-mutation path tests cover storage and frontend failures;
-OAuth completion's captured preference is source-inspected, not exercised by a
+Config-mutation path tests cover storage and frontend failures; OAuth
+completion's captured preference is source-inspected, not exercised by a
 dedicated async regression test. Credential-save browser capture is likewise
 source-inspected rather than covered by a network/save integration test.
 Credential replacement-failure coverage uses a Windows readonly fixture; the
@@ -246,16 +218,6 @@ Distinguish interpreter startup latency from output capture with deterministic
 readiness-based coverage; do not weaken the partial-output assertions. A
 read-only investigation also reported a possible post-kill output-drain gap in
 `ShellTool`; verify that separately before fixing.
-
-**Windows CI streaming-test deadline:** Run `37779585497` failed
-`bang_command_output_is_capped_while_streaming_not_just_at_the_end` in
-`crates/hrdr-tui/src/app/e2e.rs` while waiting for shell events. The test
-imposes an inter-event timeout even though `forward_user_shell_output`
-deliberately stops forwarding after `USER_SHELL_LIVE_OUTPUT_CAP`. Investigate
-and, subject to user approval of the test-contract correction, use the existing
-overall deadline for receives while preserving completion and byte-cap
-assertions. The eventual child completion time in that CI failure remains
-unverified.
 
 ## GitHub Actions setup-zig cache verification
 
@@ -2513,18 +2475,18 @@ and **not** fixed.
 - **LSP `diagnostics_note` compares paths case-sensitively.** A model-supplied
   path whose case differs from the workspace root gets no diagnostics on a
   case-insensitive filesystem.
-- **Path presentation verification follow-up.** Run the config-diagnostic
-  changes on Linux/macOS CI and finish the final consumer audit before declaring
-  every path surface covered. Startup diagnostics recover a typed preference
-  from valid TOML or default to `true`; failed reloads retain the active style.
-  The reload regression exercises manual dispatch and the mtime handler, not the
-  watcher/event loop; successful hot-reload notices and independently exact
-  reload parser reasons are not asserted. Preserve filesystem identities, Unix
-  literal backslashes, parser excerpts, protocol URIs, and captured shell
-  output.
+- **Path presentation verification follow-up.** Config-diagnostic regressions
+  passed Linux/macOS CI in `37912493951`; the bounded consumer audit found no
+  further active gaps, not exhaustive proof. Startup diagnostics recover a typed
+  preference from valid TOML or default to `true`; failed reloads retain the
+  active style. The reload regression exercises manual dispatch and the mtime
+  handler, not the watcher/event loop; successful hot-reload notices and
+  independently exact reload parser reasons are not asserted. Preserve
+  filesystem identities, Unix literal backslashes, parser excerpts, protocol
+  URIs, and captured shell output.
 - **Completion identity verification gaps:** Unix collision tests in
-  `hrdr-app/src/util.rs` and `hrdr-tui/src/app/e2e.rs` require Linux/macOS CI;
-  local verification was Windows-only, including a failing
+  `hrdr-app/src/util.rs` and `hrdr-tui/src/app/e2e.rs` passed Linux/macOS CI in
+  `37912493951`; local verification was Windows-only, including a failing
   separator-normalization mutation. Unix old-code red/green remains unrun.
   Directory collision tests assert indexing/acceptance, not distinct listing
   resolution. The equal-length basename-ranking fixture cannot distinguish

@@ -9062,7 +9062,7 @@ async fn bang_command_output_is_capped_while_streaming_not_just_at_the_end() {
             tokio::time::Instant::now() < deadline,
             "shell events never arrived — the pipes may have backed up and deadlocked"
         );
-        match tokio::time::timeout(std::time::Duration::from_secs(10), h.rx.recv()).await {
+        match tokio::time::timeout_at(deadline, h.rx.recv()).await {
             Ok(Some(msg)) => {
                 if let TurnMsg::UserShell(hrdr_agent::AgentEvent::ToolOutput { chunk, .. }, _) =
                     &msg
