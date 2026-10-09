@@ -49,10 +49,10 @@ const MAX_AGENT_PROFILES_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 /// Errors when a file still spells the identity as the old `provider:` +  `model:`
 /// pair. An agent file is **configuration**, and the two keys could always
 /// disagree — so, like config.toml, a stale one is refused rather than guessed at.
-pub fn discover_agent_profiles(cwd: &Path) -> Result<Vec<SubagentProfile>> {
+pub fn discover_agent_profiles(cwd: &Path, unix_style_paths: bool) -> Result<Vec<SubagentProfile>> {
     let mut out: Vec<SubagentProfile> = Vec::new();
     for dir in agent_dirs(cwd) {
-        for profile in read_dir_profiles(&dir)? {
+        for profile in read_dir_profiles(&dir, unix_style_paths)? {
             // First source wins: skip a name already registered.
             if out
                 .iter()
@@ -106,7 +106,7 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 ///   named by path, that fails the whole directory — that behavior is
 ///   intentional and covered by
 ///   [`a_provider_key_in_an_agent_file_is_an_error_naming_the_fix`](tests::a_provider_key_in_an_agent_file_is_an_error_naming_the_fix).
-fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
+fn read_dir_profiles(dir: &Path, unix_style_paths: bool) -> Result<Vec<SubagentProfile>> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(Vec::new());
     };
@@ -121,7 +121,10 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
         }
         let len = path.metadata().map(|m| m.len()).unwrap_or(0);
         if len > MAX_AGENTS_FILE_BYTES {
-            eprintln!("hrdr: skipping agent file {} (too large)", path.display());
+            eprintln!(
+                "hrdr: skipping agent file {} (too large)",
+                hrdr_tools::display_path(&path, unix_style_paths)
+            );
             continue;
         }
         // Aggregate ceiling across the directory: stop once this dir has read
@@ -148,10 +151,10 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
             Err(e) if e.is::<InvalidYamlFrontmatter>() => {
                 eprintln!(
                     "hrdr: skipping agent file {} — invalid frontmatter: {e:#}",
-                    path.display()
+                    hrdr_tools::display_path(&path, unix_style_paths)
                 );
             }
-            Err(e) => return Err(legacy_error(&path, &e)),
+            Err(e) => return Err(legacy_error(&path, &e, unix_style_paths)),
         }
     }
     if truncated {
@@ -159,7 +162,7 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
             "hrdr: agent-profile discovery in {} hit the aggregate cap \
              ({MAX_AGENT_PROFILES} files / {MAX_AGENT_PROFILES_TOTAL_BYTES} bytes); \
              some files were not read",
-            dir.display()
+            hrdr_tools::display_path(dir, unix_style_paths)
         );
     }
     // Stable order within a directory (read_dir order is unspecified).
@@ -168,8 +171,11 @@ fn read_dir_profiles(dir: &Path) -> Result<Vec<SubagentProfile>> {
 }
 
 /// An agent file's parse error, named by the file it came from.
-fn legacy_error(path: &Path, err: &anyhow::Error) -> anyhow::Error {
-    anyhow::anyhow!("hrdr: {}: {err:#}", path.display())
+fn legacy_error(path: &Path, err: &anyhow::Error, unix_style_paths: bool) -> anyhow::Error {
+    anyhow::anyhow!(
+        "hrdr: {}: {err:#}",
+        hrdr_tools::display_path(path, unix_style_paths)
+    )
 }
 
 /// Parse one agent file (`text`) into a profile, using `filename_stem` as the
@@ -576,7 +582,7 @@ mod tests {
         )
         .unwrap();
 
-        let found = discover_agent_profiles(cwd).unwrap();
+        let found = discover_agent_profiles(cwd, false).unwrap();
         let revs: Vec<&SubagentProfile> = found.iter().filter(|p| p.name == "reviewer").collect();
         assert_eq!(revs.len(), 1, "same name registered once");
         // .claude precedes .opencode in the precedence order → it wins.
@@ -605,14 +611,19 @@ mod tests {
         let agents = dir.path().join(".hrdr").join("agents");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(agents.join("builder.md"), text).unwrap();
-        let err = discover_agent_profiles(dir.path())
-            .expect_err("discovery refuses it too")
-            .to_string();
-        assert!(err.contains("builder.md"), "names the file: {err}");
-        assert!(
-            err.contains("model: openrouter://deepseek/deepseek-chat"),
-            "{err}"
-        );
+        for style in [false, true] {
+            let err = discover_agent_profiles(dir.path(), style)
+                .expect_err("discovery refuses it too")
+                .to_string();
+            let reason = parse_agent_file(text, "builder").unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "hrdr: {}: {reason:#}",
+                    hrdr_tools::display_path(&agents.join("builder.md"), style)
+                )
+            );
+        }
     }
 
     /// `model: inherit` still means "the main agent's identity" — no spec at all.
@@ -795,13 +806,126 @@ mod tests {
         )
         .unwrap();
 
-        let found = discover_agent_profiles(dir.path()).unwrap();
+        let found = discover_agent_profiles(dir.path(), false).unwrap();
         assert!(
             !found.iter().any(|p| p.name == "broken"),
             "invalid YAML frontmatter must not produce a profile, even with read_only/tools set"
         );
         let fine = found.iter().find(|p| p.name == "fine").unwrap();
         assert_eq!(fine.description.as_deref(), Some("a working agent"));
+    }
+
+    #[test]
+    fn presentation_path_warnings() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root
+            .path()
+            .join(if cfg!(unix) { r"repo\literal" } else { "repo" });
+        let agents = cwd.join(".hrdr").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let broken = agents.join("broken.md");
+        let text = "---\n[provider/model\\literal]\n---\nbody";
+        std::fs::write(&broken, text).unwrap();
+        let reason = parse_agent_file(text, "broken").unwrap_err();
+        let large = agents.join("large.md");
+        std::fs::write(&large, vec![b'x'; MAX_AGENTS_FILE_BYTES as usize + 1]).unwrap();
+        std::fs::write(agents.join("explore.md"), "body").unwrap();
+        let cap = root.path().join("cap");
+        std::fs::create_dir(&cap).unwrap();
+        for i in 0..=MAX_AGENT_PROFILES {
+            std::fs::write(cap.join(format!("{i}.md")), "body").unwrap();
+        }
+        for style in [false, true] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "agents_dir::tests::presentation_path_warnings_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HRDR_PRESENTATION_CWD", &cwd)
+                .env("HRDR_PRESENTATION_CAP", &cap)
+                .env("HRDR_PRESENTATION_STYLE", style.to_string())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{stderr}");
+            for expected in [
+                format!(
+                    "hrdr: skipping agent file {} (too large)",
+                    hrdr_tools::display_path(&large, style)
+                ),
+                format!(
+                    "hrdr: skipping agent file {} — invalid frontmatter: {reason:#}",
+                    hrdr_tools::display_path(&broken, style)
+                ),
+                format!(
+                    "hrdr: agent-profile discovery in {} hit the aggregate cap ({MAX_AGENT_PROFILES} files / {MAX_AGENT_PROFILES_TOTAL_BYTES} bytes); some files were not read",
+                    hrdr_tools::display_path(&cap, style)
+                ),
+                format!(
+                    "hrdr: ignoring repo-local agent profile 'explore' from \"{}\" — it collides with a built-in agent name; built-ins cannot be overridden by discovered files",
+                    hrdr_tools::display_path(&cwd, style)
+                ),
+            ] {
+                assert!(
+                    stderr.lines().any(|line| line == expected),
+                    "missing {expected:?} in {stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run by presentation_path_warnings in a private process"]
+    fn presentation_path_warnings_child() {
+        let style = std::env::var("HRDR_PRESENTATION_STYLE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let cfg = crate::AgentConfig {
+            cwd: PathBuf::from(std::env::var_os("HRDR_PRESENTATION_CWD").unwrap()),
+            unix_style_paths: style,
+            ..Default::default()
+        };
+        let profiles = crate::delegation::resolve_agent_profiles(&cfg).unwrap();
+        assert_eq!(profiles.iter().filter(|p| p.name == "explore").count(), 1);
+        let cap = PathBuf::from(std::env::var_os("HRDR_PRESENTATION_CAP").unwrap());
+        assert_eq!(
+            read_dir_profiles(&cap, style).unwrap().len(),
+            MAX_AGENT_PROFILES
+        );
+    }
+
+    #[test]
+    fn presentation_path_config_discovery_preserves_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root
+            .path()
+            .join(if cfg!(unix) { r"repo\literal" } else { "repo" });
+        let agents = cwd.join(".hrdr").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let file = agents.join("legacy.md");
+        let text = "---\nprovider: provider/mixed\\literal\nmodel: model/mixed\\literal\n---\nbody";
+        std::fs::write(&file, text).unwrap();
+        let reason = parse_agent_file(text, "legacy").unwrap_err();
+        assert!(reason.to_string().contains(r"provider/mixed\literal"));
+        for style in [false, true] {
+            let cfg = crate::AgentConfig {
+                cwd: cwd.clone(),
+                unix_style_paths: style,
+                ..Default::default()
+            };
+            assert_eq!(
+                crate::delegation::resolve_agent_profiles(&cfg)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "hrdr: {}: {reason:#}",
+                    hrdr_tools::display_path(&file, style)
+                )
+            );
+        }
     }
 
     /// A directory holding far more than `MAX_AGENT_PROFILES` files yields a
@@ -818,7 +942,7 @@ mod tests {
             )
             .unwrap();
         }
-        let profiles = read_dir_profiles(dir.path()).unwrap();
+        let profiles = read_dir_profiles(dir.path(), false).unwrap();
         assert_eq!(
             profiles.len(),
             MAX_AGENT_PROFILES,

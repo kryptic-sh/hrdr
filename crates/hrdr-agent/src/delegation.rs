@@ -1193,6 +1193,7 @@ fn resolve_subagent_cwd(
     requested: Option<&str>,
     parent: &std::path::Path,
     mode: hrdr_tools::SandboxMode,
+    unix_style_paths: bool,
 ) -> Result<PathBuf> {
     let jailed = mode == hrdr_tools::SandboxMode::Jail;
     let requested = requested.map(str::trim).filter(|s| !s.is_empty());
@@ -1200,7 +1201,7 @@ fn resolve_subagent_cwd(
         if jailed {
             bail!(
                 "this agent is jailed, so `cwd` is required: it decides what the agent may read                  at all. Pass the narrowest directory containing what needs auditing (e.g.                  `vendor/some-dep`), or `{}` — your own working directory — to let it read                  everything.",
-                parent.display()
+                hrdr_tools::display_path(parent, unix_style_paths)
             );
         }
         return Ok(parent.to_path_buf());
@@ -1210,16 +1211,16 @@ fn resolve_subagent_cwd(
     if !resolved.starts_with(&parent_canon) {
         bail!(
             "`cwd` must be inside your own working directory: {requested:?} resolves to {} ,              which is outside {}. Pass a path within it, or {} itself.",
-            resolved.display(),
-            parent_canon.display(),
-            parent_canon.display()
+            hrdr_tools::display_path(&resolved, unix_style_paths),
+            hrdr_tools::display_path(&parent_canon, unix_style_paths),
+            hrdr_tools::display_path(&parent_canon, unix_style_paths)
         );
     }
     if !resolved.is_dir() {
         bail!(
             "`cwd` {requested:?} does not exist (resolved to {}). Pass a directory that is              there — check the path with `ls` first — or your own working directory {} to use              the whole project.",
-            resolved.display(),
-            parent_canon.display()
+            hrdr_tools::display_path(&resolved, unix_style_paths),
+            hrdr_tools::display_path(&parent_canon, unix_style_paths)
         );
     }
     Ok(resolved)
@@ -1534,6 +1535,7 @@ impl hrdr_tools::Tool for SubagentTool {
             args.get("cwd").and_then(|v| v.as_str()),
             &ctx.cwd,
             crate::config::effective_sandbox(cfg.sandbox, cfg.read_only),
+            ctx.unix_style_paths,
         )?;
         // Inherit the parent's resolved memory roots, so the sub-agent shares the
         // repo's PROJECT memory rather than deriving a scope of its own.
@@ -2147,15 +2149,16 @@ pub fn resolve_agent_profiles(config: &AgentConfig) -> Result<Vec<SubagentProfil
     }
     let mut profiles = builtin_subagent_profiles();
     let builtin_names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
-    for mut p in discover_agent_profiles(&config.cwd)? {
+    for mut p in discover_agent_profiles(&config.cwd, config.unix_style_paths)? {
         if builtin_names
             .iter()
             .any(|n| n.eq_ignore_ascii_case(&p.name))
         {
             eprintln!(
-                "hrdr: ignoring repo-local agent profile '{}' from {:?} — it collides with a \
+                "hrdr: ignoring repo-local agent profile '{}' from \"{}\" — it collides with a \
                  built-in agent name; built-ins cannot be overridden by discovered files",
-                p.name, config.cwd
+                p.name,
+                hrdr_tools::display_path(&config.cwd, config.unix_style_paths)
             );
             continue;
         }
@@ -2620,6 +2623,67 @@ mod background_publication_tests {
 /// to ask for, and the ones it is not.
 #[cfg(test)]
 mod scoped_cwd_tests {
+    #[test]
+    fn presentation_path_refusals_and_identity() {
+        use super::resolve_subagent_cwd;
+        use hrdr_tools::{SandboxMode, canonicalize_nearest, display_path, resolve_under};
+        let root = tempfile::tempdir().unwrap();
+        let parent = root
+            .path()
+            .join(if cfg!(unix) { r"repo\literal" } else { "repo" });
+        std::fs::create_dir_all(parent.join("vendor").join("child")).unwrap();
+        let canonical = canonicalize_nearest(&parent);
+        for style in [false, true] {
+            let label = display_path(&parent, style);
+            let err = resolve_subagent_cwd(None, &parent, SandboxMode::Jail, style)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("or `{label}` — your own working directory")),
+                "{err}"
+            );
+            for requested in [r"../outside\mixed/path", r"vendor/missing\mixed"] {
+                let resolved = canonicalize_nearest(&resolve_under(&parent, requested));
+                let err = resolve_subagent_cwd(Some(requested), &parent, SandboxMode::Jail, style)
+                    .unwrap_err()
+                    .to_string();
+                let resolved_label = display_path(&resolved, style);
+                let parent_label = display_path(&canonical, style);
+                if requested.starts_with("..") {
+                    assert!(
+                        err.contains(&format!("{requested:?} resolves to {resolved_label} ,")),
+                        "{err}"
+                    );
+                    assert!(err.contains(&format!("which is outside {parent_label}. Pass a path within it, or {parent_label} itself.")), "{err}");
+                } else {
+                    assert!(
+                        err.contains(&format!(
+                            "`cwd` {requested:?} does not exist (resolved to {resolved_label})."
+                        )),
+                        "{err}"
+                    );
+                    assert!(
+                        err.contains(&format!("working directory {parent_label} to use")),
+                        "{err}"
+                    );
+                }
+            }
+            assert_eq!(
+                resolve_subagent_cwd(None, &parent, SandboxMode::Write, style).unwrap(),
+                parent
+            );
+            assert_eq!(
+                resolve_subagent_cwd(Some("vendor/child"), &parent, SandboxMode::Jail, style)
+                    .unwrap(),
+                canonical.join("vendor").join("child")
+            );
+            assert_eq!(
+                resolve_subagent_cwd(Some("."), &parent, SandboxMode::Jail, style).unwrap(),
+                canonical
+            );
+        }
+    }
+
     /// **A jailed delegation must name its own scope**, and the scope cannot be
     /// wider than the caller's. `cwd` is that agent's whole world — everything it
     /// may read — so inheriting it silently is the hole: "audit `vendor/sketchy`"
@@ -2635,7 +2699,7 @@ mod scoped_cwd_tests {
         std::fs::create_dir_all(parent.join("vendor").join("sketchy")).unwrap();
 
         // Omitted for a jailed agent: refused, and the error names both ways out.
-        let err = resolve_subagent_cwd(None, &parent, SandboxMode::Jail)
+        let err = resolve_subagent_cwd(None, &parent, SandboxMode::Jail, false)
             .expect_err("a jailed agent must be scoped deliberately")
             .to_string();
         assert!(err.contains("`cwd` is required"), "{err}");
@@ -2644,18 +2708,19 @@ mod scoped_cwd_tests {
 
         // Omitted for anything else: inherit, as before.
         assert_eq!(
-            resolve_subagent_cwd(None, &parent, SandboxMode::Write).unwrap(),
+            resolve_subagent_cwd(None, &parent, SandboxMode::Write, false).unwrap(),
             parent
         );
 
         // Narrowed: accepted, relative to the caller.
         assert_eq!(
-            resolve_subagent_cwd(Some("vendor/sketchy"), &parent, SandboxMode::Jail).unwrap(),
+            resolve_subagent_cwd(Some("vendor/sketchy"), &parent, SandboxMode::Jail, false)
+                .unwrap(),
             parent.join("vendor").join("sketchy")
         );
         // The caller's own cwd: the explicit "audit everything" answer.
         assert_eq!(
-            resolve_subagent_cwd(Some("."), &parent, SandboxMode::Jail).unwrap(),
+            resolve_subagent_cwd(Some("."), &parent, SandboxMode::Jail, false).unwrap(),
             parent
         );
 
@@ -2663,7 +2728,7 @@ mod scoped_cwd_tests {
         // makes "jail" mean whatever the model asked for.
         for escape in ["/", "..", "../..", "/etc"] {
             for mode in [SandboxMode::Jail, SandboxMode::Write] {
-                let err = resolve_subagent_cwd(Some(escape), &parent, mode)
+                let err = resolve_subagent_cwd(Some(escape), &parent, mode, false)
                     .expect_err("{escape} must not be reachable")
                     .to_string();
                 assert!(err.contains("must be inside your own"), "{escape}: {err}");
@@ -2675,7 +2740,7 @@ mod scoped_cwd_tests {
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/", parent.join("escape")).unwrap();
-            let err = resolve_subagent_cwd(Some("escape"), &parent, SandboxMode::Jail)
+            let err = resolve_subagent_cwd(Some("escape"), &parent, SandboxMode::Jail, false)
                 .expect_err("a symlink out is still out")
                 .to_string();
             assert!(err.contains("must be inside your own"), "{err}");
@@ -2683,7 +2748,7 @@ mod scoped_cwd_tests {
 
         // A missing path FAILS rather than falling back to the parent: a silent
         // fallback is exactly the widening this prevents.
-        let err = resolve_subagent_cwd(Some("vendor/typo"), &parent, SandboxMode::Jail)
+        let err = resolve_subagent_cwd(Some("vendor/typo"), &parent, SandboxMode::Jail, false)
             .expect_err("a missing path is an error")
             .to_string();
         assert!(err.contains("does not exist"), "{err}");
