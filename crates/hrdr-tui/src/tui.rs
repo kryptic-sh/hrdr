@@ -181,7 +181,7 @@ pub(crate) async fn run_loop(
             terminal.clear()?;
             terminal_title_sent = None;
         }
-        terminal.draw(|f| ui::draw(f, app))?;
+        crate::cursor_backend::draw_frame(terminal, |f| ui::draw(f, app))?;
         sync_title(
             terminal.backend_mut(),
             terminal_title(&app.state().name),

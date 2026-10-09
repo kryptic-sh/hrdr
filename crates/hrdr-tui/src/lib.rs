@@ -16,6 +16,7 @@
 extern crate hrdr_test_support;
 
 mod app;
+mod cursor_backend;
 mod theme;
 mod trust_prompt;
 mod tui;
@@ -102,7 +103,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-type Tui = Terminal<CrosstermBackend<Stdout>>;
+type Tui = Terminal<cursor_backend::CursorBackend<CrosstermBackend<Stdout>>>;
 
 /// Leave the TUI screen so an external program (e.g. `$EDITOR`) can use the
 /// terminal: drop raw mode, the alt screen, and the keyboard enhancements.
@@ -160,7 +161,7 @@ pub async fn run(
     }));
 
     let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(stdout());
+    let backend = cursor_backend::CursorBackend::new(CrosstermBackend::new(stdout()));
     let mut terminal: Tui = Terminal::new(backend)?;
 
     // Session retention: a background worker compresses idle sessions and purges

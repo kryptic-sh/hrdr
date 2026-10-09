@@ -2514,21 +2514,22 @@ and **not** fixed.
   resolution. The equal-length basename-ranking fixture cannot distinguish
   lexical tie-breaking from a backslash-as-separator regression; add
   unequal-length candidates when strengthening ranking coverage.
-- **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
-  reproduced the same issue in both Alacritty and Windows 11 Terminal,
-  correcting the earlier observation that Windows 11 Terminal was unaffected.
-  The user reports blinking in sync with text updates: the cursor briefly moves
-  from transcript text to the input box, apparently following the render
-  cadence. Prioritize visibility during frame writes and final input-cursor
-  positioning, rather than assuming this is the terminal's periodic cursor-blink
-  setting. Investigate cursor visibility/style commands, rendering and focus
-  lifecycle, Windows console/ConPTY behavior, and Alacritty defaults.
-  Distinguish intended input-cursor blinking from an unintended visible cursor
-  or redraw flicker. Reproduce without disturbing the user's desktop; fix the
-  cause if feasible and cover cursor command/lifecycle behavior with regression
-  tests. If not fixable in hrdr, record the verified limitation and reason here,
-  including any external setting/workaround and unverified reproduction gaps. Do
-  not attribute the cause to Alacritty without evidence.
+- **Cursor rendering verification gaps — reported 2026-10-09.** The user saw
+  transcript-to-input cursor flicker in both Alacritty and Windows 11 Terminal.
+  `cursor_backend::draw_frame` now hides before frame output and reveals only
+  after final positioning and flushing; recording-backend tests cover the real
+  Ratatui drawing seam, failures, and unwind cleanup. Visual confirmation in
+  either terminal remains outstanding. Ordered writes do not make frames atomic
+  or guarantee terminal blink timing; restoration after output failure is best
+  effort. Coverage still excludes `Write` forwarding/short writes, autoresize
+  size/clear failures, and restoration-flush failure/panic injection.
+- **Parallel config-mutation test failure:** During cursor-adapter verification,
+  the ordinary parallel workspace suite failed in
+  `config_mutation_path_style_host_forwarding` at
+  `host.info_log.last().unwrap()`. The serial suite and nextest passed.
+  Investigate shared environment/config state before attributing the failure or
+  changing the test; do not treat serial success as proof that parallel
+  execution is reliable.
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage

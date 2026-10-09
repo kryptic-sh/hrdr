@@ -101,6 +101,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **TUI frame writes keep the cursor hidden until its input position is
+  flushed.** Deferred visibility prevents Ratatui's show-before-position
+  ordering from exposing the cursor amid transcript updates. Errors preserve the
+  original failure and attempt cursor restoration during cleanup.
 - **Header logos animate while within the transcript viewport.** The idle TUI
   timer includes logo glyphs without invalidating transcript caches, regardless
   of toast, modal, or completion overlays. Offscreen logos do not drive redraws.
