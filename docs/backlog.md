@@ -157,6 +157,22 @@ push each verified slice to `main` before proceeding to the next slice.
     recovery protocol before implementation. Test actual process replacement,
     version identity, automatic turn continuation, exact goal/TODO preservation,
     and failure recovery on the supported platform matrix.
+12. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
+    Deferred until the earlier queued work is finished. Compare hrdr's
+    OAuth-authenticated OpenAI requests with the official `openai/codex`
+    implementation: usage accounting, request categorization, and credit usage
+    as reflected in the GPT usage dashboard. Identify which request metadata,
+    endpoint behavior, and response usage/rate-limit fields Codex actually uses;
+    do not assume dashboard attribution is entirely client-controlled or invent
+    unsupported accounting fields. Trace hrdr's corresponding paths, implement
+    evidenced parity, and test request construction and usage interpretation.
+    Verify dashboard attribution with an authorized real account separately;
+    record any server-side visibility limits. Never log tokens or send private
+    request contents as diagnostics. Reference checkout:
+    `~/Projects/mxaddict/codex` from `https://github.com/openai/codex.git`,
+    cloned at `a06545b311fe01e51ce855c7aa5d8da21e9e7aaf`; pin the reference
+    revision used for the comparison. No comparison or implementation has been
+    performed yet.
 
 **Resume/verification gaps — 2026-10-09:** Work after the current messaging
 runtime slice was deferred at the user's wrap-up request. The queue above stays
