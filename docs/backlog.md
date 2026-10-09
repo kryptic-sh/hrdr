@@ -2522,11 +2522,14 @@ and **not** fixed.
   reload parser reasons are not asserted. Preserve filesystem identities, Unix
   literal backslashes, parser excerpts, protocol URIs, and captured shell
   output.
-- **Unix completion filename identity:** `walk_files_gitignore` and
-  `walk_files_fallback` in `hrdr-app/src/util.rs` unconditionally replace
-  literal backslashes with `/` in matching/insertion candidates. This predates
-  the display-style work. Fix separately with Unix filename regression coverage;
-  do not silently change the index while styling completion popup labels.
+- **Completion identity verification gaps:** Unix collision tests in
+  `hrdr-app/src/util.rs` and `hrdr-tui/src/app/e2e.rs` require Linux/macOS CI;
+  local verification was Windows-only, including a failing
+  separator-normalization mutation. Unix old-code red/green remains unrun.
+  Directory collision tests assert indexing/acceptance, not distinct listing
+  resolution. The equal-length basename-ranking fixture cannot distinguish
+  lexical tie-breaking from a backslash-as-separator regression; add
+  unequal-length candidates when strengthening ranking coverage.
 - **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
   reproduced the same issue in both Alacritty and Windows 11 Terminal,
   correcting the earlier observation that Windows 11 Terminal was unaffected.

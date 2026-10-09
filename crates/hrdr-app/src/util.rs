@@ -705,7 +705,9 @@ pub fn walk_files_gitignore(root: &Path) -> Vec<String> {
         if rel.as_os_str().is_empty() {
             continue;
         }
-        let rel = rel.to_string_lossy().replace('\\', "/");
+        let rel = rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         if ft.is_file() {
             out.push(rel);
         } else if ft.is_dir() {
@@ -738,13 +740,20 @@ fn walk_files_fallback(root: &Path) -> Vec<String> {
                 }
                 if let Ok(rel) = path.strip_prefix(root) {
                     // Selectable itself — `@dir/` attaches its listing.
-                    out.push(format!("{}/", rel.to_string_lossy().replace('\\', "/")));
+                    out.push(format!(
+                        "{}/",
+                        rel.to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/")
+                    ));
                 }
                 stack.push((path, depth + 1));
             } else if ft.is_file()
                 && let Ok(rel) = path.strip_prefix(root)
             {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+                out.push(
+                    rel.to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/"),
+                );
             }
             if out.len() >= WALK_MAX_FILES {
                 break;
@@ -854,6 +863,59 @@ mod tests {
             !items.iter().any(|i| i == "/" || i.is_empty()),
             "the root itself is not a candidate: {items:?}"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn completion_walkers_preserve_platform_path_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("d/e")).unwrap();
+        std::fs::write(root.join("a/b.txt"), r"nested\body").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::write(root.join(r"a\b.txt"), r"literal\body").unwrap();
+            std::fs::create_dir(root.join(r"d\e")).unwrap();
+        }
+        #[cfg(unix)]
+        let expected = ["a/", "a/b.txt", r"a\b.txt", "d/", "d/e/", "d\\e/"];
+        #[cfg(windows)]
+        let expected = ["a/", "a/b.txt", "d/", "d/e/"];
+        for walk in [walk_files_gitignore, walk_files_fallback] {
+            assert_eq!(walk(root), expected);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        spawn_file_index(root.to_path_buf(), move |index| tx.send(index).unwrap());
+        let index = rx.await.unwrap();
+        assert_eq!(
+            index,
+            expected.map(|p| (p.to_owned(), p.to_ascii_lowercase()))
+        );
+        for path in expected {
+            assert_eq!(
+                crate::rank_file_matches(&index, &path.to_ascii_uppercase())[0],
+                path
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            crate::rank_file_matches(&index, "B.TXT"),
+            ["a/b.txt", r"a\b.txt"]
+        );
+        for style in [false, true] {
+            let files = [
+                ("a/b.txt", r"nested\body"),
+                #[cfg(unix)]
+                (r"a\b.txt", r"literal\body"),
+            ];
+            let mentions = files.map(|(p, _)| format!("@{p} @{p}")).join(" ");
+            let out = expand_mentions_tracked(&mentions, root, style);
+            assert_eq!(out.inlined(), files.map(|(p, _)| root.join(p)));
+            for (_, body) in files {
+                assert_eq!(out.text().matches(body).count(), 1, "{}", out.text());
+            }
+        }
     }
 
     /// The paths reported alongside the expansion are the ones whose *whole*

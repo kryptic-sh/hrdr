@@ -101,6 +101,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Unix file completions preserve literal backslashes.** Both filesystem
+  walkers normalize only native separators, keeping `a\b.txt` distinct from
+  `a/b.txt` through indexing, mention resolution, and completion acceptance.
+  Windows candidates retain their `/` separator spelling.
 - **Windows home-directory display now falls back to `USERPROFILE`.**
   `display_dir` reuses the shared home resolver and recognizes native separator
   boundaries, so home descendants shorten to `~` without collapsing similarly

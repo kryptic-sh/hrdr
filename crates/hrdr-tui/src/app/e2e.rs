@@ -11178,6 +11178,56 @@ async fn cwd_changes_rediscover_skills_for_the_new_directory() {
     );
 }
 
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn indexed_completion_accepts_platform_path_identity() {
+    let mut h = Harness::new(vec![]).await;
+    let cwd = std::path::PathBuf::from(h.app.current_cwd());
+    std::fs::create_dir_all(cwd.join("a")).unwrap();
+    std::fs::create_dir_all(cwd.join("d/e")).unwrap();
+    std::fs::write(cwd.join("a/b.txt"), "nested body").unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::write(cwd.join(r"a\b.txt"), "literal body").unwrap();
+        std::fs::create_dir(cwd.join(r"d\e")).unwrap();
+    }
+    h.type_str("@");
+    let _ = h.app.active_completions();
+    h.wait_for("file index", |m| matches!(m, TurnMsg::FileIndex(..)))
+        .await;
+    let cases = [
+        ("a/b", "a/b.txt", " "),
+        ("d/e", "d/e/", ""),
+        #[cfg(unix)]
+        (r"a\b", r"a\b.txt", " "),
+        #[cfg(unix)]
+        (r"d\e", "d\\e/", ""),
+    ];
+    for style in [false, true] {
+        h.app.cfg.unix_style_paths = style;
+        for prefix in ["@", "/add ", "/edit "] {
+            for key in [KeyCode::Tab, KeyCode::Enter] {
+                for (query, path, mention_suffix) in cases {
+                    // Argument acceptance always separates the next argument;
+                    // directory mentions stay open for descending into the path.
+                    let suffix = if prefix == "@" { mention_suffix } else { " " };
+                    h.app.editor.set_content("");
+                    h.type_str(&format!("{prefix}{query}"));
+                    let completions = h.app.active_completions().expect("indexed candidates");
+                    assert_eq!(completions.items[0].insertion, path);
+                    assert!(
+                        h.app
+                            .file_index
+                            .contains(&(path.into(), path.to_ascii_lowercase()))
+                    );
+                    h.press(key);
+                    assert_eq!(h.app.editor.content(), format!("{prefix}{path}{suffix}"));
+                }
+            }
+        }
+    }
+}
+
 /// `@file` completion sees files that appear *after* its index was built. A
 /// recursive watcher on the cwd invalidates the cache on create/rename/remove,
 /// so a file added by a `git pull`, another shell, or the agent's own write
