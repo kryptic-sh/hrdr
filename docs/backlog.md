@@ -185,6 +185,14 @@ Tenth-push run `37855182787` (`b707018`) also failed Windows nextest in
 `timed out waiting for shell events`. macOS ordinary tests additionally hit
 `WouldBlock` in `mutation_lock_blocks_independent_handles_and_registration`. The
 registration and streaming test-contract corrections still await approval.
+Fifteenth-push run `37867044400` (`56d30d5`) repeated the Windows streaming
+receive timeout and Linux/macOS ordinary-suite `WouldBlock` in
+`socket_only_turnover_stays_bounded_with_live_survivor`. Platform Clippy and
+build/smoke, Linux/macOS nextest, Windows leak guard, and dependency jobs
+passed. The streaming test still imposes a shorter receive-inactivity timeout
+despite intentional silence after the live-output cap; the log does not
+establish that the child would finish within its overall deadline. No test
+contract was changed.
 
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four
@@ -2484,8 +2492,9 @@ and **not** fixed.
   notices, theme source labels, skill base-directory footers, and command/skill
   discovery source labels already use it. Generated system-prompt cwd/sandbox
   roots, skipped-AGENTS notices, and memory headings/pointers also use it and
-  refresh on style changes with memory enabled or disabled. Remaining work
-  includes path-bearing tool/profile/delegation notices, startup/trust prompts,
+  refresh on style changes with memory enabled or disabled. Memory-tool fallback
+  listing roots and malformed-memory error paths also use it. Remaining work
+  includes profile/delegation notices, startup/trust prompts,
   attachments/completion labels, and lower-level storage/configuration errors.
   Live reload updates subsequent main-agent tool calls and newly spawned
   children; existing children retain their own setting. Cwd/picker caches

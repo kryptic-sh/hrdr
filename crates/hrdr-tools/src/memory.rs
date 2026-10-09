@@ -216,7 +216,7 @@ impl Tool for MemoryTool {
 
         match a.action.as_str() {
             "view" => match a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-                None => Ok(view_index(scope, root)),
+                None => Ok(view_index(scope, root, ctx.unix_style_paths)),
                 Some(name) => {
                     let slug = safe_stem(name)?;
                     let file = resolve(root, &format!("{slug}.md"))?;
@@ -225,7 +225,8 @@ impl Tool for MemoryTool {
                     // `view` returns the file verbatim, so parsing here buys
                     // nothing for the happy path — it is how the user gets the
                     // parser's complaint about a file the store is skipping.
-                    parse_memory(&text, &slug).map_err(|e| unreadable_memory(&file, &e))?;
+                    parse_memory(&text, &slug)
+                        .map_err(|e| unreadable_memory(&file, &e, ctx.unix_style_paths))?;
                     Ok(truncate_saved(
                         &text,
                         ctx.max_output,
@@ -291,8 +292,8 @@ impl Tool for MemoryTool {
                 // Parsed BEFORE the drift guard runs: an edit that is about to
                 // fail must not leave a backup file behind for a rewrite that
                 // never happens.
-                let mut mem =
-                    parse_memory(&existing, &slug).map_err(|e| unreadable_memory(&file, &e))?;
+                let mut mem = parse_memory(&existing, &slug)
+                    .map_err(|e| unreadable_memory(&file, &e, ctx.unix_style_paths))?;
                 let backup = backup_if_drifted(&file, &existing, &slug)?;
                 mem.name = slug.clone();
                 if let Some(d) = a.description.filter(|d| !d.trim().is_empty()) {
@@ -339,10 +340,10 @@ impl Tool for MemoryTool {
 /// The error `view` and `edit` report for a file they cannot read as a memory:
 /// the path plus [`parse_memory`]'s reason, which together are everything
 /// needed to fix the file by hand.
-fn unreadable_memory(file: &Path, reason: &str) -> anyhow::Error {
+fn unreadable_memory(file: &Path, reason: &str, unix_style_paths: bool) -> anyhow::Error {
     anyhow::anyhow!(
         "{}: {reason}\n(`memory` write replaces it and keeps the current content as a .bak)",
-        file.display()
+        crate::display_path(file, unix_style_paths)
     )
 }
 
@@ -998,15 +999,15 @@ fn rebuild_index(root: &Path) -> Result<()> {
 
 /// `view` with no name: return the generated pointer index, or a scope listing
 /// if none exists yet.
-fn view_index(scope: &str, root: &Path) -> String {
+fn view_index(scope: &str, root: &Path, unix_style_paths: bool) -> String {
     match std::fs::read_to_string(root.join("MEMORY.md")) {
         Ok(text) if !text.trim().is_empty() => text,
-        _ => list_scope(scope, root),
+        _ => list_scope(scope, root, unix_style_paths),
     }
 }
 
 /// A plain listing of the scope's memory files (fallback when there's no index).
-fn list_scope(scope: &str, root: &Path) -> String {
+fn list_scope(scope: &str, root: &Path, unix_style_paths: bool) -> String {
     let store = load_memories(root);
     if store.memories.is_empty() && store.skipped.is_empty() {
         return format!("(no {scope} memory yet — save some with `memory` write)");
@@ -1017,7 +1018,10 @@ fn list_scope(scope: &str, root: &Path) -> String {
         .map(|(stem, _)| stem.as_str())
         .collect();
     names.sort_unstable();
-    let mut out = format!("{scope} memory ({}):\n", root.display());
+    let mut out = format!(
+        "{scope} memory ({}):\n",
+        crate::display_path(root, unix_style_paths)
+    );
     for name in names {
         out.push_str(&format!("- {name}.md\n"));
     }
@@ -1222,6 +1226,134 @@ mod tests {
         ctx.memory_project = Some(dir.join("project"));
         ctx.memory_global = Some(dir.join("global"));
         ctx
+    }
+
+    #[tokio::test]
+    async fn path_style_fallback_heading_preserves_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_memory(dir.path());
+        #[cfg(unix)]
+        {
+            ctx.memory_project = Some(dir.path().join(r"project\literal"));
+        }
+        let root = ctx.memory_project.clone().unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let body = "notes with C:\\mixed/slashes\n";
+        std::fs::write(root.join("note.md"), body).unwrap();
+        #[cfg(unix)]
+        std::fs::write(root.join(r"literal\name.md"), body).unwrap();
+
+        for unix_style_paths in [false, true] {
+            ctx.unix_style_paths = unix_style_paths;
+            let out = MemoryTool
+                .execute(json!({"action": "view"}), &ctx)
+                .await
+                .unwrap();
+            let label = crate::display_path(&root, unix_style_paths);
+            #[cfg(windows)]
+            assert!(!label.contains(if unix_style_paths { '\\' } else { '/' }));
+            #[cfg(unix)]
+            assert_eq!(label, root.display().to_string());
+            #[cfg(unix)]
+            let names = "- literal\\name.md\n- note.md\n";
+            #[cfg(not(unix))]
+            let names = "- note.md\n";
+            assert_eq!(out, format!("project memory ({label}):\n{names}"));
+            assert!(!root.join("MEMORY.md").exists());
+            assert_eq!(
+                std::fs::read(root.join("note.md")).unwrap(),
+                body.as_bytes()
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                std::fs::read(root.join(r"literal\name.md")).unwrap(),
+                body.as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn path_style_unreadable_view_and_edit_preserve_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_memory(dir.path());
+        let root = ctx.memory_project.clone().unwrap();
+        seed_unparsable(&root, "handwritten");
+        let file = resolve(&root, "handwritten.md").unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+        let reason = parse_memory(&before, "handwritten").unwrap_err();
+        for unix_style_paths in [false, true] {
+            ctx.unix_style_paths = unix_style_paths;
+            for action in ["view", "edit"] {
+                let err = MemoryTool
+                    .execute(
+                        json!({"action": action, "name": "handwritten", "body": "replacement"}),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "{}: {reason}\n(`memory` write replaces it and keeps the current content as a .bak)",
+                        crate::display_path(&file, unix_style_paths),
+                    )
+                );
+                assert_eq!(std::fs::read(&file).unwrap(), before.as_bytes());
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn path_style_existing_index_and_named_memory_are_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_memory(dir.path());
+        let root = ctx.memory_project.clone().unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let index = "# Memory\r\nC:\\mixed/slashes [note](note.md)\r\n";
+        let body = "notes with C:\\mixed/slashes\r\n";
+        std::fs::write(root.join("MEMORY.md"), index).unwrap();
+        std::fs::write(root.join("note.md"), body).unwrap();
+        for unix_style_paths in [false, true] {
+            ctx.unix_style_paths = unix_style_paths;
+            for (args, expected) in [
+                (json!({"action": "view"}), index),
+                (json!({"action": "view", "name": "note"}), body),
+            ] {
+                assert_eq!(MemoryTool.execute(args, &ctx).await.unwrap(), expected);
+            }
+            assert_eq!(
+                std::fs::read(root.join("MEMORY.md")).unwrap(),
+                index.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(root.join("note.md")).unwrap(),
+                body.as_bytes()
+            );
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn path_style_unreadable_reason_is_verbatim() {
+        let file = Path::new(r"parent\literal/note.md");
+        let reason = r"invalid C:\mixed/slashes\value";
+        for (style, windows_label) in [
+            (false, r"parent\literal\note.md"),
+            (true, "parent/literal/note.md"),
+        ] {
+            let label = if cfg!(windows) {
+                windows_label
+            } else {
+                r"parent\literal/note.md"
+            };
+            assert_eq!(
+                unreadable_memory(file, reason, style).to_string(),
+                format!(
+                    "{label}: {reason}\n(`memory` write replaces it and keeps the current content as a .bak)"
+                )
+            );
+        }
     }
 
     #[tokio::test]

@@ -29,13 +29,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   system-prompt cwd/sandbox roots, skipped-AGENTS notices, and memory headings
   and oversized-index pointers also honor the setting. Live style changes
   rebuild the system prompt while retaining the loaded project instructions and
-  history, including when memory is disabled. Access checks, LSP protocol paths,
-  and diagnostic message text remain unchanged. Stale-read errors preserve the
-  original culprit command. Headline caches refresh on configuration reload,
-  which also updates subsequent main-agent tool calls and newly spawned
-  children; existing children retain their own setting. Unix rendering, stored
-  tool arguments/results, file contents, and filesystem targets are unchanged.
-  Other path presentation surfaces remain pending.
+  history, including when memory is disabled. Memory-tool fallback listing roots
+  and malformed-memory error paths also follow the setting without rewriting
+  stored indexes, memory bodies, or parser reasons. Access checks, LSP protocol
+  paths, and diagnostic message text remain unchanged. Stale-read errors
+  preserve the original culprit command. Headline caches refresh on
+  configuration reload, which also updates subsequent main-agent tool calls and
+  newly spawned children; existing children retain their own setting. Unix
+  rendering, stored tool arguments/results, file contents, and filesystem
+  targets are unchanged. Other path presentation surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,
