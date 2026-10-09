@@ -220,9 +220,12 @@ nextest, Clippy, build/smoke, dependency checks, Windows leak guard, and
 release-target builds passed. The proposed registration retry change still
 awaits approval. Config-mutation path tests cover storage and frontend failures;
 OAuth completion's captured preference is source-inspected, not exercised by a
-dedicated async regression test. Auth-storage path diagnostics remain pending;
-auth/blob lock callers retain native labels, with blob lock errors still
-ignored.
+dedicated async regression test. Credential-save browser capture is likewise
+source-inspected rather than covered by a network/save integration test.
+Credential replacement-failure coverage uses a Windows readonly fixture; the
+corresponding Unix failure branch has not been exercised. Blob lock and OAuth
+refresh persistence errors remain ignored, with native labels in those discarded
+errors.
 
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four

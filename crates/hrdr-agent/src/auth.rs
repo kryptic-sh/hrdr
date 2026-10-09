@@ -62,10 +62,14 @@ pub fn auth_token(provider: &str) -> Option<String> {
 /// Store `provider`'s `token` in the credential file (creating it, `0600` on
 /// unix), preserving any other entries. Saved under the shared [`auth_key`], so
 /// the OpenCode endpoints write one entry between them. Returns the file path.
-pub fn save_auth_token(provider: &str, token: &str) -> anyhow::Result<PathBuf> {
+pub fn save_auth_token(
+    provider: &str,
+    token: &str,
+    unix_style_paths: bool,
+) -> anyhow::Result<PathBuf> {
     let path =
         auth_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the auth file"))?;
-    crate::auth_store::save_key_at(&path, auth_key(provider), token)?;
+    crate::auth_store::save_key_at(&path, auth_key(provider), token, unix_style_paths)?;
     Ok(path)
 }
 
@@ -116,7 +120,7 @@ mod tests {
         // A key saved while on `zen` resolves when the session is on `go`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        crate::auth_store::save_key_at(&path, auth_key("zen"), "sk-opencode").unwrap();
+        crate::auth_store::save_key_at(&path, auth_key("zen"), "sk-opencode", false).unwrap();
         let tokens = crate::auth_store::load_keys_at(&path);
         assert_eq!(
             tokens.get(auth_key("go")).map(String::as_str),

@@ -300,7 +300,7 @@ pub fn login_key_warning(name: &str, unix_style_paths: bool) -> String {
 pub fn login_enter_key(name: &str, key: &str, host: &mut dyn CommandHost) {
     // Save first so the credential survives even if the live switch races a
     // busy turn; report the exact path back to the user.
-    let saved = match hrdr_agent::save_auth_token(name, key) {
+    let saved = match hrdr_agent::save_auth_token(name, key, host.unix_style_paths()) {
         Ok(path) => hrdr_tools::display_path(&path, host.unix_style_paths()),
         Err(e) => {
             host.info(format!("couldn't save the API key: {e}"));
@@ -453,6 +453,7 @@ pub fn browser_login_start(
     let Some(target) = browser_login_provider(name) else {
         return Ok(None);
     };
+    let unix_style_paths = host.unix_style_paths();
     let (verifier, challenge) = hrdr_agent::generate_pkce();
 
     if target == "openrouter" {
@@ -476,7 +477,9 @@ pub fn browser_login_start(
         open_browser(&url, label, "5 minutes", host);
         let future = Box::pin(async move {
             let (token_saved, error) =
-                match openrouter_exchange_and_save(listener, &verifier, &state).await {
+                match openrouter_exchange_and_save(listener, &verifier, &state, unix_style_paths)
+                    .await
+                {
                     Ok(()) => (true, None),
                     Err(e) => (false, Some(e.to_string())),
                 };
@@ -517,7 +520,8 @@ pub fn browser_login_start(
     );
     open_browser(&url, label, "60 minutes", host);
     let future = Box::pin(async move {
-        let flow = chatgpt_exchange_and_save(listener, &verifier, &state, &redirect);
+        let flow =
+            chatgpt_exchange_and_save(listener, &verifier, &state, &redirect, unix_style_paths);
         let (token_saved, error) =
             match tokio::time::timeout(hrdr_agent::CHATGPT_LOGIN_BACKSTOP, flow).await {
                 Ok(Ok(())) => (true, None),
@@ -672,11 +676,12 @@ async fn openrouter_exchange_and_save(
     listener: std::net::TcpListener,
     verifier: &str,
     state: &str,
+    unix_style_paths: bool,
 ) -> anyhow::Result<()> {
     let code =
         hrdr_agent::await_oauth_code_on(listener, state, hrdr_agent::CALLBACK_TIMEOUT).await?;
     let key = hrdr_agent::openrouter_exchange(&code, verifier).await?;
-    hrdr_agent::save_auth_token("openrouter", &key)?;
+    hrdr_agent::save_auth_token("openrouter", &key, unix_style_paths)?;
     Ok(())
 }
 
@@ -692,6 +697,7 @@ async fn chatgpt_exchange_and_save(
     verifier: &str,
     state: &str,
     redirect: &str,
+    unix_style_paths: bool,
 ) -> anyhow::Result<()> {
     let code = hrdr_agent::await_oauth_code_on(listener, state, hrdr_agent::CHATGPT_LOGIN_BACKSTOP)
         .await?;
@@ -712,6 +718,7 @@ async fn chatgpt_exchange_and_save(
         hrdr_agent::ResolvedProviderKind::ChatGptOAuth,
         "openai",
         &creds,
+        unix_style_paths,
     )?;
     Ok(())
 }
@@ -1005,6 +1012,55 @@ mod tests {
             "both auth methods are shown"
         );
         assert!(p.contains("/cancel"), "prompt should note how to abort");
+    }
+
+    #[test]
+    fn login_enter_key_failure_uses_active_path_style_without_token() {
+        const CHILD: &str = "HRDR_CREDENTIAL_SAVE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "login::tests::login_enter_key_failure_uses_active_path_style_without_token",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        {
+            let path = hrdr_agent::auth_file_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = b"{ invalid fixture";
+            std::fs::write(&path, original).unwrap();
+            let mut host = RouteTestHost::new();
+            for style in [false, true] {
+                host.cfg.unix_style_paths = style;
+                host.info_lines.clear();
+                login_enter_key("local", r"synthetic\secret", &mut host);
+                assert_eq!(
+                    host.info_lines,
+                    [format!(
+                        "couldn't save the API key: parsing existing credential store {}",
+                        hrdr_tools::display_path(&path, style)
+                    )]
+                );
+                assert!(
+                    host.info_lines
+                        .iter()
+                        .all(|line| !line.contains(r"synthetic\secret"))
+                );
+                assert!(host.model_picker_for.is_none());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+        }
     }
 
     #[test]

@@ -58,6 +58,7 @@ fn a_subscription_login_puts_its_provider_in_the_picker() {
             expires_ms: u64::MAX,
             account_id: Some("acct".into()),
         },
+        false,
     )
     .expect("the credential is stored");
 

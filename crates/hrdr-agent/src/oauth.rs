@@ -538,9 +538,9 @@ pub fn oauth_file_path() -> Option<PathBuf> {
 
 /// Persist `creds` for `provider` (atomic write, `0600` on unix), preserving any
 /// other providers' entries. Returns the file path.
-pub fn save_oauth(provider: &str, creds: &OAuthCreds) -> Result<PathBuf> {
+pub fn save_oauth(provider: &str, creds: &OAuthCreds, unix_style_paths: bool) -> Result<PathBuf> {
     let path = oauth_file_path().ok_or_else(|| anyhow!("no config dir to locate auth.json"))?;
-    crate::auth_store::save_oauth_entry_at(&path, provider, creds)?;
+    crate::auth_store::save_oauth_entry_at(&path, provider, creds, unix_style_paths)?;
     Ok(path)
 }
 
@@ -574,8 +574,9 @@ pub fn save_oauth_for(
     kind: crate::ResolvedProviderKind,
     name: &str,
     creds: &OAuthCreds,
+    unix_style_paths: bool,
 ) -> Result<PathBuf> {
-    save_oauth(canonical_oauth_key(kind, name), creds)
+    save_oauth(canonical_oauth_key(kind, name), creds, unix_style_paths)
 }
 
 /// Kind-gated wrapper over [`load_oauth`]; see [`save_oauth_for`].
@@ -629,7 +630,7 @@ pub async fn valid_access_token(provider: &str) -> Option<(String, Option<String
     let fresh = refresh_to_creds(&creds.refresh, creds.account_id)
         .await
         .ok()?;
-    let _ = save_oauth(provider, &fresh);
+    let _ = save_oauth(provider, &fresh, false);
     Some((fresh.access, fresh.account_id))
 }
 
@@ -748,7 +749,7 @@ pub async fn coordinated_oauth_access(
         chatgpt_coord(),
         || crate::auth_store::load_oauth_entry_at(&path, "openai"),
         |c| {
-            let _ = crate::auth_store::save_oauth_entry_at(&path, "openai", c);
+            let _ = crate::auth_store::save_oauth_entry_at(&path, "openai", c, false);
         },
         |refresh_token, prev| async move { refresh_to_creds(&refresh_token, prev).await },
     )
@@ -1153,6 +1154,7 @@ mod tests {
                 expires_ms,
                 account_id: None,
             },
+            false,
         )
         .unwrap();
     }

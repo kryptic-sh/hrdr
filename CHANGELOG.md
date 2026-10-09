@@ -54,9 +54,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preserving their filter and selected file. Config mutation failures also style
   creation/read/write, malformed-file backup, and lock-error labels using the
   active frontend preference, without changing config values or lock behavior.
-  Access checks, LSP protocol paths, and diagnostic message text remain
-  unchanged. Stale-read errors preserve the original culprit command. Headline
-  caches refresh on configuration reload, which also updates subsequent
+  Credential-save creation/read/parse/write and lock failures also honor the
+  setting; browser login captures the preference before its asynchronous save.
+  Credentials, canonical provider keys, and best-effort refresh behavior remain
+  unchanged. Access checks, LSP protocol paths, and diagnostic message text
+  remain unchanged. Stale-read errors preserve the original culprit command.
+  Headline caches refresh on configuration reload, which also updates subsequent
   main-agent tool calls and newly spawned children; existing children retain
   their own setting. Unix rendering, stored tool arguments/results, file
   contents, and filesystem targets are unchanged. Other path presentation

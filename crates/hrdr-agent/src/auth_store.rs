@@ -129,31 +129,51 @@ fn load_map_at(auth_json: &Path) -> HashMap<String, AuthEntry> {
 /// Refuses to clobber a store it cannot parse: an existing but malformed
 /// `auth.json` yields an error and is left byte-for-byte intact, so a corrupt
 /// file is never silently overwritten.
-fn save_entry_at(auth_json: &Path, key: &str, entry: AuthEntry) -> Result<()> {
+fn save_entry_at(
+    auth_json: &Path,
+    key: &str,
+    entry: AuthEntry,
+    unix_style_paths: bool,
+) -> Result<()> {
     let parent = auth_json.parent().unwrap_or(Path::new("."));
-    crate::auth::create_dir_owner_only(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
+    crate::auth::create_dir_owner_only(parent).with_context(|| {
+        format!(
+            "creating {}",
+            hrdr_tools::display_path(parent, unix_style_paths)
+        )
+    })?;
     // Acquire the write lock BEFORE the read and hold it across the whole
     // read-modify-write. `_lock` releases on drop (normal return, `?`, panic).
     let _lock = StoreLock::acquire(
         auth_json,
         crate::store_lock::StoreKind::SmallFileRewrite,
-        false,
+        unix_style_paths,
     )?;
     let mut map: HashMap<String, AuthEntry> = match std::fs::read_to_string(auth_json) {
         Ok(text) => serde_json::from_str(&text).with_context(|| {
-            format!("parsing existing credential store {}", auth_json.display())
+            format!(
+                "parsing existing credential store {}",
+                hrdr_tools::display_path(auth_json, unix_style_paths)
+            )
         })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("reading credential store {}", auth_json.display()));
+            return Err(e).with_context(|| {
+                format!(
+                    "reading credential store {}",
+                    hrdr_tools::display_path(auth_json, unix_style_paths)
+                )
+            });
         }
     };
     map.insert(key.to_string(), entry);
     let json = serde_json::to_vec_pretty(&map).context("serializing auth.json")?;
-    crate::write_atomic(auth_json, &json)
-        .with_context(|| format!("writing {}", auth_json.display()))
+    crate::write_atomic(auth_json, &json).with_context(|| {
+        format!(
+            "writing {}",
+            hrdr_tools::display_path(auth_json, unix_style_paths)
+        )
+    })
 }
 
 // ── Key entries ─────────────────────────────────────────────────────────────
@@ -167,13 +187,19 @@ pub(crate) fn load_keys_at(auth_json: &Path) -> HashMap<String, String> {
 }
 
 /// Store `provider`'s raw API `token`, preserving other entries.
-pub(crate) fn save_key_at(auth_json: &Path, provider: &str, token: &str) -> Result<()> {
+pub(crate) fn save_key_at(
+    auth_json: &Path,
+    provider: &str,
+    token: &str,
+    unix_style_paths: bool,
+) -> Result<()> {
     save_entry_at(
         auth_json,
         provider,
         AuthEntry::Key {
             key: token.to_string(),
         },
+        unix_style_paths,
     )
 }
 
@@ -259,8 +285,14 @@ pub(crate) fn save_oauth_entry_at(
     auth_json: &Path,
     provider: &str,
     creds: &OAuthCreds,
+    unix_style_paths: bool,
 ) -> Result<()> {
-    save_entry_at(auth_json, provider, AuthEntry::from(creds.clone()))
+    save_entry_at(
+        auth_json,
+        provider,
+        AuthEntry::from(creds.clone()),
+        unix_style_paths,
+    )
 }
 
 #[cfg(test)]
@@ -273,6 +305,165 @@ mod tests {
             refresh: refresh.to_string(),
             expires_ms,
             account_id: account.map(str::to_string),
+        }
+    }
+
+    fn save_fixture(path: &Path, oauth_entry: bool, style: bool) -> Result<()> {
+        if oauth_entry {
+            save_oauth_entry_at(
+                path,
+                "openai",
+                &oauth(
+                    r"access\untouched",
+                    r"refresh\untouched",
+                    42,
+                    Some(r"account\untouched"),
+                ),
+                style,
+            )
+        } else {
+            save_key_at(path, "opencode", r"key\untouched", style)
+        }
+    }
+
+    #[test]
+    fn credential_save_failure_labels_follow_style() {
+        for style in [false, true] {
+            for oauth_entry in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let parent = dir.path().join("blocked");
+                let original = b"not a directory";
+                std::fs::write(&parent, original).unwrap();
+                let path = parent.join("auth.json");
+                let err = save_fixture(&path, oauth_entry, style).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!("creating {}", hrdr_tools::display_path(&parent, style))
+                );
+                assert_eq!(std::fs::read(&parent).unwrap(), original);
+
+                let path = dir.path().join("auth.json");
+                for (original, reason) in [
+                    (&b"\xff\xfe"[..], "reading credential store"),
+                    (
+                        &b"{ not valid json\n"[..],
+                        "parsing existing credential store",
+                    ),
+                ] {
+                    std::fs::write(&path, original).unwrap();
+                    let err = save_fixture(&path, oauth_entry, style).unwrap_err();
+                    assert_eq!(
+                        err.to_string(),
+                        format!("{reason} {}", hrdr_tools::display_path(&path, style))
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), original);
+                    assert!(!format!("{err:#}").contains("untouched"));
+                }
+
+                let original = b"{}";
+                std::fs::write(&path, original).unwrap();
+                let lock = StoreLock::acquire(
+                    &path,
+                    crate::store_lock::StoreKind::SmallFileRewrite,
+                    style,
+                )
+                .unwrap();
+                let lock_path = hrdr_llm::sibling_with_suffix(&path, ".lock");
+                let lock_bytes = std::fs::read(&lock_path).unwrap();
+                let err = save_fixture(&path, oauth_entry, style).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "timed out acquiring lock {} (held by another process?)",
+                        hrdr_tools::display_path(&lock_path, style)
+                    )
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert_eq!(std::fs::read(&lock_path).unwrap(), lock_bytes);
+                drop(lock);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_save_write_failure_labels_follow_style() {
+        for style in [false, true] {
+            for oauth_entry in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("auth.json");
+                let original = b"{}";
+                std::fs::write(&path, original).unwrap();
+                let permissions = std::fs::metadata(&path).unwrap().permissions();
+                let mut readonly = permissions.clone();
+                readonly.set_readonly(true);
+                std::fs::set_permissions(&path, readonly).unwrap();
+                let result = save_fixture(&path, oauth_entry, style);
+                std::fs::set_permissions(&path, permissions).unwrap();
+                let err = result.unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!("writing {}", hrdr_tools::display_path(&path, style))
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert!(!format!("{err:#}").contains("untouched"));
+            }
+        }
+    }
+
+    #[test]
+    fn credential_save_wrappers_preserve_values_and_canonical_keys() {
+        const CHILD: &str = "HRDR_CREDENTIAL_SAVE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "auth_store::tests::credential_save_wrappers_preserve_values_and_canonical_keys", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        {
+            for style in [false, true] {
+                let path = crate::save_auth_token("zen", r"key\untouched", style).unwrap();
+                let creds = oauth(
+                    r"access\untouched",
+                    r"refresh\untouched",
+                    42,
+                    Some(r"account\untouched"),
+                );
+                assert_eq!(
+                    crate::save_oauth_for(
+                        crate::ResolvedProviderKind::ChatGptOAuth,
+                        "codex",
+                        &creds,
+                        style
+                    )
+                    .unwrap(),
+                    path
+                );
+                crate::save_oauth_for(
+                    crate::ResolvedProviderKind::Custom,
+                    "custom\\provider",
+                    &creds,
+                    style,
+                )
+                .unwrap();
+                let map = load_map_at(&path);
+                assert_eq!(
+                    map.get("opencode").unwrap().as_key(),
+                    Some(r"key\untouched")
+                );
+                assert!(map.get("openai").unwrap().as_oauth() == Some(creds.clone()));
+                assert!(map.get("custom\\provider").unwrap().as_oauth() == Some(creds));
+                assert!(!map.contains_key("zen"));
+                assert!(!map.contains_key("codex"));
+            }
         }
     }
 
@@ -330,10 +521,10 @@ mod tests {
     fn save_and_load_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        save_key_at(&path, "openai", "sk-oai").unwrap();
+        save_key_at(&path, "openai", "sk-oai", false).unwrap();
         // A second key coexists; re-saving one preserves the other.
-        save_key_at(&path, "openrouter", "sk-or").unwrap();
-        save_key_at(&path, "openai", "sk-oai-2").unwrap();
+        save_key_at(&path, "openrouter", "sk-or", false).unwrap();
+        save_key_at(&path, "openai", "sk-oai-2", false).unwrap();
         let keys = load_keys_at(&path);
         assert_eq!(keys.get("openai").map(String::as_str), Some("sk-oai-2"));
         assert_eq!(keys.get("openrouter").map(String::as_str), Some("sk-or"));
@@ -346,10 +537,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let creds = oauth("acc", "ref", 42, Some("acct"));
-        save_oauth_entry_at(&path, "chatgpt", &creds).unwrap();
+        save_oauth_entry_at(&path, "chatgpt", &creds, false).unwrap();
         assert!(load_oauth_entry_at(&path, "chatgpt") == Some(creds));
         // A key entry is not returned as OAuth, and vice-versa.
-        save_key_at(&path, "openai", "sk-oai").unwrap();
+        save_key_at(&path, "openai", "sk-oai", false).unwrap();
         assert!(load_oauth_entry_at(&path, "openai").is_none());
         assert_eq!(load_keys_at(&path).get("chatgpt"), None);
     }
@@ -360,8 +551,8 @@ mod tests {
         reset_oauth_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        save_key_at(&path, "openrouter", "sk-or").unwrap();
-        save_oauth_entry_at(&path, "chatgpt", &oauth("acc", "ref", 1, None)).unwrap();
+        save_key_at(&path, "openrouter", "sk-or", false).unwrap();
+        save_oauth_entry_at(&path, "chatgpt", &oauth("acc", "ref", 1, None), false).unwrap();
         // Both live in one map: the key survives an OAuth write and vice-versa.
         assert_eq!(
             load_keys_at(&path).get("openrouter").map(String::as_str),
@@ -392,7 +583,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let creds = oauth("acc", "ref", 42, Some("acct"));
-        save_oauth_entry_at(&path, "chatgpt", &creds).unwrap();
+        save_oauth_entry_at(&path, "chatgpt", &creds, false).unwrap();
         // First load reads disk and populates the cache.
         assert!(load_oauth_entry_at(&path, "chatgpt") == Some(creds.clone()));
         assert!(
@@ -405,7 +596,7 @@ mod tests {
         );
         // A rewrite bumps the mtime: the new credentials must come through.
         let newer = oauth("acc2", "ref2", 43, Some("acct2"));
-        save_oauth_entry_at(&path, "chatgpt", &newer).unwrap();
+        save_oauth_entry_at(&path, "chatgpt", &newer, false).unwrap();
         assert!(
             load_oauth_entry_at(&path, "chatgpt") == Some(newer),
             "an mtime change invalidates the cache"
@@ -430,7 +621,9 @@ mod tests {
         let path = dir.path().join("auth.json");
         let original = b"{ not valid json\n";
         std::fs::write(&path, original).unwrap();
-        let err = save_key_at(&path, "openai", "sk").unwrap_err().to_string();
+        let err = save_key_at(&path, "openai", "sk", false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("parsing existing credential store"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
@@ -439,8 +632,8 @@ mod tests {
     fn save_leaves_no_temp_or_lock_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        save_key_at(&path, "openai", "sk").unwrap();
-        save_oauth_entry_at(&path, "chatgpt", &oauth("a", "r", 1, None)).unwrap();
+        save_key_at(&path, "openai", "sk", false).unwrap();
+        save_oauth_entry_at(&path, "chatgpt", &oauth("a", "r", 1, None), false).unwrap();
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -460,7 +653,7 @@ mod tests {
         // A nested dir that does not exist yet, so the save creates it 0700.
         let cfg_dir = tmp.path().join("hrdr");
         let path = cfg_dir.join("auth.json");
-        save_key_at(&path, "openai", "sk").unwrap();
+        save_key_at(&path, "openai", "sk", false).unwrap();
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(file_mode & 0o777, 0o600, "credential file must be 0600");
         let dir_mode = std::fs::metadata(&cfg_dir).unwrap().permissions().mode();
@@ -473,13 +666,13 @@ mod tests {
     fn concurrent_writers_different_providers_all_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
-        save_key_at(&path, "seed", "sk-seed").unwrap();
+        save_key_at(&path, "seed", "sk-seed", false).unwrap();
         let n = 16;
         let handles: Vec<_> = (0..n)
             .map(|i| {
                 let path = path.clone();
                 std::thread::spawn(move || {
-                    save_key_at(&path, &format!("p{i}"), &format!("sk-{i}")).unwrap();
+                    save_key_at(&path, &format!("p{i}"), &format!("sk-{i}"), false).unwrap();
                 })
             })
             .collect();

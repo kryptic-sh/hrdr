@@ -405,7 +405,7 @@ mod tests {
             },
             account_id: None,
         };
-        hrdr_agent::save_oauth("openai", &creds).expect("seed openai oauth");
+        hrdr_agent::save_oauth("openai", &creds, false).expect("seed openai oauth");
     }
 
     /// A remote provider with no credential is not probed at all: the request
