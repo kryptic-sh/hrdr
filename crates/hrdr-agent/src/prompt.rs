@@ -429,7 +429,12 @@ pub struct SubagentLimits {
     pub write: usize,
 }
 
-pub fn environment_section(cwd: &Path, tools: &ToolRegistry, limits: SubagentLimits) -> String {
+pub fn environment_section(
+    unix_style_paths: bool,
+    cwd: &Path,
+    tools: &ToolRegistry,
+    limits: SubagentLimits,
+) -> String {
     // One `- ` bullet per entry, joined at the end. Built as a list rather than
     // one format string because several entries are CONDITIONAL, and the old
     // shape carried each optional entry's leading newline *inside* the variable
@@ -467,7 +472,10 @@ pub fn environment_section(cwd: &Path, tools: &ToolRegistry, limits: SubagentLim
     }
     // Last, always: the cwd is the volatile tail this whole section exists to
     // keep at the bottom (see the doc comment).
-    lines.push(format!("- Working directory: {}", cwd.display()));
+    lines.push(format!(
+        "- Working directory: {}",
+        hrdr_tools::display_path(cwd, unix_style_paths)
+    ));
     format!("\n\nEnvironment:\n{}", lines.join("\n"))
 }
 
@@ -699,18 +707,18 @@ fn cache_roots_line(policy: &hrdr_tools::SandboxPolicy) -> String {
 /// the environment section — see the assembly order on [`render_system`]. The
 /// enforcement itself is not in the prompt (that is `hrdr_tools::sandbox`); this
 /// only tells the model what is already true.
-pub fn sandbox_section(policy: &hrdr_tools::SandboxPolicy) -> String {
+pub fn sandbox_section(unix_style_paths: bool, policy: &hrdr_tools::SandboxPolicy) -> String {
     let roots = |roots: &[std::path::PathBuf]| {
         roots
             .iter()
-            .map(|r| format!("- {}", r.display()))
+            .map(|r| format!("- {}", hrdr_tools::display_path(r, unix_style_paths)))
             .collect::<Vec<_>>()
             .join("\n")
     };
     let paths = |paths: &[&std::path::Path]| {
         paths
             .iter()
-            .map(|r| format!("- {}", r.display()))
+            .map(|r| format!("- {}", hrdr_tools::display_path(r, unix_style_paths)))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -932,9 +940,9 @@ pub struct SkippedAgentDoc {
 impl SkippedAgentDoc {
     /// The user-facing line: what was skipped, how big it was, and which cap did
     /// it — so the fix (split the file, or trim it) is obvious from the message.
-    pub fn notice(&self) -> String {
+    pub fn notice(&self, unix_style_paths: bool) -> String {
         let kib = self.bytes as f64 / 1024.0;
-        let path = self.path.display();
+        let path = hrdr_tools::display_path(&self.path, unix_style_paths);
         match self.reason {
             AgentDocSkip::TooLarge => format!(
                 "AGENTS.md at {path} ({kib:.1} KiB) was skipped — over the {} KiB \
@@ -1129,6 +1137,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generated_prompt_path_labels_use_explicit_style() {
+        let tools = ToolRegistry::with_defaults();
+        for raw in [r"C:\work/mixed\project", r"/tmp/literal\name"] {
+            let path = Path::new(raw);
+            for style in [false, true] {
+                let expected = if cfg!(windows) {
+                    if style {
+                        raw.replace('\\', "/")
+                    } else {
+                        raw.replace('/', "\\")
+                    }
+                } else {
+                    raw.to_string()
+                };
+                let environment = environment_section(style, path, &tools, test_limits());
+                assert!(environment.ends_with(&format!("- Working directory: {expected}")));
+                for mode in [
+                    hrdr_tools::SandboxMode::Write,
+                    hrdr_tools::SandboxMode::Jail,
+                ] {
+                    let policy = hrdr_tools::SandboxPolicy {
+                        mode,
+                        writable_roots: vec![path.to_path_buf()],
+                        readable_roots: vec![path.to_path_buf()],
+                        cache_roots: Vec::new(),
+                        wrap_tool_results: false,
+                    };
+                    assert!(
+                        sandbox_section(style, &policy)
+                            .lines()
+                            .any(|line| line == format!("- {expected}"))
+                    );
+                    assert_eq!(policy.writable_roots, vec![path.to_path_buf()]);
+                    assert_eq!(policy.readable_roots, vec![path.to_path_buf()]);
+                }
+                let skipped = SkippedAgentDoc {
+                    path: path.to_path_buf(),
+                    bytes: MAX_AGENTS_FILE_BYTES + 1,
+                    reason: AgentDocSkip::TooLarge,
+                };
+                assert!(
+                    skipped
+                        .notice(style)
+                        .starts_with(&format!("AGENTS.md at {expected} ("))
+                );
+                assert_eq!(skipped.path, path);
+                let body = r"User prose C:\keep/mixed\slashes";
+                assert!(global_agent_docs_section(Some(body)).ends_with(body));
+                assert!(project_agent_docs_section(Some(body)).ends_with(body));
+            }
+        }
+    }
+
     /// The Environment block is ONE BULLET PER LINE, whichever optional entries
     /// are present — and every line is a bullet, with no blank ones.
     ///
@@ -1139,7 +1201,7 @@ mod tests {
     #[test]
     fn the_environment_block_is_one_bullet_per_line() {
         let write = ToolRegistry::with_defaults();
-        let block = environment_section(Path::new("/tmp/x"), &write, test_limits());
+        let block = environment_section(true, Path::new("/tmp/x"), &write, test_limits());
         let body = block
             .strip_prefix("\n\nEnvironment:\n")
             .expect("the block opens with its own header");
@@ -1172,13 +1234,14 @@ mod tests {
         // than a constant, so a configured cap reaches the model.
         let mut delegating = ToolRegistry::with_defaults();
         delegating.register(std::sync::Arc::new(StubTask));
-        let with_task = environment_section(Path::new("/tmp/x"), &delegating, test_limits());
+        let with_task = environment_section(true, Path::new("/tmp/x"), &delegating, test_limits());
         assert!(
             says(&with_task, "at most 5 read-only and 2 write-capable"),
             "{with_task}"
         );
         assert!(
             environment_section(
+                false,
                 Path::new("/tmp/x"),
                 &delegating,
                 SubagentLimits {
@@ -1195,7 +1258,7 @@ mod tests {
         let mut ro = ToolRegistry::with_defaults();
         let ro_names = ro.read_only_names();
         ro.retain_only(&ro_names);
-        let ro_block = environment_section(Path::new("/tmp/x"), &ro, test_limits());
+        let ro_block = environment_section(true, Path::new("/tmp/x"), &ro, test_limits());
         let ro_body = ro_block
             .strip_prefix("\n\nEnvironment:\n")
             .expect("the block opens with its own header");
@@ -1233,7 +1296,7 @@ mod tests {
         // now (appended after the base body), so build the full prompt to assert
         // on both the body rules and the environment.
         let p = render_system(&tools, false).unwrap()
-            + &environment_section(Path::new("/tmp/x"), &tools, test_limits());
+            + &environment_section(true, Path::new("/tmp/x"), &tools, test_limits());
         // Tool names present, one line, but not their long descriptions
         // (those ship natively as function defs — no double token spend).
         assert!(says(&p, "read"));
@@ -3335,7 +3398,7 @@ mod tests {
         let tools = ToolRegistry::with_defaults();
         // The date rides the trailing environment block now.
         let p = render_system(&tools, false).unwrap()
-            + &environment_section(Path::new("/tmp/x"), &tools, test_limits());
+            + &environment_section(true, Path::new("/tmp/x"), &tools, test_limits());
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(p.contains(&format!("- Date: {today}")), "{p}");
     }
@@ -3349,7 +3412,7 @@ mod tests {
         let tools = ToolRegistry::with_defaults();
         let shell = tools.shell().expect("a dev machine has a shell");
         let write = render_system(&tools, false).unwrap()
-            + &environment_section(Path::new("/tmp/x"), &tools, test_limits());
+            + &environment_section(true, Path::new("/tmp/x"), &tools, test_limits());
         // Whatever this machine resolved, the line is the shell's own label.
         let expected = format!("- Shell: {}", shell.env_label());
         assert!(says(&write, &expected), "{write}");
@@ -3360,7 +3423,7 @@ mod tests {
         ro.retain_only(&names);
         assert!(ro.shell().is_none());
         let read = render_system(&ro, false).unwrap()
-            + &environment_section(Path::new("/tmp/x"), &ro, test_limits());
+            + &environment_section(true, Path::new("/tmp/x"), &ro, test_limits());
         assert!(!says(&read, "- Shell:"), "{read}");
     }
 
@@ -3427,7 +3490,7 @@ mod tests {
             .unwrap_or_else(|| panic!("the skipped file must be recorded: {:?}", docs.skipped));
         assert_eq!(rec.reason, AgentDocSkip::TooLarge);
         assert!(rec.bytes > MAX_AGENTS_FILE_BYTES, "{}", rec.bytes);
-        let notice = rec.notice();
+        let notice = rec.notice(false);
         assert!(notice.contains(&big.display().to_string()), "{notice}");
         assert!(says(&notice, "70.0 KiB"), "the size, readably: {notice}");
         assert!(says(&notice, "64 KiB per-file cap"), "{notice}");
@@ -3686,7 +3749,7 @@ mod tests {
             cache_roots: Vec::new(),
             wrap_tool_results: false,
         };
-        let s = sandbox_section(&plain);
+        let s = sandbox_section(true, &plain);
         assert!(
             !says(&s, "READ-ONLY") && !s.to_lowercase().contains("cannot commit"),
             "no agent is locked out of git: {s}"
@@ -3699,7 +3762,7 @@ mod tests {
         let mut with_caches = plain.clone();
         with_caches.writable_roots.push(cache.clone());
         with_caches.cache_roots = vec![cache.clone()];
-        let s = sandbox_section(&with_caches);
+        let s = sandbox_section(true, &with_caches);
         assert!(
             !s.contains(&cache.display().to_string()),
             "a cache path must not be listed one per line: {s}"
@@ -3731,13 +3794,16 @@ mod tests {
             hrdr_tools::SandboxMode::Read,
             hrdr_tools::SandboxMode::Jail,
         ] {
-            let s = sandbox_section(&hrdr_tools::SandboxPolicy {
-                mode,
-                writable_roots: roots.clone(),
-                readable_roots: roots.clone(),
-                cache_roots: Vec::new(),
-                wrap_tool_results: false,
-            });
+            let s = sandbox_section(
+                false,
+                &hrdr_tools::SandboxPolicy {
+                    mode,
+                    writable_roots: roots.clone(),
+                    readable_roots: roots.clone(),
+                    cache_roots: Vec::new(),
+                    wrap_tool_results: false,
+                },
+            );
             // `jail` may state that it has no network — it holds no tool that could
             // open one — but no mode may describe the *sandbox* as confining it.
             assert!(
@@ -3767,7 +3833,7 @@ mod tests {
             cache_roots: Vec::new(),
             wrap_tool_results: false,
         };
-        let s = sandbox_section(&policy);
+        let s = sandbox_section(true, &policy);
         assert!(
             s.starts_with("\n\nSandbox:"),
             "the section carries its own separator and header: {s:?}"
@@ -3787,7 +3853,7 @@ mod tests {
             cache_roots: Vec::new(),
             wrap_tool_results: false,
         };
-        let s = sandbox_section(&ro);
+        let s = sandbox_section(true, &ro);
         assert!(says(&s, "Mode: read"));
         assert!(says(&s, "write NOTHING"));
         assert!(says(&s, "Reads are unrestricted"));
@@ -3805,7 +3871,7 @@ mod tests {
             cache_roots: Vec::new(),
             wrap_tool_results: false,
         };
-        let s = sandbox_section(&strict);
+        let s = sandbox_section(true, &strict);
         assert!(says(&s, "Mode: jail"));
         // The brief that makes the mode usable: what it reads may be hostile, and
         // an instruction inside audited content is a finding rather than an order.
@@ -3836,7 +3902,7 @@ mod tests {
     #[test]
     fn sandbox_section_is_empty_for_mode_none() {
         assert!(
-            sandbox_section(&hrdr_tools::SandboxPolicy::unconfined()).is_empty(),
+            sandbox_section(true, &hrdr_tools::SandboxPolicy::unconfined()).is_empty(),
             "mode None must render nothing"
         );
     }

@@ -403,7 +403,7 @@ impl Agent {
         let project_docs_changed = false;
         let memory = mem_dirs
             .as_ref()
-            .map(|(p, g)| gather_memory(p, g))
+            .map(|(p, g)| gather_memory(p, g, config.unix_style_paths))
             .unwrap_or_default();
         let subagent_limits = prompt::SubagentLimits {
             read_only: config.max_readonly_subagents,
@@ -431,6 +431,7 @@ impl Agent {
             &ctx.sandbox,
             subagent_limits,
             &gate,
+            config.unix_style_paths,
         )?;
 
         // Configure the client from the (possibly auth-switched) resolved model,
@@ -491,7 +492,12 @@ impl Agent {
         let mut pending_notices = preflight_notices(&config.providers, &resolved);
         // An `AGENTS.md` hrdr found and did not load is a user instruction silently
         // missing from the prompt — the same channel carries it, for the same reason.
-        pending_notices.extend(project_docs.skipped.iter().map(|s| s.notice()));
+        pending_notices.extend(
+            project_docs
+                .skipped
+                .iter()
+                .map(|s| s.notice(config.unix_style_paths)),
+        );
         // A `[[guardrails]]` entry whose regex does not compile blocks nothing,
         // and from the outside that is indistinguishable from a rule that is
         // working — the same channel, for the same reason.
@@ -762,7 +768,7 @@ impl Agent {
     /// Rebuild `messages[0]` with a freshly-read memory index, leaving project
     /// docs as they are.
     ///
-    /// Only compaction calls this. A running conversation is deliberately never
+    /// Compaction and path-style changes call this. A running conversation is deliberately never
     /// re-seeded from `AGENTS.md` — the agent that edited the file already has
     /// the change in its context — but the *memory index* is different: a note
     /// the agent saves this session exists for it only as a tool exchange in the
@@ -773,12 +779,11 @@ impl Agent {
     /// Re-reads from the memory roots already resolved for this cwd, so it does
     /// no path resolution and cannot change scope.
     pub(crate) fn refresh_system_prompt_in_place(&mut self) {
-        if !self.memory_enabled {
-            return;
-        }
         let memory = match (&self.ctx.memory_project, &self.ctx.memory_global) {
-            (Some(proj), Some(glob)) => gather_memory(proj, glob),
-            _ => return,
+            (Some(proj), Some(glob)) if self.memory_enabled => {
+                gather_memory(proj, glob, self.ctx.unix_style_paths)
+            }
+            _ => MemoryIndex::default(),
         };
         let Ok((system, system_cache_split)) = build_system_prompt(
             &self.tools,
@@ -792,6 +797,7 @@ impl Agent {
             &self.ctx.sandbox,
             self.subagent_limits,
             &self.gate,
+            self.ctx.unix_style_paths,
         ) else {
             return;
         };
@@ -833,7 +839,11 @@ impl Agent {
         // A `set_cwd` into a project whose AGENTS.md is over a cap has to say so
         // too — the file is missing from the prompt this call just rebuilt. Deduped,
         // since `/clear` re-runs this against the same tree.
-        for notice in docs.skipped.iter().map(|s| s.notice()) {
+        for notice in docs
+            .skipped
+            .iter()
+            .map(|s| s.notice(self.ctx.unix_style_paths))
+        {
             if !self.pending_notices.contains(&notice) {
                 self.pending_notices.push(notice);
             }
@@ -843,7 +853,7 @@ impl Agent {
         // index, so `/clear` and `set_cwd` reflect saved notes for this project.
         let memory = if self.memory_enabled {
             if let Some((proj, glob)) = memory_dirs(&self.ctx.cwd, self.memory_dir.as_deref()) {
-                let mem = gather_memory(&proj, &glob);
+                let mem = gather_memory(&proj, &glob, self.ctx.unix_style_paths);
                 self.ctx.memory_project = Some(proj);
                 self.ctx.memory_global = Some(glob);
                 mem
@@ -889,6 +899,7 @@ impl Agent {
             &self.ctx.sandbox,
             self.subagent_limits,
             &self.gate,
+            self.ctx.unix_style_paths,
         ) else {
             return;
         };
@@ -1417,9 +1428,12 @@ impl Agent {
         self.ctx.unix_style_paths
     }
 
-    /// Set path-label presentation for subsequent tool calls.
+    /// Set path-label presentation for subsequent tool calls and the system prompt.
     pub fn set_unix_style_paths(&mut self, enabled: bool) {
-        self.ctx.unix_style_paths = enabled;
+        if self.ctx.unix_style_paths != enabled {
+            self.ctx.unix_style_paths = enabled;
+            self.refresh_system_prompt_in_place();
+        }
     }
 
     /// Shared TODO list, mutated by the `todo` tool.

@@ -2482,16 +2482,19 @@ and **not** fixed.
   overflow pointers, cwd chrome, session-picker cwd rows, command/status output,
   reload/resume notices, default editor notices, session listings, login storage
   notices, theme source labels, skill base-directory footers, and command/skill
-  discovery source labels already use it. Remaining work includes path-bearing
-  notices, prompts, attachments/completion labels, and other tools. Live reload
-  updates subsequent main-agent tool calls and newly spawned children; existing
-  children retain their own setting. Cwd/picker caches restyle on reload. Keep
-  this display-only: do not change filesystem targets or literal Unix
-  backslashes. Preserve unified-diff prefix semantics. Never rewrite file
-  bodies, user prose, or captured shell output. Cover both settings and
-  unchanged Unix behavior at each real rendering seam, including config-to-agent
-  wiring. Complete these presentation surfaces before moving to the newly
-  prioritized self-update tool.
+  discovery source labels already use it. Generated system-prompt cwd/sandbox
+  roots, skipped-AGENTS notices, and memory headings/pointers also use it and
+  refresh on style changes with memory enabled or disabled. Remaining work
+  includes path-bearing tool/profile/delegation notices, startup/trust prompts,
+  attachments/completion labels, and lower-level storage/configuration errors.
+  Live reload updates subsequent main-agent tool calls and newly spawned
+  children; existing children retain their own setting. Cwd/picker caches
+  restyle on reload. Keep this display-only: do not change filesystem targets or
+  literal Unix backslashes. Preserve unified-diff prefix semantics. Never
+  rewrite file bodies, user prose, or captured shell output. Cover both settings
+  and unchanged Unix behavior at each real rendering seam, including
+  config-to-agent wiring. Complete these presentation surfaces before moving to
+  the newly prioritized self-update tool.
 - **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
   reproduced the same issue in both Alacritty and Windows 11 Terminal,
   correcting the earlier observation that Windows 11 Terminal was unaffected.

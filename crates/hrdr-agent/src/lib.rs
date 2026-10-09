@@ -1119,7 +1119,7 @@ fn memory_dirs(
 /// Read a scope's memory index (`MEMORY.md` or `index.md`), bounded to the
 /// prompt budget. Returns the resolved file path + bounded text; `None` when
 /// there's no index or it's empty.
-fn read_memory_index(root: &std::path::Path) -> Option<(PathBuf, String)> {
+fn read_memory_index(root: &std::path::Path, unix_style_paths: bool) -> Option<(PathBuf, String)> {
     let file = memory_index_file(root)?;
     let text = std::fs::read_to_string(&file).ok()?;
     let text = text.trim();
@@ -1139,7 +1139,7 @@ fn read_memory_index(root: &std::path::Path) -> Option<(PathBuf, String)> {
     }
     out.push_str(&format!(
         "… (truncated — read the full index at {})",
-        file.display()
+        hrdr_tools::display_path(&file, unix_style_paths)
     ));
     Some((file, out))
 }
@@ -1166,12 +1166,26 @@ impl MemoryIndex {
     }
 }
 
-fn gather_memory(project: &std::path::Path, global: &std::path::Path) -> MemoryIndex {
+fn gather_memory(
+    project: &std::path::Path,
+    global: &std::path::Path,
+    unix_style_paths: bool,
+) -> MemoryIndex {
     MemoryIndex {
-        global: read_memory_index(global)
-            .map(|(path, content)| format!("## {}\n\n{}", path.display(), content)),
-        project: read_memory_index(project)
-            .map(|(path, content)| format!("## {}\n\n{}", path.display(), content)),
+        global: read_memory_index(global, unix_style_paths).map(|(path, content)| {
+            format!(
+                "## {}\n\n{}",
+                hrdr_tools::display_path(&path, unix_style_paths),
+                content
+            )
+        }),
+        project: read_memory_index(project, unix_style_paths).map(|(path, content)| {
+            format!(
+                "## {}\n\n{}",
+                hrdr_tools::display_path(&path, unix_style_paths),
+                content
+            )
+        }),
     }
 }
 
@@ -1261,6 +1275,7 @@ fn build_system_prompt_sections(
     sandbox: &hrdr_tools::SandboxPolicy,
     limits: prompt::SubagentLimits,
     gate: &hrdr_tools::Gate,
+    unix_style_paths: bool,
 ) -> Result<prompt::SystemPrompt> {
     use prompt::{
         SECTION_BASE, SECTION_COMMANDS, SECTION_ENVIRONMENT, SECTION_GATE,
@@ -1321,10 +1336,13 @@ fn build_system_prompt_sections(
     p.push(SECTION_PERSONA, persona_section(persona));
     p.push(
         SECTION_ENVIRONMENT,
-        prompt::environment_section(cwd, tools, limits),
+        prompt::environment_section(unix_style_paths, cwd, tools, limits),
     );
     p.push(SECTION_GATE, prompt::gate_section(gate, tools));
-    p.push(SECTION_SANDBOX, prompt::sandbox_section(sandbox));
+    p.push(
+        SECTION_SANDBOX,
+        prompt::sandbox_section(unix_style_paths, sandbox),
+    );
     Ok(p)
 }
 
@@ -1348,9 +1366,21 @@ fn build_system_prompt(
     sandbox: &hrdr_tools::SandboxPolicy,
     limits: prompt::SubagentLimits,
     gate: &hrdr_tools::Gate,
+    unix_style_paths: bool,
 ) -> Result<(String, Option<usize>)> {
     let p = build_system_prompt_sections(
-        tools, cwd, docs, memory, commands, skills, persona, delegated, sandbox, limits, gate,
+        tools,
+        cwd,
+        docs,
+        memory,
+        commands,
+        skills,
+        persona,
+        delegated,
+        sandbox,
+        limits,
+        gate,
+        unix_style_paths,
     )?;
     let split = p.prefix_len_before(prompt::SECTION_ENVIRONMENT);
     Ok((p.render(), split))
@@ -1638,7 +1668,7 @@ mod tests {
             thinking,
         ];
         agent.set_messages(saved);
-        let cwd = agent.cwd().display().to_string();
+        let cwd = hrdr_tools::display_path(&agent.cwd(), agent.unix_style_paths());
 
         let system = agent.messages[0].content.clone().unwrap_or_default();
         assert_eq!(agent.messages[0].role, Role::System);
@@ -3534,9 +3564,9 @@ mod tests {
         .unwrap();
         let notices = agent.take_pending_notices();
         assert!(
-            notices
-                .iter()
-                .any(|n| n.contains(&big.display().to_string()) && n.contains("per-file cap")),
+            notices.iter().any(|n| n
+                .contains(&hrdr_tools::display_path(&big, agent.unix_style_paths()))
+                && n.contains("per-file cap")),
             "the skipped AGENTS.md must be named on the notice channel: {notices:?}"
         );
         // And it is not in the prompt — the notice is the only way to learn that.
@@ -4544,6 +4574,7 @@ mod tests {
                     write: DEFAULT_MAX_WRITE_SUBAGENTS,
                 },
                 &gate,
+                true,
             )
             .unwrap()
         };
@@ -4629,6 +4660,7 @@ mod tests {
                 write: DEFAULT_MAX_WRITE_SUBAGENTS,
             },
             &hrdr_tools::Gate::default(),
+            true,
         )
         .unwrap();
 
@@ -4664,6 +4696,7 @@ mod tests {
                 write: DEFAULT_MAX_WRITE_SUBAGENTS,
             },
             &hrdr_tools::Gate::default(),
+            true,
         )
         .unwrap();
 
@@ -4723,6 +4756,107 @@ mod tests {
     }
 
     #[test]
+    fn generated_prompt_paths_follow_live_style_without_rewriting_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r"Keep C:\raw/mixed\body unchanged.";
+        for memory in [false, true] {
+            std::fs::write(dir.path().join("AGENTS.md"), body).unwrap();
+            let memory_base = dir.path().join("memory");
+            let (project, global) = super::memory_dirs(dir.path(), Some(&memory_base)).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(&global).unwrap();
+            for root in [&project, &global] {
+                std::fs::write(root.join("MEMORY.md"), body).unwrap();
+            }
+            let mut agent = Agent::new(AgentConfig {
+                cwd: dir.path().to_path_buf(),
+                memory,
+                memory_dir: Some(memory_base),
+                unix_style_paths: false,
+                sandbox: hrdr_tools::SandboxMode::Write,
+                ..Default::default()
+            })
+            .unwrap();
+            let raw_cwd = agent.ctx.cwd.clone();
+            let raw_roots = agent.ctx.sandbox.writable_roots.clone();
+            let history = ChatMessage::user(body.to_string());
+            Arc::make_mut(&mut agent.messages).push(history.clone());
+            std::fs::write(dir.path().join("AGENTS.md"), "NOT RELOADED BY STYLE SETTER").unwrap();
+            for style in [false, true, false] {
+                agent.set_unix_style_paths(style);
+                let prompt = agent.messages[0].content.as_deref().unwrap();
+                assert!(prompt.contains(&format!(
+                    "- Working directory: {}",
+                    hrdr_tools::display_path(&raw_cwd, style)
+                )));
+                assert!(prompt.contains(body));
+                assert!(!prompt.contains("NOT RELOADED BY STYLE SETTER"));
+                assert!(!agent.ctx.sandbox.project_writable_roots().is_empty());
+                for root in agent.ctx.sandbox.project_writable_roots() {
+                    assert!(
+                        prompt
+                            .lines()
+                            .any(|line| line
+                                == format!("- {}", hrdr_tools::display_path(root, style)))
+                    );
+                }
+                for root in [&project, &global] {
+                    let heading = format!(
+                        "## {}\n\n{body}",
+                        hrdr_tools::display_path(&root.join("MEMORY.md"), style)
+                    );
+                    assert_eq!(prompt.contains(&heading), memory);
+                }
+                assert_eq!(agent.messages[1].content, history.content);
+                assert_eq!(agent.messages[1].role, history.role);
+                assert_eq!(agent.ctx.cwd, raw_cwd);
+                assert_eq!(agent.ctx.sandbox.writable_roots, raw_roots);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_prompt_memory_paths_preserve_index_bodies() {
+        use super::{MEMORY_INDEX_MAX_LINES, gather_memory, read_memory_index};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(if cfg!(windows) {
+            "mixed"
+        } else {
+            r"literal\name"
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("MEMORY.md");
+        let body = r"Keep C:\raw/mixed\body unchanged.";
+        for text in [
+            body.to_string(),
+            format!("{body}\n").repeat(MEMORY_INDEX_MAX_LINES + 1),
+        ] {
+            std::fs::write(&file, &text).unwrap();
+            for style in [false, true] {
+                let label = hrdr_tools::display_path(&file, style);
+                let (raw_path, content) = read_memory_index(&root, style).unwrap();
+                assert_eq!(raw_path, file);
+                let expected = if text.lines().count() > MEMORY_INDEX_MAX_LINES {
+                    format!(
+                        "{}… (truncated — read the full index at {label})",
+                        format!("{body}\n").repeat(MEMORY_INDEX_MAX_LINES)
+                    )
+                } else {
+                    text.clone()
+                };
+                assert_eq!(content, expected);
+                let memory = gather_memory(&root, &root, style);
+                assert_eq!(
+                    memory.project.as_deref(),
+                    Some(format!("## {label}\n\n{expected}").as_str())
+                );
+                assert_eq!(memory.global, memory.project);
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+            }
+        }
+    }
+
+    #[test]
     fn gather_memory_reads_bounded_index_per_scope() {
         use super::{gather_memory, read_memory_index};
         let dir = tempfile::tempdir().unwrap();
@@ -4731,17 +4865,22 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::create_dir_all(&glob).unwrap();
         // Both empty → nothing injected.
-        assert!(gather_memory(&proj, &glob).is_empty());
+        assert!(gather_memory(&proj, &glob, false).is_empty());
         std::fs::write(proj.join("MEMORY.md"), "- project fact").unwrap();
         std::fs::write(glob.join("MEMORY.md"), "- global fact").unwrap();
-        let mem = gather_memory(&proj, &glob);
+        let mem = gather_memory(&proj, &glob, false);
         // Each scope is its own field now, so it can be its own prompt section —
         // global stays cached when the project index differs.
         assert!(mem.global.as_deref().unwrap().contains("global fact"));
         assert!(mem.project.as_deref().unwrap().contains("project fact"));
         // A huge index is bounded, with a pointer to read the rest.
         std::fs::write(proj.join("MEMORY.md"), "line\n".repeat(10_000)).unwrap();
-        assert!(read_memory_index(&proj).unwrap().1.contains("truncated"));
+        assert!(
+            read_memory_index(&proj, false)
+                .unwrap()
+                .1
+                .contains("truncated")
+        );
         // A base override relocates both scopes under it (still scope subdirs).
         let over = dir.path().join("elsewhere");
         let (p2, g2) =
@@ -4766,7 +4905,7 @@ mod tests {
         std::fs::remove_file(glob.join("MEMORY.md")).unwrap();
         std::fs::write(glob.join("index.md"), "- okf global fact").unwrap();
         std::fs::write(proj.join("index.md"), "- okf project fact").unwrap();
-        let mem = gather_memory(&proj, &glob);
+        let mem = gather_memory(&proj, &glob, false);
         assert!(mem.global.as_deref().unwrap().contains("okf global fact"));
         assert!(mem.project.as_deref().unwrap().contains("okf project fact"));
     }
