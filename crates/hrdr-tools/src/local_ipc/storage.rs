@@ -37,12 +37,39 @@ fn inject_failure(stage: u8) -> io::Result<()> {
 
 const MUTATION_LOCK: &str = ".mutation.lock";
 
-/// Closing the independently opened handle releases the kernel lock. Never unlink
-/// or replace the lock file: cooperative writers must always lock the same object.
+/// A kernel lock released by its acquiring process, even if a duplicate survives.
+pub(super) struct OwnedLock {
+    file: File,
+    pid: u32,
+}
+
+impl OwnedLock {
+    pub(super) fn acquire(file: File) -> io::Result<Self> {
+        file.try_lock().map_err(io::Error::from)?;
+        Ok(Self {
+            file,
+            pid: std::process::id(),
+        })
+    }
+}
+
+impl Drop for OwnedLock {
+    fn drop(&mut self) {
+        // An inherited handle must not unlock the acquiring process's lock.
+        if self.pid == std::process::id()
+            && let Err(error) = self.file.unlock()
+        {
+            let _ = writeln!(io::stderr(), "failed to release IPC file lock: {error}");
+        }
+    }
+}
+
+/// Never unlink or replace the lock file: cooperative writers must always lock
+/// the same object.
 /// Other users are excluded by storage permissions; hostile same-user replacement
 /// is outside the security boundary. Keep this guard out of asynchronous work.
 pub(super) struct MutationGuard {
-    _file: File,
+    _lock: OwnedLock,
 }
 
 struct UnwindTemporary<'a> {
@@ -83,8 +110,9 @@ impl MutationGuard {
             }
             Err(error) => return Err(error),
         };
-        file.try_lock().map_err(io::Error::from)?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _lock: OwnedLock::acquire(file)?,
+        })
     }
 
     fn remove_temporary(&self, directory: &UserDirectory, endpoint: &EndpointId) -> io::Result<()> {
@@ -163,15 +191,15 @@ impl MutationGuard {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            match lease.try_lock().map_err(io::Error::from) {
-                Ok(()) => {}
+            let _lease = match OwnedLock::acquire(lease) {
+                Ok(lease) => lease,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     let endpoint = EndpointId::from_name(stem).expect("validated generation");
                     self.remove_temporary(directory, &endpoint)?;
                     continue;
                 }
                 Err(error) => return Err(error),
-            }
+            };
             let associated = [
                 stem.to_owned(),
                 format!("{stem}.json"),

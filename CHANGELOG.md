@@ -101,6 +101,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **IPC lock release follows its owning guard's lifetime.** Mutation and
+  generation locks explicitly unlock in their acquiring process when dropped, so
+  surviving duplicate handles do not retain them after owner cleanup. Listener
+  transport still closes before lease release; unlock failures are reported.
 - **Unix file completions preserve literal backslashes.** Both filesystem
   walkers normalize only native separators, keeping `a\b.txt` distinct from
   `a/b.txt` through indexing, mention resolution, and completion acceptance.

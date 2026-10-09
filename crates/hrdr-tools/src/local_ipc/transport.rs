@@ -93,7 +93,7 @@ impl EndpointId {
 pub struct Listener {
     inner: platform::Listener,
     // Field order closes the transport before releasing the generation lock.
-    _lease: std::fs::File,
+    _lease: super::storage::OwnedLock,
     endpoint: EndpointId,
     pub(super) directory: UserDirectory,
 }
@@ -106,7 +106,7 @@ impl Listener {
         super::storage::require_room(names.len(), 1 + usize::from(cfg!(unix)))?;
         let endpoint = EndpointId::fresh();
         let lease = super::storage::create(directory, &format!("{}.lease", endpoint.name()))?;
-        lease.try_lock().map_err(io::Error::from)?;
+        let lease = super::storage::OwnedLock::acquire(lease)?;
         Ok(Self {
             inner: platform::Listener::bind(directory, &endpoint, &mutation)?,
             _lease: lease,

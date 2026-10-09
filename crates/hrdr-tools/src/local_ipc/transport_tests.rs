@@ -16,6 +16,28 @@ pub(super) fn test_root() -> tempfile::TempDir {
 }
 
 #[test]
+fn owned_lock_releases_while_duplicate_remains_open() {
+    let root = test_root();
+    let path = root.path().join("owner.lock");
+    let file = std::fs::File::create(&path).unwrap();
+    let duplicate = file.try_clone().unwrap();
+    let owner = crate::local_ipc::storage::OwnedLock::acquire(file).unwrap();
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        io::Error::from(contender.try_lock().unwrap_err()).kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(owner);
+    contender.try_lock().unwrap();
+    contender.unlock().unwrap();
+    assert!(duplicate.metadata().unwrap().is_file());
+}
+
+#[test]
 fn endpoint_validation_and_roundtrip() {
     let endpoint = EndpointId::fresh();
     let encoded = serde_json::to_value(&endpoint).unwrap();

@@ -166,12 +166,15 @@ rejection were not exercised; retain those as security coverage gaps. Transport
 CI run `37799426844` passed after rerunning its unprovisioned macOS Clippy job;
 that result does not cover later registration/runtime changes.
 
-CI follow-up: thirtieth-push run `37912493951` (`af2f59d2`) failed the Windows
-streaming receive timeout and Linux/macOS ordinary-suite registration turnover
-`Kind(WouldBlock)`. Linux/macOS nextest and the new completion identity
-regressions passed; all platform Clippy/build/smoke, dependency jobs, and the
-Windows leak guard passed. Confirm the approved test corrections on the next CI
-run before declaring the full matrix green.
+CI follow-up: run `37916451624` (`8c00e34c`) passed all platform nextest jobs
+and Linux ordinary tests after the test corrections. macOS ordinary tests
+instead failed the unchanged immediate directory-count bound in
+`socket_only_turnover_stays_bounded_with_live_survivor`. Retained duplicate
+handles demonstrably delay close-only lock release; that mechanism is covered by
+an owner-unlock regression, but its role in this CI failure is unproven. Confirm
+the correction on macOS before declaring the matrix green. Actual fork
+inheritance, foreign-PID guard destruction, and unlock/stderr failure injection
+remain untested.
 
 During the export/editor label slice, an additional local leak-guard run
 reported `a_real_tool_round_keeps_the_scrolled_up_viewport` failing with
