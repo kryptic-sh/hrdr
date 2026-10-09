@@ -44,7 +44,7 @@ impl super::App {
                 anchor_col: 0,
                 items: slash
                     .into_iter()
-                    .map(|(n, d)| (n.to_string(), d.to_string()))
+                    .map(|(n, d)| CompletionItem::from((n.to_string(), d.to_string())))
                     .collect(),
             });
         }
@@ -53,7 +53,7 @@ impl super::App {
             return Some(Completions {
                 kind: CompletionKind::Command,
                 anchor_col: 0,
-                items: invocations,
+                items: invocations.into_iter().map(CompletionItem::from).collect(),
             });
         }
         // Argument completion: "/cmd partial" / ":command partial" — enum
@@ -64,7 +64,7 @@ impl super::App {
             return Some(Completions {
                 kind: CompletionKind::Arg { token_start: start },
                 anchor_col: content[..start].chars().count(),
-                items,
+                items: items.into_iter().map(CompletionItem::from).collect(),
             });
         }
         // File-path arguments for the commands that take one.
@@ -81,10 +81,10 @@ impl super::App {
         if let Some((start, query)) = active_file_token(content) {
             // Sub-agents first (an accepted `@name` routes the message to that
             // agent), then file paths.
-            let mut items: Vec<(String, String)> =
+            let mut items: Vec<CompletionItem> =
                 rank_agent_matches(&hrdr_app::agent_names(&self.agent), &query)
                     .into_iter()
-                    .map(|n| (n, "sub-agent".to_string()))
+                    .map(|n| CompletionItem::from((n, "sub-agent".to_string())))
                     .collect();
             items.extend(self.file_completion_items(&query));
             if !items.is_empty() {
@@ -112,7 +112,7 @@ impl super::App {
         idx: usize,
         trailing_space: bool,
     ) {
-        let chosen = &comp.items[idx].0;
+        let chosen = &comp.items[idx].insertion;
         match comp.kind {
             CompletionKind::Slash | CompletionKind::Command => {
                 if trailing_space {
@@ -148,7 +148,7 @@ impl super::App {
     /// than re-insert it. Compares the chosen label against the token already in
     /// the input, per completion kind.
     pub(super) fn completion_is_exact(&self, comp: &Completions, idx: usize) -> bool {
-        let chosen = comp.items[idx].0.as_str();
+        let chosen = comp.items[idx].insertion.as_str();
         let content = self.editor.content();
         match comp.kind {
             // A `/…` or `:…` command is "already typed in full" when it dispatches
@@ -181,11 +181,15 @@ impl super::App {
     }
 
     /// Build (and cache) the list of files under the cwd, then rank by `query`.
-    fn file_completion_items(&mut self, query: &str) -> Vec<(String, String)> {
+    fn file_completion_items(&mut self, query: &str) -> Vec<CompletionItem> {
         self.ensure_file_index();
         rank_file_matches(&self.file_index, query)
             .into_iter()
-            .map(|p| (p, String::new()))
+            .map(|insertion| CompletionItem {
+                insertion,
+                description: String::new(),
+                is_filesystem_path: true,
+            })
             .collect()
     }
     /// Kick off an off-thread rebuild of `file_index` if it's stale for the
@@ -277,8 +281,25 @@ pub(crate) struct Completions {
     /// Char column (within the token's own line) where the completed token
     /// starts — the popup is anchored above this column of the input.
     pub(crate) anchor_col: usize,
-    /// `(label, description)` rows; the label is the text inserted on accept.
-    pub(crate) items: Vec<(String, String)>,
+    pub(crate) items: Vec<CompletionItem>,
+}
+
+/// Raw completion identity, kept separate from its render-time label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletionItem {
+    pub(crate) insertion: String,
+    pub(crate) description: String,
+    pub(crate) is_filesystem_path: bool,
+}
+
+impl From<(String, String)> for CompletionItem {
+    fn from((insertion, description): (String, String)) -> Self {
+        Self {
+            insertion,
+            description,
+            is_filesystem_path: false,
+        }
+    }
 }
 /// Which completion is active, and how to apply the selection.
 #[derive(Clone)]

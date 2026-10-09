@@ -2496,8 +2496,9 @@ and **not** fixed.
   listing roots and malformed-memory error paths also use it, as do profile
   discovery/collision notices and delegation cwd refusals. Attachment
   diagnostics, clipboard file-URI refusals, generated `@file` headers, and
-  attached directory labels also use it. Remaining work includes startup/trust
-  prompts, completion labels, and lower-level storage/configuration errors. Live
+  attached directory labels also use it. File-completion popup labels restyle
+  without changing insertion values or ranking. Remaining work includes
+  startup/trust prompts and lower-level storage/configuration errors. Live
   reload updates subsequent main-agent tool calls and newly spawned children;
   existing children retain their own setting. Cwd/picker caches restyle on
   reload. Keep this display-only: do not change filesystem targets or literal

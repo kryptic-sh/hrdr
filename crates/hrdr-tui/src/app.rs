@@ -3735,7 +3735,7 @@ mod tests {
         let spec = sel.current().unwrap().spec.clone();
         app.editor.set_content("/theme style-reload-b");
         assert_eq!(
-            app.active_completions().unwrap().items[0].1,
+            app.active_completions().unwrap().items[0].description,
             hrdr_agent::display_dir_with_style(&dir, false)
         );
         for style in [true, false] {
@@ -3751,7 +3751,7 @@ mod tests {
                 hrdr_agent::display_dir_with_style(&dir, style)
             );
             assert_eq!(
-                app.active_completions().unwrap().items[0].1,
+                app.active_completions().unwrap().items[0].description,
                 hrdr_agent::display_dir_with_style(&dir, style)
             );
         }
@@ -3801,7 +3801,10 @@ mod tests {
         app.editor.set_content(":described");
         assert_eq!(
             app.active_completions().unwrap().items,
-            vec![(":described".into(), description.into())]
+            vec![super::completion::CompletionItem::from((
+                ":described".into(),
+                description.into()
+            ))]
         );
         let sel = app.command_selector.as_mut().unwrap();
         let initial = sel.rows().cloned().collect::<Vec<_>>();
@@ -3870,7 +3873,10 @@ mod tests {
             sel.down();
             assert_eq!(
                 app.active_completions().unwrap().items,
-                vec![(":described".into(), description.into())]
+                vec![super::completion::CompletionItem::from((
+                    ":described".into(),
+                    description.into()
+                ))]
             );
         }
     }

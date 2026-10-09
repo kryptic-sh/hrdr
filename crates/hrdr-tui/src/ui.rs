@@ -856,7 +856,20 @@ fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app
     } else {
         0
     };
-    let shown = &comp.items[start..(start + COMPLETION_MAX_ROWS).min(total)];
+    let shown: Vec<_> = comp.items[start..(start + COMPLETION_MAX_ROWS).min(total)]
+        .iter()
+        .map(|item| {
+            let label = if item.is_filesystem_path {
+                hrdr_tools::display_path(
+                    std::path::Path::new(&item.insertion),
+                    app.unix_style_paths(),
+                )
+            } else {
+                item.insertion.clone()
+            };
+            (label, &item.description)
+        })
+        .collect();
     // Height: one row per shown item, plus the block's padded row above and
     // below, plus a trailing "N more" hint when the list is windowed.
     let more = total - (start + shown.len());

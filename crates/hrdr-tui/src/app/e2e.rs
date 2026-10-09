@@ -9644,6 +9644,146 @@ async fn an_unchanged_block_is_reused_not_rerendered() {
 }
 
 #[tokio::test]
+async fn path_style_completion_labels_preserve_rank_exactness_and_acceptance() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    // Seed the walker's raw index so this tests presentation, not filesystem walking.
+    let paths = ["nested/file.rs", "nested/deeper/", "other/nested.txt"];
+    h.app.file_index = paths
+        .iter()
+        .map(|p| (p.to_string(), p.to_ascii_lowercase()))
+        .collect();
+    h.app.file_index_cwd = Some(std::path::PathBuf::from(h.app.current_cwd()));
+    for prefix in ["@", "/add ", "/edit "] {
+        for style in [false, true] {
+            h.app.editor.set_content(&format!("{prefix}nested"));
+            h.app.suppress_completions = false;
+            let warm = h.app.active_completions().unwrap();
+            assert_eq!(
+                warm.items
+                    .iter()
+                    .map(|item| item.insertion.as_str())
+                    .collect::<Vec<_>>(),
+                ["other/nested.txt", "nested/deeper/", "nested/file.rs"]
+            );
+            h.render();
+            hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
+                .unwrap();
+            h.app.apply_config_reload(true);
+            let comp = h.app.active_completions().unwrap();
+            assert_eq!(comp.items, warm.items);
+            assert_eq!(
+                h.app
+                    .file_index
+                    .iter()
+                    .map(|(p, _)| p.as_str())
+                    .collect::<Vec<_>>(),
+                paths
+            );
+            let screen = h.render();
+            for item in &comp.items {
+                assert!(item.is_filesystem_path);
+                let expected = if cfg!(windows) && !style {
+                    item.insertion.replace('/', "\\")
+                } else {
+                    item.insertion.clone()
+                };
+                assert!(
+                    screen.contains(&expected),
+                    "missing {expected:?}:\n{screen}"
+                );
+            }
+            for (idx, item) in comp.items.iter().enumerate() {
+                h.app.editor.set_content(&format!("{prefix}nested"));
+                h.app.suppress_completions = false;
+                h.app.completion_idx = idx;
+                assert!(!h.app.completion_is_exact(&comp, idx));
+                h.press(KeyCode::Tab);
+                let space = if prefix == "@" && item.insertion.ends_with('/') {
+                    ""
+                } else {
+                    " "
+                };
+                assert_eq!(
+                    h.app.editor.content(),
+                    format!("{prefix}{}{space}", item.insertion)
+                );
+                assert!(h.app.completion_is_exact(&comp, idx));
+            }
+        }
+    }
+    // A style flip also restyles an unchanged cache, without adding style to its key.
+    h.app.editor.set_content("@nested");
+    h.app.suppress_completions = false;
+    h.app.cfg.unix_style_paths = true;
+    let warm = h.app.active_completions().unwrap();
+    h.render();
+    h.app.cfg.unix_style_paths = false;
+    let screen = h.render();
+    let expected = if cfg!(windows) {
+        r"nested\file.rs"
+    } else {
+        "nested/file.rs"
+    };
+    assert!(screen.contains(expected), "{screen}");
+    assert_eq!(h.app.active_completions().unwrap().items, warm.items);
+    h.app.completion_idx = 2;
+    h.press(KeyCode::Tab);
+    assert_eq!(h.app.editor.content(), "@nested/file.rs ");
+}
+
+#[tokio::test]
+async fn path_style_completion_nonpath_rows_stay_verbatim() {
+    use super::completion::{CompletionItem, CompletionKind, Completions};
+    let mut h = Harness::new(vec![]).await;
+    for style in [false, true] {
+        h.app.cfg.unix_style_paths = style;
+        for (input, insertion, kind) in [
+            (
+                "@ag",
+                r"agent/team\name",
+                CompletionKind::Mention { token_start: 0 },
+            ),
+            (":co", r":command/group\name", CompletionKind::Command),
+            (
+                "/model co",
+                r"choice/group\name",
+                CompletionKind::Arg { token_start: 7 },
+            ),
+        ] {
+            for description in [r"description/with\slashes", ""] {
+                h.app.editor.set_content(input);
+                h.app.suppress_completions = false;
+                h.app.completion_idx = 0;
+                let item = CompletionItem::from((insertion.into(), description.into()));
+                assert!(!item.is_filesystem_path);
+                h.app.completion_cache = Some((
+                    input.into(),
+                    h.app.completion_generation,
+                    Some(Completions {
+                        kind: kind.clone(),
+                        anchor_col: 0,
+                        items: vec![item],
+                    }),
+                ));
+                let screen = h.render();
+                assert!(screen.contains(insertion), "{screen}");
+                assert!(screen.contains(description), "{screen}");
+                h.press(KeyCode::Tab);
+                let prefix = if input.starts_with('@') {
+                    "@"
+                } else if input.starts_with('/') {
+                    "/model "
+                } else {
+                    ""
+                };
+                assert_eq!(h.app.editor.content(), format!("{prefix}{insertion} "));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn path_style_reload_updates_cwd_chrome_and_warm_session_picker() {
     let _home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
@@ -10635,7 +10775,7 @@ async fn up_after_recalling_a_slash_command_keeps_walking_history() {
         .active_completions()
         .expect("a freshly typed `/` opens completions again");
     assert!(
-        comp.items.iter().any(|(name, _)| name == "/help"),
+        comp.items.iter().any(|item| item.insertion == "/help"),
         "the popup offers the command: {:?}",
         comp.items
     );
@@ -10717,7 +10857,7 @@ async fn at_mention_completion_picks_up_files_created_after_the_index() {
         .map(|c| c.items)
         .unwrap_or_default();
     assert!(
-        items.iter().any(|(name, _)| name == "alpha.txt"),
+        items.iter().any(|item| item.insertion == "alpha.txt"),
         "indexed file offered: {items:?}"
     );
 
@@ -10754,7 +10894,7 @@ async fn at_mention_completion_picks_up_files_created_after_the_index() {
         .map(|c| c.items)
         .unwrap_or_default();
     assert!(
-        items.iter().any(|(name, _)| name == "beta.rs"),
+        items.iter().any(|item| item.insertion == "beta.rs"),
         "the newly created file is offered: {items:?}"
     );
 }
