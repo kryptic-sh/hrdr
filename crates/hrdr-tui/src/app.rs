@@ -1845,7 +1845,7 @@ impl App {
     fn paste_clipboard(&mut self) {
         let cwd = hrdr_app::agent_cwd(&self.agent);
         let stem = format!("pasted-{}", self.paste_seq + 1);
-        match hrdr_app::clipboard_paste(&self.clipboard, &cwd, &stem) {
+        match hrdr_app::clipboard_paste(&self.clipboard, &cwd, &stem, self.unix_style_paths()) {
             hrdr_app::ClipboardPaste::Media(a) => {
                 self.paste_seq += 1;
                 // "pasted …", the sibling of the text paste's "pasted N chars";

@@ -100,8 +100,8 @@ pub fn agent_mention_message(agent: &str, body: &str) -> String {
 /// the user can see they're about to send).
 pub const MAX_ATTACH_BYTES: usize = 100 * 1024;
 
-pub fn expand_mentions(input: &str, cwd: &Path) -> String {
-    expand_mentions_tracked(input, cwd).into_text()
+pub fn expand_mentions(input: &str, cwd: &Path, unix_style_paths: bool) -> String {
+    expand_mentions_tracked(input, cwd, unix_style_paths).into_text()
 }
 
 /// A prepared outgoing message: the text the model reads, the image/PDF
@@ -188,7 +188,7 @@ impl Outgoing {
 
 /// [`expand_mentions`], plus what the text cannot carry: the attachments and the
 /// fully-inlined paths (see [`Outgoing`]).
-pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> Outgoing {
+pub fn expand_mentions_tracked(input: &str, cwd: &Path, unix_style_paths: bool) -> Outgoing {
     // (label, body, whole-file-inlined). Only a file's complete content counts as
     // inlined — a truncated file is a partial view, and a directory listing is not
     // content at all, so neither may license a blind overwrite.
@@ -215,7 +215,7 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> Outgoing {
         // a name: a directory of screenshots is a pointer at fifty files, not an
         // instruction to send fifty images.
         if resolve_under(cwd, rel).is_dir() {
-            if let Ok(listing) = hrdr_tools::read_attach_dir(rel, cwd) {
+            if let Ok(listing) = hrdr_tools::read_attach_dir(rel, cwd, unix_style_paths) {
                 seen.push(rel.to_string());
                 attached.push((format!("{rel}/"), listing, false));
             }
@@ -224,7 +224,7 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> Outgoing {
         // The bytes decide, not the extension: an image or PDF rides beside the
         // text as an attachment, and everything else — including a `.png` that
         // holds text — goes down the text path below.
-        match hrdr_tools::read_attach_media(rel, cwd) {
+        match hrdr_tools::read_attach_media(rel, cwd, unix_style_paths) {
             Ok(Some(a)) => {
                 seen.push(rel.to_string());
                 attachments.push(a);
@@ -236,7 +236,9 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> Outgoing {
             // exactly as an unreadable text mention is.
             Err(_) => continue,
         }
-        let Ok(text) = hrdr_tools::read_attach_file(rel, cwd, Some(MAX_ATTACH_BYTES)) else {
+        let Ok(text) =
+            hrdr_tools::read_attach_file(rel, cwd, Some(MAX_ATTACH_BYTES), unix_style_paths)
+        else {
             continue;
         };
         let (text, full) = if text.len() > MAX_ATTACH_BYTES {
@@ -269,7 +271,8 @@ pub fn expand_mentions_tracked(input: &str, cwd: &Path) -> Outgoing {
         } else {
             ""
         };
-        out.push_str(&format!("\n=== {rel}{what} ===\n{text}\n"));
+        let label = hrdr_tools::display_path(Path::new(&rel), unix_style_paths);
+        out.push_str(&format!("\n=== {label}{what} ===\n{text}\n"));
     }
     Outgoing {
         text: out,
@@ -340,12 +343,12 @@ pub fn prepare_outgoing_tracked(
     };
     match extract_agent_mention(input, names) {
         Some((agent, body)) => {
-            let mut out = expand_mentions_tracked(&body, cwd);
+            let mut out = expand_mentions_tracked(&body, cwd, unix_style_paths);
             out.text = agent_mention_message(&agent, &expand_todo_refs(&out.text, todos));
             out
         }
         None => {
-            let mut out = expand_mentions_tracked(input, cwd);
+            let mut out = expand_mentions_tracked(input, cwd, unix_style_paths);
             out.text = expand_todo_refs(&out.text, todos);
             out
         }
@@ -768,18 +771,18 @@ mod tests {
         std::fs::write(root.join("a.txt"), "hello from a").unwrap();
 
         // No mentions → unchanged.
-        assert_eq!(expand_mentions("just text", root), "just text");
+        assert_eq!(expand_mentions("just text", root, true), "just text");
 
         // A readable mention is attached (trailing punctuation trimmed), once,
         // while the original line is preserved.
-        let out = expand_mentions("look at @a.txt, and @a.txt again", root);
+        let out = expand_mentions("look at @a.txt, and @a.txt again", root, true);
         assert!(out.starts_with("look at @a.txt, and @a.txt again"));
         assert!(out.contains("--- Referenced paths (via @) ---"));
         assert_eq!(out.matches("=== a.txt ===").count(), 1);
         assert!(out.contains("hello from a"));
 
         // A missing mention resolves nothing → unchanged.
-        assert_eq!(expand_mentions("@nope.txt", root), "@nope.txt");
+        assert_eq!(expand_mentions("@nope.txt", root, true), "@nope.txt");
     }
 
     /// `@dir` attaches what the directory holds, spelled with or without the
@@ -795,7 +798,7 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "//! lib").unwrap();
 
         for spelling in ["@src", "@src/"] {
-            let out = expand_mentions(&format!("look at {spelling}"), root);
+            let out = expand_mentions(&format!("look at {spelling}"), root, true);
             assert!(
                 out.contains("=== src/ (directory listing, one level) ==="),
                 "{spelling} labels the block as a listing: {out}"
@@ -816,14 +819,14 @@ mod tests {
 
         // A directory is a pointer, not content, so it never disarms the
         // read-before-edit guard for the files inside it.
-        let inlined = expand_mentions_tracked("@src", root);
+        let inlined = expand_mentions_tracked("@src", root, true);
         assert!(
             inlined.inlined().is_empty(),
             "a listing licenses no blind overwrite: {inlined:?}"
         );
 
         // Both spellings in one message describe the same directory — attach once.
-        let out = expand_mentions("@src and @src/ again", root);
+        let out = expand_mentions("@src and @src/ again", root, true);
         assert_eq!(out.matches("=== src/").count(), 1, "{out}");
     }
 
@@ -868,18 +871,19 @@ mod tests {
 
         // Nothing inlined → nothing to mark.
         assert!(
-            expand_mentions_tracked("just text", root)
+            expand_mentions_tracked("just text", root, true)
                 .inlined()
                 .is_empty()
         );
         assert!(
-            expand_mentions_tracked("@nope.txt", root)
+            expand_mentions_tracked("@nope.txt", root, true)
                 .inlined()
                 .is_empty()
         );
 
         // Two distinct mentions, one repeated: each reported once, resolved.
-        let out = expand_mentions_tracked("see @a.txt and @sub/b.txt, plus @a.txt again", root);
+        let out =
+            expand_mentions_tracked("see @a.txt and @sub/b.txt, plus @a.txt again", root, true);
         assert!(out.text().contains("hello from b"));
         assert_eq!(
             out.inlined(),
@@ -891,12 +895,87 @@ mod tests {
         // there is nothing to mark — a partial view must not license an edit.
         let big = root.join("big.log");
         std::fs::write(&big, "x".repeat(MAX_ATTACH_BYTES + 1)).unwrap();
-        let out = expand_mentions_tracked("look at @big.log", root);
+        let out = expand_mentions_tracked("look at @big.log", root, true);
         assert_eq!(out.text(), "look at @big.log");
         assert!(
             out.inlined().is_empty(),
             "an unattached file is not a read file"
         );
+    }
+
+    #[test]
+    fn attachment_presentation_outgoing_changes_only_generated_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let folder = if cfg!(unix) {
+            r"nested\literal"
+        } else {
+            "nested"
+        };
+        std::fs::create_dir_all(root.join(folder).join("child")).unwrap();
+        let body = r"body\keeps/its separators";
+        let rel = format!("{folder}/note.txt");
+        std::fs::write(root.join(&rel), body).unwrap();
+        let image = format!("{folder}/shot.png");
+        let bytes = png_bytes(16);
+        std::fs::write(root.join(&image), &bytes).unwrap();
+        let names = vec!["explore".to_string()];
+        let prose = format!(
+            r"prose\keeps/its separators @{rel} @{rel} @{folder}/ @{folder} @{image} @{image}"
+        );
+        for style in [false, true] {
+            let native = cfg!(windows) && !style;
+            let label = if native {
+                rel.replace('/', "\\")
+            } else {
+                rel.clone()
+            };
+            let directory = if native {
+                format!("{folder}\\")
+            } else {
+                format!("{folder}/")
+            };
+            let child = if native { "child\\" } else { "child/" };
+            let expanded = format!(
+                "{prose}\n\n--- Referenced paths (via @) ---\n\n=== {label} ===\n{body}\n\n=== {directory} (directory listing, one level) ===\n{child}\nnote.txt\nshot.png\n"
+            );
+            for routed in [false, true] {
+                let input = if routed {
+                    format!("@explore {prose}")
+                } else {
+                    prose.clone()
+                };
+                let out = prepare_outgoing_tracked(&input, &names, root, LOAD, &[], style);
+                assert_eq!(
+                    out.text(),
+                    if routed {
+                        agent_mention_message("explore", &expanded)
+                    } else {
+                        expanded.clone()
+                    }
+                );
+                assert_eq!(out.inlined(), [resolve_under(root, &rel)]);
+                assert_eq!(
+                    out.attachments(),
+                    [hrdr_tools::Attachment::new(
+                        bytes.clone(),
+                        hrdr_tools::MediaType::Png,
+                        "shot.png"
+                    )
+                    .unwrap()]
+                );
+                assert_eq!(out.into_steer(&input).display, input);
+            }
+            let media_input = format!(r"prose\with/slashes @{image} @{image}");
+            let out = prepare_outgoing_tracked(&media_input, &names, root, LOAD, &[], style);
+            assert_eq!(out.text(), media_input);
+            assert!(out.inlined().is_empty());
+            assert_eq!(out.attachments().len(), 1);
+            assert_eq!(
+                expand_mentions(&format!("@{rel}"), root, style),
+                format!("@{rel}\n\n--- Referenced paths (via @) ---\n\n=== {label} ===\n{body}\n")
+            );
+        }
     }
 
     /// `prepare_outgoing_tracked` carries the inlined-path list out through both
@@ -1321,12 +1400,12 @@ mod tests {
         std::fs::write(&outside, "outside content").unwrap();
 
         // Relative `..` escape.
-        let out = expand_mentions("check @../leak.txt", &root);
+        let out = expand_mentions("check @../leak.txt", &root, true);
         assert!(out.starts_with("check @../leak.txt"));
         assert!(out.contains("outside content"), "got: {out}");
 
         // Absolute path outside cwd.
-        let out = expand_mentions(&format!("check @{}", outside.display()), &root);
+        let out = expand_mentions(&format!("check @{}", outside.display()), &root, true);
         assert!(out.contains("outside content"), "got: {out}");
     }
 
@@ -1338,7 +1417,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".env"), "SECRET=1").unwrap();
 
-        let out = expand_mentions("check @.env", &root);
+        let out = expand_mentions("check @.env", &root, true);
         assert_eq!(out, "check @.env");
     }
 
@@ -1351,7 +1430,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("notes.txt"), "nested content").unwrap();
 
-        let out = expand_mentions("show @sub/notes.txt", &root);
+        let out = expand_mentions("show @sub/notes.txt", &root, true);
         assert!(out.starts_with("show @sub/notes.txt"));
         assert!(out.contains("nested content"));
     }
@@ -1386,7 +1465,7 @@ mod tests {
         std::fs::write(root.join("shot.png"), png_bytes(256)).unwrap();
         std::fs::write(root.join("report.pdf"), PDF_BYTES).unwrap();
 
-        let out = expand_mentions_tracked("what is @shot.png and @report.pdf", root);
+        let out = expand_mentions_tracked("what is @shot.png and @report.pdf", root, true);
         let kinds: Vec<_> = out
             .attachments()
             .iter()
@@ -1429,7 +1508,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("notes.md"), "# notes\nbody\n").unwrap();
 
-        let out = expand_mentions_tracked("look at @notes.md", root);
+        let out = expand_mentions_tracked("look at @notes.md", root, true);
         assert_eq!(
             out.text(),
             "look at @notes.md\n\n--- Referenced paths (via @) ---\n\n=== notes.md ===\n\
@@ -1439,13 +1518,13 @@ mod tests {
         assert_eq!(out.inlined(), [root.join("notes.md")]);
         // And with attachments empty, delivery adds no label block.
         assert_eq!(
-            expand_mentions_tracked("look at @notes.md", root)
+            expand_mentions_tracked("look at @notes.md", root, true)
                 .into_steer("look at @notes.md")
                 .sent,
             out.text()
         );
 
-        let plain = expand_mentions_tracked("just some text", root);
+        let plain = expand_mentions_tracked("just some text", root, true);
         assert_eq!(plain.text(), "just some text");
         assert!(plain.attachments().is_empty() && plain.inlined().is_empty());
     }
@@ -1460,7 +1539,7 @@ mod tests {
         std::fs::write(root.join("liar.png"), "not an image at all\n").unwrap();
         std::fs::write(root.join("screenshot"), png_bytes(32)).unwrap();
 
-        let out = expand_mentions_tracked("see @liar.png", root);
+        let out = expand_mentions_tracked("see @liar.png", root, true);
         assert!(
             out.attachments().is_empty(),
             "bytes that are not an image are not attached as one"
@@ -1472,7 +1551,7 @@ mod tests {
         );
         assert_eq!(out.inlined(), [root.join("liar.png")]);
 
-        let out = expand_mentions_tracked("see @screenshot", root);
+        let out = expand_mentions_tracked("see @screenshot", root, true);
         assert_eq!(out.attachments().len(), 1, "the bytes are a PNG");
     }
 
@@ -1492,7 +1571,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("data.csv"), "a,b\n1,2\n").unwrap();
 
-        let out = expand_mentions_tracked("hear @clip.wav", root);
+        let out = expand_mentions_tracked("hear @clip.wav", root, true);
         assert!(out.attachments().is_empty());
         assert_eq!(
             out.text(),
@@ -1500,7 +1579,7 @@ mod tests {
             "unreadable as text → skipped, as before"
         );
 
-        let out = expand_mentions_tracked("read @data.csv", root);
+        let out = expand_mentions_tracked("read @data.csv", root, true);
         assert!(out.attachments().is_empty());
         assert!(out.text().contains("a,b"), "{:?}", out.text());
     }
@@ -1512,7 +1591,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        let out = expand_mentions_tracked("what is @missing.png", root);
+        let out = expand_mentions_tracked("what is @missing.png", root, true);
         assert_eq!(out.text(), "what is @missing.png");
         assert!(out.attachments().is_empty() && out.inlined().is_empty());
     }
@@ -1531,7 +1610,7 @@ mod tests {
         std::fs::write(root.join("report.pdf"), PDF_BYTES).unwrap();
         std::fs::write(root.join("notes.md"), "# notes\n").unwrap();
 
-        let out = expand_mentions_tracked("@shot.png @report.pdf @notes.md", root);
+        let out = expand_mentions_tracked("@shot.png @report.pdf @notes.md", root, true);
         assert_eq!(out.attachments().len(), 2);
         assert_eq!(
             out.inlined(),
@@ -1552,7 +1631,7 @@ mod tests {
             std::fs::write(shots.join(format!("s{n}.png")), png_bytes(16)).unwrap();
         }
 
-        let out = expand_mentions_tracked("look at @shots/", root);
+        let out = expand_mentions_tracked("look at @shots/", root, true);
         assert!(
             out.attachments().is_empty(),
             "a listed directory sends no images"
@@ -1578,7 +1657,7 @@ mod tests {
         let raw = MAX_ATTACH_BYTES * 2;
         std::fs::write(root.join("big.png"), png_bytes(raw)).unwrap();
 
-        let out = expand_mentions_tracked("what is @big.png", root);
+        let out = expand_mentions_tracked("what is @big.png", root, true);
         assert_eq!(out.attachments().len(), 1, "an image is not text");
         assert_eq!(
             out.attachments()[0].encoded_len(),
@@ -1596,7 +1675,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("shot.png"), png_bytes(16)).unwrap();
 
-        let text = expand_mentions_tracked("what is @shot.png", root).into_text();
+        let text = expand_mentions_tracked("what is @shot.png", root, true).into_text();
         assert_eq!(text, "what is @shot.png");
         assert!(!text.contains("Attached files"), "{text}");
     }
@@ -1643,7 +1722,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("shot.png"), png_bytes(16)).unwrap();
 
-        let mut out = expand_mentions_tracked("compare @shot.png with this", root);
+        let mut out = expand_mentions_tracked("compare @shot.png with this", root, true);
         let pasted =
             hrdr_tools::Attachment::new(png_bytes(8), hrdr_tools::MediaType::Png, "pasted-1.png")
                 .unwrap();
@@ -1690,9 +1769,9 @@ mod tests {
         // — and is the only difference there is.
         let text = "what is this @shot.png";
 
-        let user = expand_mentions_tracked(text, root).into_steer(text);
+        let user = expand_mentions_tracked(text, root, true).into_steer(text);
 
-        let attached = hrdr_tools::read_attach_media("shot.png", root)
+        let attached = hrdr_tools::read_attach_media("shot.png", root, true)
             .unwrap()
             .expect("a png");
         let agent = hrdr_agent::Steer::plain(text).with_labelled_attachments(vec![attached]);
@@ -1715,7 +1794,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let text = "just a question";
 
-        let user = expand_mentions_tracked(text, dir.path()).into_steer(text);
+        let user = expand_mentions_tracked(text, dir.path(), true).into_steer(text);
         let agent = hrdr_agent::Steer::plain(text).with_labelled_attachments(Vec::new());
 
         assert_eq!(user, agent);
@@ -1728,7 +1807,7 @@ mod tests {
     #[test]
     fn attach_alone_labels_the_message_that_had_no_mentions() {
         let dir = tempfile::tempdir().unwrap();
-        let mut out = expand_mentions_tracked("what is this", dir.path());
+        let mut out = expand_mentions_tracked("what is this", dir.path(), true);
         assert!(out.attachments().is_empty());
         out.attach(vec![
             hrdr_tools::Attachment::new(png_bytes(8), hrdr_tools::MediaType::Png, "pasted-1.png")

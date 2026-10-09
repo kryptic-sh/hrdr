@@ -1028,11 +1028,16 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
 fn open_attach_file(
     path_str: &str,
     cwd: &std::path::Path,
+    unix_style_paths: bool,
 ) -> anyhow::Result<(std::fs::File, PathBuf)> {
     let resolved = resolve_under(cwd, path_str);
-    let file = std::fs::File::open(&resolved)
-        .map_err(|e| anyhow::anyhow!("can't open {}: {e}", resolved.display()))?;
-    let canon = validate_attach_path(path_str, cwd)?;
+    let file = std::fs::File::open(&resolved).map_err(|e| {
+        anyhow::anyhow!(
+            "can't open {}: {e}",
+            display_path(&resolved, unix_style_paths)
+        )
+    })?;
+    let canon = validate_attach_path(path_str, cwd, unix_style_paths)?;
 
     // Prove the opened handle is the same object canonicalization validated. If
     // any path component changed during validation, reject it. Compared through
@@ -1041,7 +1046,7 @@ fn open_attach_file(
     if file_identity(&file)? != path_identity(&canon)? {
         anyhow::bail!(
             "{} changed while it was being validated",
-            resolved.display()
+            display_path(&resolved, unix_style_paths)
         );
     }
     Ok((file, resolved))
@@ -1070,10 +1075,11 @@ const SNIFF_BYTES: usize = 12;
 pub fn read_attach_media(
     path_str: &str,
     cwd: &std::path::Path,
+    unix_style_paths: bool,
 ) -> anyhow::Result<Option<Attachment>> {
     use std::io::Read;
 
-    let (mut file, resolved) = open_attach_file(path_str, cwd)?;
+    let (mut file, resolved) = open_attach_file(path_str, cwd, unix_style_paths)?;
     let mut head = [0u8; SNIFF_BYTES];
     let mut filled = 0;
     // One `read` may return fewer bytes than asked for even mid-file; loop until
@@ -1083,7 +1089,12 @@ pub fn read_attach_media(
         match file.read(&mut head[filled..]) {
             Ok(0) => break,
             Ok(n) => filled += n,
-            Err(e) => return Err(anyhow::anyhow!("can't read {}: {e}", resolved.display())),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "can't read {}: {e}",
+                    display_path(&resolved, unix_style_paths)
+                ));
+            }
         }
     }
     let Some(media_type) = MediaType::sniff(&head[..filled]) else {
@@ -1091,15 +1102,24 @@ pub fn read_attach_media(
     };
 
     let mut bytes = head[..filled].to_vec();
-    file.read_to_end(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("can't read {}: {e}", resolved.display()))?;
+    file.read_to_end(&mut bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "can't read {}: {e}",
+            display_path(&resolved, unix_style_paths)
+        )
+    })?;
     let filename = resolved
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path_str.to_string());
     Attachment::new(bytes, media_type, filename)
         .map(Some)
-        .map_err(|e| anyhow::anyhow!("can't attach {}: {e}", resolved.display()))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "can't attach {}: {e}",
+                display_path(&resolved, unix_style_paths)
+            )
+        })
 }
 
 /// Open and read a file that is safe to attach to a model request.
@@ -1110,28 +1130,38 @@ pub fn read_attach_file(
     path_str: &str,
     cwd: &std::path::Path,
     max_bytes: Option<usize>,
+    unix_style_paths: bool,
 ) -> anyhow::Result<String> {
     use std::io::Read;
 
-    let (mut file, resolved) = open_attach_file(path_str, cwd)?;
+    let (mut file, resolved) = open_attach_file(path_str, cwd, unix_style_paths)?;
 
     if let Some(max) = max_bytes {
         let len = file
             .metadata()
-            .map_err(|e| anyhow::anyhow!("can't stat {}: {e}", resolved.display()))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "can't stat {}: {e}",
+                    display_path(&resolved, unix_style_paths)
+                )
+            })?
             .len() as usize;
         if len > max {
             anyhow::bail!(
                 "{} is {} bytes, over the {max} byte limit for attachments",
-                resolved.display(),
+                display_path(&resolved, unix_style_paths),
                 len
             );
         }
     }
 
     let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|e| anyhow::anyhow!("can't read {}: {e}", resolved.display()))?;
+    file.read_to_string(&mut text).map_err(|e| {
+        anyhow::anyhow!(
+            "can't read {}: {e}",
+            display_path(&resolved, unix_style_paths)
+        )
+    })?;
     Ok(text)
 }
 
@@ -1143,7 +1173,7 @@ pub fn read_attach_file(
 pub const ATTACH_DIR_MAX_ENTRIES: usize = 200;
 
 /// List a directory that is safe to attach to a model request: one level, names
-/// only, `/`-suffixed for subdirectories and `@` for symlinks — the same shape
+/// only, separator-suffixed for subdirectories and `@` for symlinks — the same shape
 /// the `ls` tool returns, so the model reads one format either way.
 ///
 /// Used for an `@dir` mention, where inlining content makes no sense but the
@@ -1153,23 +1183,38 @@ pub const ATTACH_DIR_MAX_ENTRIES: usize = 200;
 ///
 /// Entries past [`ATTACH_DIR_MAX_ENTRIES`] are dropped and counted in a trailing
 /// line, so a truncated listing always says so.
-pub fn read_attach_dir(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+pub fn read_attach_dir(
+    path_str: &str,
+    cwd: &std::path::Path,
+    unix_style_paths: bool,
+) -> anyhow::Result<String> {
     let resolved = resolve_under(cwd, path_str);
     if !resolved.is_dir() {
-        anyhow::bail!("not a directory: {}", resolved.display());
+        anyhow::bail!(
+            "not a directory: {}",
+            display_path(&resolved, unix_style_paths)
+        );
     }
-    let canon = resolved
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("can't resolve {}: {e}", resolved.display()))?;
+    let canon = resolved.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "can't resolve {}: {e}",
+            display_path(&resolved, unix_style_paths)
+        )
+    })?;
     if let Some(reason) = secret_file_reason(&canon) {
         anyhow::bail!(
             "refusing to list {}: {reason} — secret/credential paths are off-limits",
-            resolved.display(),
+            display_path(&resolved, unix_style_paths),
         );
     }
     let mut entries: Vec<String> = Vec::new();
     for e in std::fs::read_dir(&canon)
-        .map_err(|e| anyhow::anyhow!("can't list {}: {e}", resolved.display()))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "can't list {}: {e}",
+                display_path(&resolved, unix_style_paths)
+            )
+        })?
         .flatten()
     {
         let name = e.file_name().to_string_lossy().to_string();
@@ -1186,6 +1231,9 @@ pub fn read_attach_dir(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<
     entries.sort();
     let total = entries.len();
     entries.truncate(ATTACH_DIR_MAX_ENTRIES);
+    for entry in &mut entries {
+        *entry = display_path(std::path::Path::new(entry), unix_style_paths);
+    }
     let mut out = entries.join("\n");
     if total > ATTACH_DIR_MAX_ENTRIES {
         out.push_str(&format!(
@@ -1205,21 +1253,31 @@ pub fn read_attach_dir(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<
 /// * Must not be a secret/credential file (see [`secret_file_reason`])
 ///
 /// Returns the canonicalized [`PathBuf`] on success.
-pub fn validate_attach_path(path_str: &str, cwd: &std::path::Path) -> anyhow::Result<PathBuf> {
+pub fn validate_attach_path(
+    path_str: &str,
+    cwd: &std::path::Path,
+    unix_style_paths: bool,
+) -> anyhow::Result<PathBuf> {
     let resolved = resolve_under(cwd, path_str);
     // Reject non-regular files (directories, sockets, etc.).
     if !resolved.is_file() {
-        anyhow::bail!("not a regular file: {}", resolved.display());
+        anyhow::bail!(
+            "not a regular file: {}",
+            display_path(&resolved, unix_style_paths)
+        );
     }
     // Canonicalize — resolves symlinks and `..` components.
-    let canon = resolved
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("can't resolve {}: {e}", resolved.display()))?;
+    let canon = resolved.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "can't resolve {}: {e}",
+            display_path(&resolved, unix_style_paths)
+        )
+    })?;
     // Reject secret/credential files.
     if let Some(reason) = secret_file_reason(&canon) {
         anyhow::bail!(
             "refusing to attach {}: {reason} — secret/credential files are off-limits",
-            resolved.display(),
+            display_path(&resolved, unix_style_paths),
         );
     }
     Ok(canon)
@@ -3919,9 +3977,9 @@ b:2:y"
         std::fs::write(&outside, "data").unwrap();
 
         // Relative `..` escape.
-        assert!(validate_attach_path("../outside.txt", &cwd).is_ok());
+        assert!(validate_attach_path("../outside.txt", &cwd, true).is_ok());
         // Absolute path outside cwd.
-        assert!(validate_attach_path(&outside.to_string_lossy(), &cwd).is_ok());
+        assert!(validate_attach_path(&outside.to_string_lossy(), &cwd, true).is_ok());
     }
 
     #[test]
@@ -3931,7 +3989,7 @@ b:2:y"
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::write(cwd.join(".env"), "SECRET=1").unwrap();
 
-        let err = validate_attach_path(".env", &cwd).unwrap_err();
+        let err = validate_attach_path(".env", &cwd, true).unwrap_err();
         assert!(
             err.to_string().contains("secret"),
             "expected secret-file error, got: {err}"
@@ -3946,7 +4004,7 @@ b:2:y"
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("notes.txt"), "hello").unwrap();
 
-        let canon = validate_attach_path("sub/notes.txt", &cwd).unwrap();
+        let canon = validate_attach_path("sub/notes.txt", &cwd, true).unwrap();
         assert!(canon.exists());
         assert_eq!(std::fs::read_to_string(&canon).unwrap(), "hello");
     }
@@ -3957,7 +4015,7 @@ b:2:y"
         let cwd = dir.path().join("project");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let err = validate_attach_path("nope.txt", &cwd).unwrap_err();
+        let err = validate_attach_path("nope.txt", &cwd, true).unwrap_err();
         assert!(
             err.to_string().contains("not a regular file"),
             "expected not-a-file error, got: {err}"
@@ -3971,11 +4029,188 @@ b:2:y"
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir(cwd.join("subdir")).unwrap();
 
-        let err = validate_attach_path("subdir", &cwd).unwrap_err();
+        let err = validate_attach_path("subdir", &cwd, true).unwrap_err();
         assert!(
             err.to_string().contains("not a regular file"),
             "expected not-a-file error, got: {err}"
         );
+    }
+
+    #[test]
+    fn attachment_presentation_preserves_targets_and_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("nested/child")).unwrap();
+        let body = r"body\with/mixed separators";
+        std::fs::write(root.join("nested/note.txt"), body).unwrap();
+        std::fs::write(root.join("nested/bad.txt"), [0xff]).unwrap();
+        std::fs::write(root.join("nested/.env"), "FAKE=fixture").unwrap();
+        let bytes = png_bytes(16);
+        std::fs::write(root.join("nested/shot.png"), &bytes).unwrap();
+        for style in [false, true] {
+            let label = |rel: &str| {
+                let raw = resolve_under(root, rel).display().to_string();
+                if cfg!(windows) {
+                    if style {
+                        raw.replace('\\', "/")
+                    } else {
+                        raw.replace('/', "\\")
+                    }
+                } else {
+                    raw
+                }
+            };
+            let missing = "nested/missing.txt";
+            let os_error = std::fs::File::open(root.join(missing)).unwrap_err();
+            let expected = format!("can't open {}: {os_error}", label(missing));
+            assert_eq!(
+                read_attach_file(missing, root, None, style)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+            assert_eq!(
+                read_attach_media(missing, root, style)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+            for rel in [missing, "nested/child"] {
+                assert_eq!(
+                    validate_attach_path(rel, root, style)
+                        .unwrap_err()
+                        .to_string(),
+                    format!("not a regular file: {}", label(rel))
+                );
+            }
+            assert_eq!(
+                read_attach_dir("nested/note.txt", root, style)
+                    .unwrap_err()
+                    .to_string(),
+                format!("not a directory: {}", label("nested/note.txt"))
+            );
+            for err in [
+                validate_attach_path("nested/.env", root, style).unwrap_err(),
+                read_attach_file("nested/.env", root, None, style).unwrap_err(),
+                read_attach_media("nested/.env", root, style).unwrap_err(),
+            ] {
+                assert!(
+                    err.to_string()
+                        .starts_with(&format!("refusing to attach {}:", label("nested/.env"))),
+                    "{err}"
+                );
+                assert!(
+                    err.to_string()
+                        .ends_with("secret/credential files are off-limits"),
+                    "{err}"
+                );
+            }
+            assert_eq!(
+                read_attach_file("nested/note.txt", root, Some(1), style)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "{} is {} bytes, over the 1 byte limit for attachments",
+                    label("nested/note.txt"),
+                    body.len()
+                )
+            );
+            let utf8_error = std::fs::read_to_string(root.join("nested/bad.txt")).unwrap_err();
+            assert_eq!(
+                read_attach_file("nested/bad.txt", root, None, style)
+                    .unwrap_err()
+                    .to_string(),
+                format!("can't read {}: {utf8_error}", label("nested/bad.txt"))
+            );
+            assert_eq!(
+                validate_attach_path("nested/note.txt", root, style).unwrap(),
+                root.join("nested/note.txt").canonicalize().unwrap()
+            );
+            let (file, target) = open_attach_file("nested/note.txt", root, style).unwrap();
+            assert_eq!(target, resolve_under(root, "nested/note.txt"));
+            assert_eq!(
+                file_identity(&file).unwrap(),
+                path_identity(&target).unwrap()
+            );
+            assert_eq!(
+                read_attach_file("nested/note.txt", root, None, style).unwrap(),
+                body
+            );
+            assert_eq!(
+                read_attach_media("nested/shot.png", root, style)
+                    .unwrap()
+                    .unwrap(),
+                Attachment::new(bytes.clone(), MediaType::Png, "shot.png").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_presentation_directory_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("nested/child")).unwrap();
+        std::fs::write(root.join("nested/note.txt"), "body").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::write(root.join(r"nested/literal\name"), "body").unwrap();
+            std::os::unix::fs::symlink("note.txt", root.join("nested/link")).unwrap();
+        }
+        for style in [false, true] {
+            let mut expected = [
+                if cfg!(windows) && !style {
+                    "child\\"
+                } else {
+                    "child/"
+                },
+                "note.txt",
+                #[cfg(unix)]
+                "link@",
+                #[cfg(unix)]
+                r"literal\name",
+            ];
+            expected.sort();
+            assert_eq!(
+                read_attach_dir("nested", root, style).unwrap(),
+                expected.join("\n")
+            );
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    read_attach_file(r"nested/literal\name", root, None, style).unwrap(),
+                    "body"
+                );
+                assert_eq!(
+                    validate_attach_path(r"nested/literal\name", root, style).unwrap(),
+                    root.join(r"nested/literal\name").canonicalize().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_presentation_directory_order_and_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("foo0"), "body").unwrap();
+        let mut earlier = Vec::new();
+        for i in 0..ATTACH_DIR_MAX_ENTRIES - 1 {
+            let name = format!("a{i:04}");
+            std::fs::write(root.join(&name), "body").unwrap();
+            earlier.push(name);
+        }
+        for style in [true, false] {
+            let suffix = if cfg!(windows) && !style { "\\" } else { "/" };
+            assert_eq!(
+                read_attach_dir(".", root, style).unwrap(),
+                format!(
+                    "{}\nfoo{suffix}\n…[1 more of {} entries not shown]",
+                    earlier.join("\n"),
+                    ATTACH_DIR_MAX_ENTRIES + 1
+                )
+            );
+        }
     }
 
     // ---- read_attach_media ----
@@ -3997,10 +4232,12 @@ b:2:y"
         std::fs::write(cwd.join("shot.png"), png_bytes(64)).unwrap();
         std::fs::write(cwd.join("report.pdf"), b"%PDF-1.7\nbody\n%%EOF\n").unwrap();
 
-        let img = read_attach_media("shot.png", cwd).unwrap().expect("a png");
+        let img = read_attach_media("shot.png", cwd, true)
+            .unwrap()
+            .expect("a png");
         assert_eq!(img.media_type(), MediaType::Png);
         assert_eq!(img.filename(), "shot.png");
-        let doc = read_attach_media("report.pdf", cwd)
+        let doc = read_attach_media("report.pdf", cwd, true)
             .unwrap()
             .expect("a pdf");
         assert_eq!(doc.media_type(), MediaType::Pdf);
@@ -4018,11 +4255,11 @@ b:2:y"
         std::fs::write(cwd.join("screenshot"), png_bytes(16)).unwrap();
 
         assert!(
-            read_attach_media("liar.png", cwd).unwrap().is_none(),
+            read_attach_media("liar.png", cwd, true).unwrap().is_none(),
             "a .png holding text is not an image"
         );
         assert_eq!(
-            read_attach_media("screenshot", cwd)
+            read_attach_media("screenshot", cwd, true)
                 .unwrap()
                 .expect("bytes are a png")
                 .media_type(),
@@ -4044,7 +4281,7 @@ b:2:y"
 
         for name in ["notes.md", "tiny.bin", "clip.wav", "empty.png"] {
             assert!(
-                read_attach_media(name, cwd).unwrap().is_none(),
+                read_attach_media(name, cwd, true).unwrap().is_none(),
                 "{name} is not something hrdr can attach"
             );
         }
@@ -4057,11 +4294,11 @@ b:2:y"
     fn read_attach_media_refuses_what_the_text_path_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        assert!(read_attach_media("nope.png", cwd).is_err());
+        assert!(read_attach_media("nope.png", cwd, true).is_err());
 
         // A secret file whose bytes *are* a PNG is still off-limits.
         std::fs::write(cwd.join(".env"), png_bytes(8)).unwrap();
-        let err = read_attach_media(".env", cwd).unwrap_err();
+        let err = read_attach_media(".env", cwd, true).unwrap_err();
         assert!(
             err.to_string().contains("secret"),
             "expected the secret-file refusal, got: {err}"
@@ -4078,7 +4315,9 @@ b:2:y"
         let big = 300 * 1024;
         std::fs::write(cwd.join("big.png"), png_bytes(big)).unwrap();
 
-        let a = read_attach_media("big.png", cwd).unwrap().expect("a png");
+        let a = read_attach_media("big.png", cwd, true)
+            .unwrap()
+            .expect("a png");
         // 4 encoded bytes per 3 raw: the whole file arrived, not a prefix.
         assert_eq!(a.encoded_len(), (big + 8).div_ceil(3) * 4);
     }

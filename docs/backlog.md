@@ -2494,16 +2494,23 @@ and **not** fixed.
   roots, skipped-AGENTS notices, and memory headings/pointers also use it and
   refresh on style changes with memory enabled or disabled. Memory-tool fallback
   listing roots and malformed-memory error paths also use it, as do profile
-  discovery/collision notices and delegation cwd refusals. Remaining work
-  includes startup/trust prompts, attachments/completion labels, and lower-level
-  storage/configuration errors. Live reload updates subsequent main-agent tool
-  calls and newly spawned children; existing children retain their own setting.
-  Cwd/picker caches restyle on reload. Keep this display-only: do not change
-  filesystem targets or literal Unix backslashes. Preserve unified-diff prefix
-  semantics. Never rewrite file bodies, user prose, or captured shell output.
-  Cover both settings and unchanged Unix behavior at each real rendering seam,
-  including config-to-agent wiring. Complete these presentation surfaces before
-  moving to the newly prioritized self-update tool.
+  discovery/collision notices and delegation cwd refusals. Attachment
+  diagnostics, clipboard file-URI refusals, generated `@file` headers, and
+  attached directory labels also use it. Remaining work includes startup/trust
+  prompts, completion labels, and lower-level storage/configuration errors. Live
+  reload updates subsequent main-agent tool calls and newly spawned children;
+  existing children retain their own setting. Cwd/picker caches restyle on
+  reload. Keep this display-only: do not change filesystem targets or literal
+  Unix backslashes. Preserve unified-diff prefix semantics. Never rewrite file
+  bodies, user prose, or captured shell output. Cover both settings and
+  unchanged Unix behavior at each real rendering seam, including config-to-agent
+  wiring. Complete these presentation surfaces before moving to the newly
+  prioritized self-update tool.
+- **Unix completion filename identity:** `walk_files_gitignore` and
+  `walk_files_fallback` in `hrdr-app/src/util.rs` unconditionally replace
+  literal backslashes with `/` in matching/insertion candidates. This predates
+  the display-style work. Fix separately with Unix filename regression coverage;
+  do not silently change the index while styling completion popup labels.
 - **Cursor flickers during Windows rendering — reported 2026-10-09.** The user
   reproduced the same issue in both Alacritty and Windows 11 Terminal,
   correcting the earlier observation that Windows 11 Terminal was unaffected.

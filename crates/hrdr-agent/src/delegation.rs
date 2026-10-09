@@ -345,14 +345,15 @@ fn attachments_arg_against(
         // The sandbox first: this must not reach a file the `read` tool would
         // refuse this agent.
         ctx.resolve_read(path)?;
-        match hrdr_tools::read_attach_media(path, &ctx.cwd) {
+        let label = hrdr_tools::display_path(std::path::Path::new(path), ctx.unix_style_paths);
+        match hrdr_tools::read_attach_media(path, &ctx.cwd, ctx.unix_style_paths) {
             Ok(Some(attachment)) => out.push(attachment),
             Ok(None) => bail!(
-                "can't attach {path}: its leading bytes are not PNG, JPEG, GIF, WebP or PDF (the \
+                "can't attach {label}: its leading bytes are not PNG, JPEG, GIF, WebP or PDF (the \
                  extension is never consulted). Only those five can be attached — put anything \
                  else in `prompt`, or name the path there and let the sub-agent `read` it."
             ),
-            Err(e) => bail!("can't attach {path}: {e:#}"),
+            Err(e) => bail!("can't attach {label}: {e:#}"),
         }
     }
     if !out.is_empty() {
@@ -3222,6 +3223,62 @@ mod attachment_tests {
         assert!(!err.contains("gone.png"), "not a file error: {err}");
     }
 
+    #[test]
+    fn attachment_presentation_delegation_outer_and_inner_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/note.txt"), r"body\with/slashes").unwrap();
+        for style in [false, true] {
+            let mut ctx = hrdr_tools::ToolContext::new(dir.path());
+            ctx.unix_style_paths = style;
+            let missing = "nested/missing.png";
+            let label = if cfg!(windows) && !style {
+                r"nested\missing.png"
+            } else {
+                missing
+            };
+            let raw = dir.path().join(missing).display().to_string();
+            let resolved = if cfg!(windows) {
+                if style {
+                    raw.replace('\\', "/")
+                } else {
+                    raw.replace('/', "\\")
+                }
+            } else {
+                raw
+            };
+            let os_error = std::fs::File::open(dir.path().join(missing)).unwrap_err();
+            let args = serde_json::json!({"attachments": [missing]});
+            let err = attachments_arg_against(&args, &ctx, "model", None, None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("can't attach {label}: can't open {resolved}: {os_error}")
+            );
+            assert_eq!(args["attachments"][0], missing);
+            let label = if cfg!(windows) && !style {
+                r"nested\note.txt"
+            } else {
+                "nested/note.txt"
+            };
+            let err = attachments_arg_against(
+                &serde_json::json!({"attachments": ["nested/note.txt"]}),
+                &ctx,
+                "model",
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "can't attach {label}: its leading bytes are not PNG, JPEG, GIF, WebP or PDF (the \
+                 extension is never consulted). Only those five can be attached — put anything \
+                 else in `prompt`, or name the path there and let the sub-agent `read` it."
+                )
+            );
+        }
+    }
+
     /// **Parity with the user's own path.** A file the model attaches through
     /// `task` and the same file the user attaches by typing `@shot.png` are one
     /// `Attachment`, because both go through `hrdr_tools::read_attach_media` —
@@ -3241,7 +3298,7 @@ mod attachment_tests {
         let ctx = hrdr_tools::ToolContext::new(dir.path());
 
         // What an `@shot.png` mention produces.
-        let theirs = hrdr_tools::read_attach_media("shot.png", dir.path())
+        let theirs = hrdr_tools::read_attach_media("shot.png", dir.path(), ctx.unix_style_paths)
             .unwrap()
             .expect("a png");
         // What `attachments: ["shot.png"]` produces.

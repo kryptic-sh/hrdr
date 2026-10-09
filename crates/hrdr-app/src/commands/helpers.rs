@@ -277,6 +277,7 @@ pub fn clipboard_paste(
     cb: &Option<hjkl_clipboard::Clipboard>,
     cwd: &Path,
     paste_stem: &str,
+    unix_style_paths: bool,
 ) -> ClipboardPaste {
     use hjkl_clipboard::{Capabilities, MimeType, Selection};
 
@@ -294,7 +295,7 @@ pub fn clipboard_paste(
         return found;
     }
     if caps.contains(Capabilities::URI_LIST)
-        && let Some(found) = clipboard_file_uri(cb, &offered, cwd)
+        && let Some(found) = clipboard_file_uri(cb, &offered, cwd, unix_style_paths)
     {
         return found;
     }
@@ -370,6 +371,7 @@ fn clipboard_file_uri(
     cb: &hjkl_clipboard::Clipboard,
     offered: &[hjkl_clipboard::MimeType],
     cwd: &Path,
+    unix_style_paths: bool,
 ) -> Option<ClipboardPaste> {
     use hjkl_clipboard::{MimeType, Selection, Uri};
 
@@ -382,7 +384,7 @@ fn clipboard_file_uri(
         let Uri::File(path) = uri else {
             continue; // an https:// URI is a link, and pastes as its text
         };
-        match hrdr_tools::read_attach_media(&path.to_string_lossy(), cwd) {
+        match hrdr_tools::read_attach_media(&path.to_string_lossy(), cwd, unix_style_paths) {
             Ok(Some(a)) => return Some(ClipboardPaste::Media(a)),
             // Not an image or PDF: the text path has the path itself to offer.
             Ok(None) => {}
@@ -618,7 +620,7 @@ mod clipboard_paste_tests {
         );
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
-        match clipboard_paste(&cb, dir.path(), "pasted-1") {
+        match clipboard_paste(&cb, dir.path(), "pasted-1", true) {
             ClipboardPaste::Media(a) => {
                 assert_eq!(a.filename(), "pasted-1.png");
                 assert_eq!(a.media_type(), hrdr_tools::MediaType::Png);
@@ -642,7 +644,7 @@ mod clipboard_paste_tests {
         );
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
-        match clipboard_paste(&cb, dir.path(), "pasted-3") {
+        match clipboard_paste(&cb, dir.path(), "pasted-3", true) {
             ClipboardPaste::Media(a) => assert_eq!(a.filename(), "pasted-3.jpg"),
             other => panic!("expected a jpeg, got {other:?}"),
         }
@@ -663,7 +665,7 @@ mod clipboard_paste_tests {
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
         assert_eq!(
-            clipboard_paste(&cb, dir.path(), "pasted-1"),
+            clipboard_paste(&cb, dir.path(), "pasted-1", true),
             ClipboardPaste::Text("just some words".to_string())
         );
     }
@@ -691,7 +693,7 @@ mod clipboard_paste_tests {
         m.preset_get(Selection::Clipboard, MimeType::UriList, Ok(uri_bytes));
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
-        match clipboard_paste(&cb, dir.path(), "pasted-1") {
+        match clipboard_paste(&cb, dir.path(), "pasted-1", true) {
             // Named for the file it came from, not for the paste serial.
             ClipboardPaste::Media(a) => assert_eq!(a.filename(), "shot.png"),
             other => panic!("expected the copied file, got {other:?}"),
@@ -728,9 +730,76 @@ mod clipboard_paste_tests {
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
         assert_eq!(
-            clipboard_paste(&cb, dir.path(), "pasted-1"),
+            clipboard_paste(&cb, dir.path(), "pasted-1", true),
             ClipboardPaste::Text("/tmp/note.txt".to_string())
         );
+    }
+
+    #[test]
+    fn attachment_presentation_clipboard_uri_preserves_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/missing.png");
+        let writer = mock(Capabilities::all());
+        let handle = writer.handle();
+        let scribe = Clipboard::with_backend(Box::new(writer));
+        scribe
+            .set_uri_list(Selection::Clipboard, &[Uri::File(path.clone())])
+            .unwrap();
+        let uri_bytes = handle.set_calls()[0].bytes.clone();
+        let text = r"text\with/slashes file:///nested/missing.png";
+        for style in [false, true] {
+            let m = mock(Capabilities::all());
+            let handle = m.handle();
+            m.preset_available(
+                Selection::Clipboard,
+                Ok(vec![MimeType::UriList, MimeType::Text]),
+            );
+            m.preset_get(
+                Selection::Clipboard,
+                MimeType::UriList,
+                Ok(uri_bytes.clone()),
+            );
+            m.preset_get(
+                Selection::Clipboard,
+                MimeType::Text,
+                Ok(text.as_bytes().to_vec()),
+            );
+            let cb = Some(Clipboard::with_backend(Box::new(m)));
+            let raw = path.display().to_string();
+            let label = if cfg!(windows) {
+                if style {
+                    raw.replace('\\', "/")
+                } else {
+                    raw.replace('/', "\\")
+                }
+            } else {
+                raw
+            };
+            let os_error = std::fs::File::open(&path).unwrap_err();
+            assert_eq!(
+                clipboard_paste(&cb, dir.path(), "pasted-1", style),
+                ClipboardPaste::Refused(format!("can't open {label}: {os_error}"))
+            );
+            let clipboard = cb.as_ref().unwrap();
+            assert_eq!(
+                clipboard
+                    .get(Selection::Clipboard, MimeType::UriList)
+                    .unwrap(),
+                uri_bytes
+            );
+            assert_eq!(
+                clipboard.get(Selection::Clipboard, MimeType::Text).unwrap(),
+                text.as_bytes()
+            );
+            assert!(handle.set_calls().is_empty());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "not an image").unwrap();
+            assert_eq!(
+                clipboard_paste(&cb, dir.path(), "pasted-1", style),
+                ClipboardPaste::Text(text.to_string())
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     /// An image type hrdr cannot attach (a BMP, say) is refused by name rather
@@ -748,7 +817,7 @@ mod clipboard_paste_tests {
         );
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
-        match clipboard_paste(&cb, dir.path(), "pasted-1") {
+        match clipboard_paste(&cb, dir.path(), "pasted-1", true) {
             ClipboardPaste::Refused(why) => assert!(why.contains("PNG, JPEG"), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -764,7 +833,7 @@ mod clipboard_paste_tests {
         m.preset_get(Selection::Clipboard, MimeType::Text, Ok(Vec::new()));
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
-        match clipboard_paste(&cb, dir.path(), "pasted-1") {
+        match clipboard_paste(&cb, dir.path(), "pasted-1", true) {
             ClipboardPaste::Refused(why) => assert!(why.contains("can't read images"), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -779,7 +848,7 @@ mod clipboard_paste_tests {
         let cb = Some(Clipboard::with_backend(Box::new(m)));
 
         assert_eq!(
-            clipboard_paste(&cb, dir.path(), "pasted-1"),
+            clipboard_paste(&cb, dir.path(), "pasted-1", true),
             ClipboardPaste::Empty
         );
     }
@@ -789,7 +858,7 @@ mod clipboard_paste_tests {
     fn no_backend_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            clipboard_paste(&None, dir.path(), "pasted-1"),
+            clipboard_paste(&None, dir.path(), "pasted-1", true),
             ClipboardPaste::Unavailable
         );
     }

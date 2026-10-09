@@ -1225,7 +1225,7 @@ mod tests {
         );
 
         // And that mention is what produces the attachment on the way out.
-        let out = crate::expand_mentions_tracked(&host.input, &root);
+        let out = crate::expand_mentions_tracked(&host.input, &root, true);
         assert_eq!(out.attachments().len(), 1, "over the text cap, still sent");
         assert_eq!(
             out.attachments()[0].media_type(),
