@@ -51,13 +51,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without adding presentation state to persisted session data. Session read,
   resume, fork, and listing diagnostics also honor the setting; open pickers
   refresh corrupt-file diagnostics on reload and recover repaired metadata while
-  preserving their filter and selected file. Access checks, LSP protocol paths,
-  and diagnostic message text remain unchanged. Stale-read errors preserve the
-  original culprit command. Headline caches refresh on configuration reload,
-  which also updates subsequent main-agent tool calls and newly spawned
-  children; existing children retain their own setting. Unix rendering, stored
-  tool arguments/results, file contents, and filesystem targets are unchanged.
-  Other path presentation surfaces remain pending.
+  preserving their filter and selected file. Config mutation failures also style
+  creation/read/write, malformed-file backup, and lock-error labels using the
+  active frontend preference, without changing config values or lock behavior.
+  Access checks, LSP protocol paths, and diagnostic message text remain
+  unchanged. Stale-read errors preserve the original culprit command. Headline
+  caches refresh on configuration reload, which also updates subsequent
+  main-agent tool calls and newly spawned children; existing children retain
+  their own setting. Unix rendering, stored tool arguments/results, file
+  contents, and filesystem targets are unchanged. Other path presentation
+  surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

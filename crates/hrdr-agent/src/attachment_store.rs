@@ -199,6 +199,7 @@ pub(crate) fn lock_blob_store(session_dir: &Path) -> Result<crate::store_lock::S
     crate::store_lock::StoreLock::acquire(
         &blob_dir_in(session_dir),
         crate::store_lock::StoreKind::BlobStore,
+        false,
     )
 }
 

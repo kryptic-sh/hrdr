@@ -2885,7 +2885,7 @@ impl App {
     /// Persist a single setting to the user config file, suppressing the
     /// resulting hot-reload (we already applied it in memory).
     fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
-        match hrdr_agent::persist_setting(key, value) {
+        match hrdr_agent::persist_setting(key, value, self.cfg.unix_style_paths) {
             Ok(_) => self.config_mtime = current_config_mtime(),
             Err(e) => self.system(format!("couldn't save '{key}' to config: {e}")),
         }
@@ -2893,7 +2893,7 @@ impl App {
 
     /// Remove a setting from the user config file (e.g. resetting the theme).
     fn unpersist_setting(&mut self, key: &str) {
-        match hrdr_agent::remove_setting(key) {
+        match hrdr_agent::remove_setting(key, self.cfg.unix_style_paths) {
             Ok(_) => self.config_mtime = current_config_mtime(),
             Err(e) => self.system(format!("couldn't update config: {e}")),
         }

@@ -562,7 +562,10 @@ fn browser_login_provider(name: &str) -> Option<&'static str> {
 /// A sanitized completion line for a finished browser login, and (on success)
 /// persist the provider as the default. Shared by the non-TUI wizard path; the
 /// TUI additionally performs a live switch + model refresh.
-pub fn browser_login_completion_line(outcome: &BrowserLoginOutcome) -> String {
+pub fn browser_login_completion_line(
+    outcome: &BrowserLoginOutcome,
+    unix_style_paths: bool,
+) -> String {
     if outcome.token_saved {
         // Seed a usable default model, so the next start (this path does no live
         // switch) lands on a talkable model rather than stalling.
@@ -578,6 +581,7 @@ pub fn browser_login_completion_line(outcome: &BrowserLoginOutcome) -> String {
                     "openai://{}",
                     hrdr_agent::CHATGPT_DEFAULT_MODEL
                 )),
+                unix_style_paths,
             );
         }
         match outcome.provider.as_str() {
@@ -635,9 +639,10 @@ fn start_oauth_login(name: &str, host: &mut dyn CommandHost) -> bool {
             return true;
         }
     };
+    let unix_style_paths = host.unix_style_paths();
     host.spawn_line(Box::pin(async move {
         let outcome = start.future.await;
-        browser_login_completion_line(&outcome)
+        browser_login_completion_line(&outcome, unix_style_paths)
     }));
     true
 }
@@ -779,12 +784,15 @@ mod tests {
     #[test]
     fn browser_login_completion_reports_failure_for_both_providers() {
         for provider in ["chatgpt", "openrouter"] {
-            let line = browser_login_completion_line(&BrowserLoginOutcome {
-                login_id: 0,
-                provider: provider.to_string(),
-                token_saved: false,
-                error: Some("authorization was rejected".to_string()),
-            });
+            let line = browser_login_completion_line(
+                &BrowserLoginOutcome {
+                    login_id: 0,
+                    provider: provider.to_string(),
+                    token_saved: false,
+                    error: Some("authorization was rejected".to_string()),
+                },
+                false,
+            );
             assert!(line.contains(&format!("{provider} login failed")));
             assert!(line.contains("authorization was rejected"));
         }

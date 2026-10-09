@@ -2105,10 +2105,14 @@ pub(crate) fn is_openrouter(base_url: &str) -> bool {
 ///
 /// Errors (and changes nothing on disk) when the existing file is not valid
 /// TOML — see [`persist_setting_at`].
-pub fn persist_setting(key: &str, value: ConfigValue) -> Result<std::path::PathBuf> {
+pub fn persist_setting(
+    key: &str,
+    value: ConfigValue,
+    unix_style_paths: bool,
+) -> Result<std::path::PathBuf> {
     let path =
         config_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
-    persist_setting_at(&path, key, value)?;
+    persist_setting_at(&path, key, value, unix_style_paths)?;
     Ok(path)
 }
 
@@ -2116,10 +2120,10 @@ pub fn persist_setting(key: &str, value: ConfigValue) -> Result<std::path::PathB
 ///
 /// Errors (and changes nothing on disk) when the existing file is not valid
 /// TOML — see [`remove_setting_at`].
-pub fn remove_setting(key: &str) -> Result<std::path::PathBuf> {
+pub fn remove_setting(key: &str, unix_style_paths: bool) -> Result<std::path::PathBuf> {
     let path =
         config_file_path().ok_or_else(|| anyhow::anyhow!("no HOME to locate the config file"))?;
-    remove_setting_at(&path, key)?;
+    remove_setting_at(&path, key, unix_style_paths)?;
     Ok(path)
 }
 
@@ -2135,35 +2139,51 @@ pub(crate) fn persist_setting_at(
     path: &std::path::Path,
     key: &str,
     value: ConfigValue,
+    unix_style_paths: bool,
 ) -> Result<()> {
-    let _lock = lock_config(path)?;
-    let mut doc = read_config_doc(path)?;
+    let _lock = lock_config(path, unix_style_paths)?;
+    let mut doc = read_config_doc(path, unix_style_paths)?;
     match value {
         ConfigValue::Str(s) => doc[key] = toml_edit::value(s),
         ConfigValue::Bool(b) => doc[key] = toml_edit::value(b),
         ConfigValue::Float(f) => doc[key] = toml_edit::value(f),
         ConfigValue::Int(i) => doc[key] = toml_edit::value(i),
     }
-    write_config_doc(path, &doc)
+    write_config_doc(path, &doc, unix_style_paths)
 }
 
 /// [`remove_setting`] against an explicit path, under the same lock and with the
 /// same malformed-file refusal as [`persist_setting_at`].
-pub(crate) fn remove_setting_at(path: &std::path::Path, key: &str) -> Result<()> {
-    let _lock = lock_config(path)?;
-    let mut doc = read_config_doc(path)?;
+pub(crate) fn remove_setting_at(
+    path: &std::path::Path,
+    key: &str,
+    unix_style_paths: bool,
+) -> Result<()> {
+    let _lock = lock_config(path, unix_style_paths)?;
+    let mut doc = read_config_doc(path, unix_style_paths)?;
     doc.remove(key);
-    write_config_doc(path, &doc)
+    write_config_doc(path, &doc, unix_style_paths)
 }
 
 /// Take the cross-process write lock for the config file, creating its parent
 /// directory first (the lock is a sibling file, so the directory must exist).
-fn lock_config(path: &std::path::Path) -> Result<crate::store_lock::StoreLock> {
+fn lock_config(
+    path: &std::path::Path,
+    unix_style_paths: bool,
+) -> Result<crate::store_lock::StoreLock> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating {}",
+                hrdr_tools::display_path(parent, unix_style_paths)
+            )
+        })?;
     }
-    crate::store_lock::StoreLock::acquire(path, crate::store_lock::StoreKind::SmallFileRewrite)
+    crate::store_lock::StoreLock::acquire(
+        path,
+        crate::store_lock::StoreKind::SmallFileRewrite,
+        unix_style_paths,
+    )
 }
 
 /// Parse the config file into an editable document, preserving comments and
@@ -2176,14 +2196,22 @@ fn lock_config(path: &std::path::Path) -> Result<crate::store_lock::StoreLock> {
 /// let the next write erase it. The malformed file is copied to a `.bak` sibling
 /// as a safety net, but the original is left exactly as it was and the caller is
 /// told to fix it.
-pub(crate) fn read_config_doc(path: &std::path::Path) -> Result<toml_edit::DocumentMut> {
+pub(crate) fn read_config_doc(
+    path: &std::path::Path,
+    unix_style_paths: bool,
+) -> Result<toml_edit::DocumentMut> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(toml_edit::DocumentMut::default());
         }
         Err(e) => {
-            return Err(e).with_context(|| format!("reading config file {}", path.display()));
+            return Err(e).with_context(|| {
+                format!(
+                    "reading config file {}",
+                    hrdr_tools::display_path(path, unix_style_paths)
+                )
+            });
         }
     };
     match content.parse::<toml_edit::DocumentMut>() {
@@ -2195,14 +2223,17 @@ pub(crate) fn read_config_doc(path: &std::path::Path) -> Result<toml_edit::Docum
             let backup = hrdr_llm::sibling_with_suffix(path, ".bak");
             let saved = std::fs::copy(path, &backup).is_ok();
             let note = if saved {
-                format!(" (a copy was saved to {})", backup.display())
+                format!(
+                    " (a copy was saved to {})",
+                    hrdr_tools::display_path(&backup, unix_style_paths)
+                )
             } else {
                 String::new()
             };
             Err(anyhow::anyhow!(
                 "config file {} is not valid TOML: {e}{note} — refusing to overwrite it; \
                  fix or remove the file and retry",
-                path.display()
+                hrdr_tools::display_path(path, unix_style_paths)
             ))
         }
     }
@@ -2222,13 +2253,25 @@ pub(crate) fn read_config_doc(path: &std::path::Path) -> Result<toml_edit::Docum
 /// process-wide counter), so two writers racing on the same config never build
 /// their new contents in the same scratch file — a fixed `.tmp` name let one
 /// writer's half-written bytes get renamed into place by the other.
-pub(crate) fn write_config_doc(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> Result<()> {
+pub(crate) fn write_config_doc(
+    path: &std::path::Path,
+    doc: &toml_edit::DocumentMut,
+    unix_style_paths: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating {}",
+                hrdr_tools::display_path(parent, unix_style_paths)
+            )
+        })?;
     }
-    hrdr_llm::write_atomic(path, doc.to_string().as_bytes())
-        .with_context(|| format!("writing {}", path.display()))
+    hrdr_llm::write_atomic(path, doc.to_string().as_bytes()).with_context(|| {
+        format!(
+            "writing {}",
+            hrdr_tools::display_path(path, unix_style_paths)
+        )
+    })
 }
 
 /// Shorthand: a config with no `[providers.*]` entries — every provider name
@@ -2341,6 +2384,115 @@ mod env_source_tests {
 mod persistence_tests {
     use super::*;
 
+    #[test]
+    fn config_mutation_path_style_create_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, b"not a directory").unwrap();
+        let path = parent.join("config.toml");
+        let reason = std::fs::create_dir_all(&parent).unwrap_err().to_string();
+        let doc = toml_edit::DocumentMut::default();
+        for style in [true, false] {
+            for err in [
+                persist_setting_at(
+                    &path,
+                    "theme",
+                    ConfigValue::Str(r"C:\value\unchanged"),
+                    style,
+                )
+                .unwrap_err(),
+                remove_setting_at(&path, "theme", style).unwrap_err(),
+                write_config_doc(&path, &doc, style).unwrap_err(),
+            ] {
+                assert_eq!(
+                    format!("{err:#}"),
+                    format!(
+                        "creating {}: {reason}",
+                        hrdr_tools::display_path(&parent, style)
+                    )
+                );
+            }
+            assert_eq!(std::fs::read(&parent).unwrap(), b"not a directory");
+        }
+    }
+
+    #[test]
+    fn config_mutation_path_style_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let bytes = b"\xffC:\\reason\\unchanged";
+        std::fs::write(&path, bytes).unwrap();
+        let reason = std::fs::read_to_string(&path).unwrap_err().to_string();
+        for style in [true, false] {
+            for err in [
+                persist_setting_at(&path, "theme", ConfigValue::Str("dark"), style).unwrap_err(),
+                remove_setting_at(&path, "theme", style).unwrap_err(),
+            ] {
+                assert_eq!(
+                    format!("{err:#}"),
+                    format!(
+                        "reading config file {}: {reason}",
+                        hrdr_tools::display_path(&path, style)
+                    )
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn config_mutation_path_style_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        let marker = path.join("kept");
+        std::fs::write(&marker, b"unchanged").unwrap();
+        let reason = hrdr_llm::write_atomic(&path, b"theme = 'dark'")
+            .unwrap_err()
+            .to_string();
+        let doc = "theme = 'C:\\value\\unchanged'".parse().unwrap();
+        for style in [true, false] {
+            let err = write_config_doc(&path, &doc, style).unwrap_err();
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "writing {}: {reason}",
+                    hrdr_tools::display_path(&path, style)
+                )
+            );
+            assert_eq!(std::fs::read(&marker).unwrap(), b"unchanged");
+        }
+    }
+
+    #[test]
+    fn config_mutation_path_style_malformed_preserves_bytes_and_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let backup = hrdr_llm::sibling_with_suffix(&path, ".bak");
+        let original = "theme = 'C:\\value\\unchanged'\nC:\\reason\\unchanged = =\n";
+        let reason = original
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains(r"C:\reason\unchanged"));
+        std::fs::write(&path, original).unwrap();
+        for style in [true, false] {
+            let expected = format!(
+                "config file {} is not valid TOML: {reason} (a copy was saved to {}) — refusing to overwrite it; fix or remove the file and retry",
+                hrdr_tools::display_path(&path, style),
+                hrdr_tools::display_path(&backup, style)
+            );
+            for err in [
+                persist_setting_at(&path, "theme", ConfigValue::Str("dark"), style).unwrap_err(),
+                remove_setting_at(&path, "theme", style).unwrap_err(),
+            ] {
+                assert_eq!(err.to_string(), expected);
+                assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+                assert_eq!(std::fs::read(&backup).unwrap(), original.as_bytes());
+            }
+        }
+    }
+
     fn doc_of(path: &std::path::Path) -> toml_edit::DocumentMut {
         std::fs::read_to_string(path)
             .unwrap()
@@ -2362,7 +2514,7 @@ mod persistence_tests {
             for key in keys {
                 let path = path.clone();
                 s.spawn(move || {
-                    persist_setting_at(&path, key, ConfigValue::Str(key)).unwrap();
+                    persist_setting_at(&path, key, ConfigValue::Str(key), false).unwrap();
                 });
             }
         });
@@ -2389,9 +2541,9 @@ mod persistence_tests {
 
         std::thread::scope(|s| {
             let p = path.clone();
-            s.spawn(move || persist_setting_at(&p, "model", ConfigValue::Str("m")).unwrap());
+            s.spawn(move || persist_setting_at(&p, "model", ConfigValue::Str("m"), false).unwrap());
             let p = path.clone();
-            s.spawn(move || remove_setting_at(&p, "theme").unwrap());
+            s.spawn(move || remove_setting_at(&p, "theme", false).unwrap());
         });
 
         let doc = doc_of(&path);
@@ -2413,7 +2565,7 @@ mod persistence_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("config.toml");
-        persist_setting_at(&real, "theme", ConfigValue::Str("dark")).unwrap();
+        persist_setting_at(&real, "theme", ConfigValue::Str("dark"), false).unwrap();
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -2435,7 +2587,7 @@ mod persistence_tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        persist_setting_at(&path, "theme", ConfigValue::Str("dark")).unwrap();
+        persist_setting_at(&path, "theme", ConfigValue::Str("dark"), false).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "a fresh config must be written 0600");
     }
@@ -2449,7 +2601,7 @@ mod persistence_tests {
         let original = "theme = \"solarized\"\nthis is not = = toml\n";
         std::fs::write(&path, original).unwrap();
 
-        let err = persist_setting_at(&path, "theme", ConfigValue::Str("dark"))
+        let err = persist_setting_at(&path, "theme", ConfigValue::Str("dark"), false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("is not valid TOML"), "{err}");
@@ -2466,7 +2618,7 @@ mod persistence_tests {
         );
 
         // A removal refuses the same way.
-        assert!(remove_setting_at(&path, "theme").is_err());
+        assert!(remove_setting_at(&path, "theme", false).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
@@ -2476,17 +2628,17 @@ mod persistence_tests {
     fn persist_creates_and_preserves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.toml");
-        persist_setting_at(&path, "theme", ConfigValue::Str("dark")).unwrap();
+        persist_setting_at(&path, "theme", ConfigValue::Str("dark"), false).unwrap();
         assert_eq!(doc_of(&path)["theme"].as_str(), Some("dark"));
 
         std::fs::write(&path, "# keep me\nother = true\ntheme = \"dark\"\n").unwrap();
-        persist_setting_at(&path, "theme", ConfigValue::Str("light")).unwrap();
+        persist_setting_at(&path, "theme", ConfigValue::Str("light"), false).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep me"), "{text}");
         assert!(text.contains("other = true"), "{text}");
         assert_eq!(doc_of(&path)["theme"].as_str(), Some("light"));
 
-        remove_setting_at(&path, "theme").unwrap();
+        remove_setting_at(&path, "theme", false).unwrap();
         assert!(doc_of(&path).get("theme").is_none());
         assert!(
             std::fs::read_to_string(&path)

@@ -167,7 +167,7 @@ impl StoreLock {
     ///
     /// `kind` says what is done under the lock, which is what sets how long a
     /// peer must wait before reaping it — see [`StoreKind`].
-    pub fn acquire(store_path: &Path, kind: StoreKind) -> Result<Self> {
+    pub fn acquire(store_path: &Path, kind: StoreKind, unix_style_paths: bool) -> Result<Self> {
         let lock_path = hrdr_llm::sibling_with_suffix(store_path, ".lock");
         let stale_age_secs = kind.stale_age_secs();
         for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
@@ -217,13 +217,16 @@ impl StoreLock {
                 Err(e) => {
                     // A non-contention error (e.g. an unwritable directory) will
                     // not fix itself by retrying — surface it right away.
-                    return Err(anyhow!("acquiring lock {}: {e}", lock_path.display()));
+                    return Err(anyhow!(
+                        "acquiring lock {}: {e}",
+                        hrdr_tools::display_path(&lock_path, unix_style_paths)
+                    ));
                 }
             }
         }
         Err(anyhow!(
             "timed out acquiring lock {} (held by another process?)",
-            lock_path.display()
+            hrdr_tools::display_path(&lock_path, unix_style_paths)
         ))
     }
 }
@@ -300,6 +303,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn config_mutation_path_style_lock_immediate_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("missing").join("config.toml");
+        let lock = hrdr_llm::sibling_with_suffix(&store, ".lock");
+        let reason = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .unwrap_err()
+            .to_string();
+        for style in [true, false] {
+            let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, style).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "acquiring lock {}: {reason}",
+                    hrdr_tools::display_path(&lock, style)
+                )
+            );
+            assert!(!lock.exists());
+        }
+    }
+
+    #[test]
+    fn config_mutation_path_style_lock_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("config.toml");
+        let lock = hrdr_llm::sibling_with_suffix(&store, ".lock");
+        let held = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false).unwrap();
+        let original = std::fs::read(&lock).unwrap();
+        for style in [true, false] {
+            let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, style).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "timed out acquiring lock {} (held by another process?)",
+                    hrdr_tools::display_path(&lock, style)
+                )
+            );
+            assert_eq!(std::fs::read(&lock).unwrap(), original);
+        }
+        drop(held);
+        assert!(!lock.exists());
+    }
+
+    #[test]
     fn lock_path_is_sibling_with_lock_suffix() {
         let p = Path::new("/some/dir/auth.toml");
         assert_eq!(
@@ -319,7 +368,7 @@ mod tests {
         let store = dir.path().join("auth.toml");
         let lock = dir.path().join("auth.toml.lock");
         {
-            let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite).unwrap();
+            let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false).unwrap();
             assert!(lock.exists(), "lock file exists while held");
         }
         assert!(!lock.exists(), "lock file removed on drop");
@@ -330,7 +379,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("auth.toml");
         let lock = dir.path().join("auth.toml.lock");
-        let guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite).unwrap();
+        let guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false).unwrap();
         // A concurrent process reaped our lock as stale (Windows has no
         // liveness probe, so every pid reads as dead past the staleness age)
         // and re-claimed the path with its own pid.
@@ -346,10 +395,10 @@ mod tests {
     fn second_acquire_while_held_times_out_cleanly() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("auth.toml");
-        let _held = StoreLock::acquire(&store, StoreKind::SmallFileRewrite).unwrap();
+        let _held = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false).unwrap();
         // A live (this process) lock is never stale, so a second acquire runs
         // out its retry budget and errors instead of hanging or corrupting.
-        let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite)
+        let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("timed out acquiring"), "{err}");
@@ -365,7 +414,7 @@ mod tests {
         let old = hrdr_tools::unix_now().saturating_sub(SMALL_FILE_STALE_LOCK_AGE_SECS + 60);
         std::fs::write(&lock, format!("4294967294 {old}")).unwrap();
         // Acquire must reap the stale lock and succeed on the first pass.
-        let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite).unwrap();
+        let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false).unwrap();
         assert!(lock.exists(), "our fresh lock replaced the stale one");
     }
 
@@ -380,7 +429,7 @@ mod tests {
         let old =
             std::time::SystemTime::now() - Duration::from_secs(SMALL_FILE_STALE_LOCK_AGE_SECS + 60);
         filetime::set_file_mtime(&lock, filetime::FileTime::from_system_time(old)).unwrap();
-        let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite).unwrap();
+        let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false).unwrap();
         assert!(lock.exists());
     }
 
@@ -392,7 +441,7 @@ mod tests {
         // A just-written garbage lock (fresh mtime) must NOT be treated as
         // stale — a live writer may be mid-write with a slow flush.
         std::fs::write(&lock, b"garbage-no-pid").unwrap();
-        let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite)
+        let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("timed out acquiring"), "{err}");
@@ -575,7 +624,7 @@ mod tests {
             "its owner is alive, so the lock is not stale however this test is timed"
         );
 
-        let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite)
+        let err = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false)
             .expect_err("a lock another process holds cannot be taken")
             .to_string();
         assert!(err.contains("timed out acquiring"), "{err}");
@@ -591,7 +640,7 @@ mod tests {
             !lock.exists(),
             "the holder's Drop released it across the process boundary"
         );
-        StoreLock::acquire(&store, StoreKind::SmallFileRewrite)
+        StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false)
             .expect("the lock is free once its holder is gone");
     }
 
@@ -626,7 +675,7 @@ mod tests {
         let old = hrdr_tools::unix_now().saturating_sub(SMALL_FILE_STALE_LOCK_AGE_SECS + 60);
         std::fs::write(&lock, format!("{dead_pid} {old}")).unwrap();
 
-        let _ours = StoreLock::acquire(&store, StoreKind::SmallFileRewrite)
+        let _ours = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false)
             .expect("a dead holder's lock is reaped rather than waited on forever");
         assert_eq!(
             lock_owner_pid(&lock),
@@ -646,8 +695,12 @@ mod tests {
             return;
         };
         let dir = PathBuf::from(dir);
-        let guard = StoreLock::acquire(&dir.join(CHILD_STORE_NAME), StoreKind::SmallFileRewrite)
-            .expect("the child takes a free lock");
+        let guard = StoreLock::acquire(
+            &dir.join(CHILD_STORE_NAME),
+            StoreKind::SmallFileRewrite,
+            false,
+        )
+        .expect("the child takes a free lock");
         std::fs::write(ready_file(&dir), std::process::id().to_string())
             .expect("the child can signal that it holds the lock");
         if std::env::var_os(CHILD_CRASH_ENV).is_some() {

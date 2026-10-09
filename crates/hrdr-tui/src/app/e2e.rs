@@ -9716,8 +9716,12 @@ async fn path_style_completion_labels_preserve_rank_exactness_and_acceptance() {
                 ["other/nested.txt", "nested/deeper/", "nested/file.rs"]
             );
             h.render();
-            hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
-                .unwrap();
+            hrdr_agent::persist_setting(
+                "unix_style_paths",
+                hrdr_agent::ConfigValue::Bool(style),
+                false,
+            )
+            .unwrap();
             h.app.apply_config_reload(true);
             let comp = h.app.active_completions().unwrap();
             assert_eq!(comp.items, warm.items);
@@ -9833,6 +9837,51 @@ async fn path_style_completion_nonpath_rows_stay_verbatim() {
 }
 
 #[tokio::test]
+async fn config_mutation_path_style_tui_forwarding_and_mtime() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let path = hrdr_agent::config_file_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for style in [true, false] {
+        h.app.cfg.unix_style_paths = style;
+        h.app.config_mtime = None;
+        std::fs::write(&path, b"\xffinvalid UTF-8").unwrap();
+        let label = hrdr_tools::display_path(&path, style);
+        h.app
+            .persist_setting("theme", hrdr_agent::ConfigValue::Str(r"C:\value\unchanged"));
+        assert_eq!(
+            h.app.toasts.last_body(),
+            Some(format!("couldn't save 'theme' to config: reading config file {label}").as_str())
+        );
+        assert_eq!(h.app.config_mtime, None);
+        h.app.unpersist_setting("theme");
+        assert_eq!(
+            h.app.toasts.last_body(),
+            Some(format!("couldn't update config: reading config file {label}").as_str())
+        );
+        assert_eq!(h.app.config_mtime, None);
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xffinvalid UTF-8");
+
+        std::fs::write(&path, "# preserved\n").unwrap();
+        h.app
+            .persist_setting("theme", hrdr_agent::ConfigValue::Str(r"C:\value\unchanged"));
+        assert_eq!(
+            h.app.config_mtime,
+            Some(std::fs::metadata(&path).unwrap().modified().unwrap())
+        );
+        let doc = hrdr_agent::read_config_file::<serde_json::Value>().unwrap();
+        assert_eq!(doc["theme"].as_str(), Some(r"C:\value\unchanged"));
+        h.app.config_mtime = None;
+        h.app.unpersist_setting("theme");
+        assert_eq!(
+            h.app.config_mtime,
+            Some(std::fs::metadata(&path).unwrap().modified().unwrap())
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# preserved\n");
+    }
+}
+
+#[tokio::test]
 async fn session_read_diagnostics_restyle_on_reload_without_rewriting_files() {
     let _home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
@@ -9849,8 +9898,12 @@ async fn session_read_diagnostics_restyle_on_reload_without_rewriting_files() {
     h.app.session_selector.as_mut().unwrap().push_char('b');
     h.render();
     for style in [false, true] {
-        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
-            .unwrap();
+        hrdr_agent::persist_setting(
+            "unix_style_paths",
+            hrdr_agent::ConfigValue::Bool(style),
+            false,
+        )
+        .unwrap();
         h.app.apply_config_reload(true);
         let expected_path = hrdr_tools::display_path(&broken, style);
         let expected = format!("parsing {expected_path}: {reason}");
@@ -9934,8 +9987,12 @@ async fn session_style_reload_repairs_metadata_and_preserves_picker_snapshot() {
     repaired.updated = 1_700_000_000;
     std::fs::write(&broken, serde_json::to_vec(&repaired).unwrap()).unwrap();
     for style in [false, true] {
-        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
-            .unwrap();
+        hrdr_agent::persist_setting(
+            "unix_style_paths",
+            hrdr_agent::ConfigValue::Bool(style),
+            false,
+        )
+        .unwrap();
         h.app.apply_config_reload(true);
         let sel = h.app.session_selector.as_ref().unwrap();
         assert_eq!(sel.filter, "match");
@@ -9974,7 +10031,12 @@ async fn session_style_reload_repairs_metadata_and_preserves_picker_snapshot() {
     assert!(sel.current().is_none());
     let empty_filter = sel.filter.clone();
     h.render();
-    hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(false)).unwrap();
+    hrdr_agent::persist_setting(
+        "unix_style_paths",
+        hrdr_agent::ConfigValue::Bool(false),
+        false,
+    )
+    .unwrap();
     h.app.apply_config_reload(true);
     let sel = h.app.session_selector.as_mut().unwrap();
     assert_eq!(sel.filter, empty_filter);
@@ -10025,8 +10087,12 @@ async fn path_style_reload_updates_cwd_chrome_and_warm_session_picker() {
     h.render();
     let width = h.app.session_rows.as_ref().unwrap().inner_w;
     for style in [false, true] {
-        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
-            .unwrap();
+        hrdr_agent::persist_setting(
+            "unix_style_paths",
+            hrdr_agent::ConfigValue::Bool(style),
+            false,
+        )
+        .unwrap();
         let agent = h.app.agent.clone();
         let guard = agent.lock().await;
         h.app.apply_config_reload(true);
@@ -10083,8 +10149,12 @@ async fn path_style_reload_reaches_following_tool_results() {
         .collect();
     let mut h = Harness::new(replies).await;
     for style in [false, true] {
-        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
-            .unwrap();
+        hrdr_agent::persist_setting(
+            "unix_style_paths",
+            hrdr_agent::ConfigValue::Bool(style),
+            false,
+        )
+        .unwrap();
         let agent = h.app.agent.clone();
         let guard = agent.lock().await;
         h.app.apply_config_reload(true);
@@ -10139,8 +10209,12 @@ async fn path_style_reload_rebuilds_warm_tool_headers_without_changing_payloads(
     h.render();
     assert_eq!(crate::ui::block_cache_ptr(h.app.render_cache_id, idx), warm);
     for style in [false, true] {
-        hrdr_agent::persist_setting("unix_style_paths", hrdr_agent::ConfigValue::Bool(style))
-            .unwrap();
+        hrdr_agent::persist_setting(
+            "unix_style_paths",
+            hrdr_agent::ConfigValue::Bool(style),
+            false,
+        )
+        .unwrap();
         h.app.apply_config_reload(true);
         assert_eq!(h.app.cfg.unix_style_paths, style);
         assert!(crate::ui::block_cache_ptr(h.app.render_cache_id, idx).is_none());

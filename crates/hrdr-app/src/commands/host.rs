@@ -162,7 +162,7 @@ pub trait CommandHost {
     /// Persist one setting to the user config file. Default writes directly;
     /// the TUI overrides to also suppress its config hot-reload.
     fn persist_setting(&mut self, key: &str, value: hrdr_agent::ConfigValue) {
-        if let Err(e) = hrdr_agent::persist_setting(key, value) {
+        if let Err(e) = hrdr_agent::persist_setting(key, value, self.unix_style_paths()) {
             // A malformed config is refused rather than overwritten, so this is
             // the only place the user learns the setting did not stick.
             self.info(format!("couldn't save '{key}' to config: {e}"));
@@ -252,7 +252,7 @@ pub trait CommandHost {
     /// Remove one setting from the user config file (`/theme` reset). Default
     /// writes directly; the TUI overrides to suppress its hot-reload.
     fn unpersist_setting(&mut self, key: &str) {
-        if let Err(e) = hrdr_agent::remove_setting(key) {
+        if let Err(e) = hrdr_agent::remove_setting(key, self.unix_style_paths()) {
             self.info(format!("couldn't update config: {e}"));
         }
     }

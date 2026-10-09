@@ -214,6 +214,16 @@ gate and separate enabled leak-guard run passed. This remains an uncorrected
 intermittent native-pipe test failure, not evidence of a session-read
 regression.
 
+Twenty-fifth-push run `37884707688` (`2c696028`) again failed only Linux/macOS
+leak-guard jobs on registration turnover `Kind(WouldBlock)`. All platform
+nextest, Clippy, build/smoke, dependency checks, Windows leak guard, and
+release-target builds passed. The proposed registration retry change still
+awaits approval. Config-mutation path tests cover storage and frontend failures;
+OAuth completion's captured preference is source-inspected, not exercised by a
+dedicated async regression test. Auth-storage path diagnostics remain pending;
+auth/blob lock callers retain native labels, with blob lock errors still
+ignored.
+
 A local default-concurrency gate failed
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four
 workspace gate commands passed with `CARGO_BUILD_JOBS=1` and

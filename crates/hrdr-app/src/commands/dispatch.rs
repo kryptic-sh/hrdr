@@ -829,6 +829,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_mutation_path_style_host_forwarding() {
+        let _guard = CONFIG_LOCK.lock().await;
+        let path = hrdr_agent::config_file_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = config_contents();
+        std::fs::write(&path, b"\xffinvalid UTF-8").unwrap();
+        let mut host = TestHost::new(std::env::temp_dir());
+        for style in [true, false] {
+            host.unix_style_paths = style;
+            let label = hrdr_tools::display_path(&path, style);
+            host.persist_setting("theme", hrdr_agent::ConfigValue::Str(r"C:\value\unchanged"));
+            assert_eq!(
+                host.info_log.last().unwrap(),
+                &format!("couldn't save 'theme' to config: reading config file {label}")
+            );
+            host.unpersist_setting("theme");
+            assert_eq!(
+                host.info_log.last().unwrap(),
+                &format!("couldn't update config: reading config file {label}")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"\xffinvalid UTF-8");
+        }
+        std::fs::write(&path, original).unwrap();
+    }
+
+    #[tokio::test]
     async fn editor_refusal_path_style_does_not_launch_a_handler() {
         for style in [true, false] {
             let mut host = TestHost::new(std::env::temp_dir());
@@ -1515,7 +1541,7 @@ mod tests {
     #[tokio::test]
     async fn temp_rejects_invalid_values_without_persisting() {
         let _guard = CONFIG_LOCK.lock().await;
-        hrdr_agent::remove_setting("temperature").expect("clean slate");
+        hrdr_agent::remove_setting("temperature", false).expect("clean slate");
         for bad in ["nan", "inf", "5", "-1", "1e40"] {
             let dir = tempfile::tempdir().unwrap();
             let mut host = TestHost::new(dir.path().to_path_buf());
@@ -1545,7 +1571,7 @@ mod tests {
     #[tokio::test]
     async fn temp_valid_value_persists_and_applies() {
         let _guard = CONFIG_LOCK.lock().await;
-        hrdr_agent::remove_setting("temperature").expect("clean slate");
+        hrdr_agent::remove_setting("temperature", false).expect("clean slate");
         let dir = tempfile::tempdir().unwrap();
         let mut host = TestHost::new(dir.path().to_path_buf());
 
@@ -1566,7 +1592,7 @@ mod tests {
             "{:?}",
             config_contents()
         );
-        hrdr_agent::remove_setting("temperature").expect("cleanup");
+        hrdr_agent::remove_setting("temperature", false).expect("cleanup");
     }
 
     /// `/temp default` clears a set value: the agent goes back to `None` and
@@ -1697,7 +1723,7 @@ mod tests {
     #[tokio::test]
     async fn effort_applies_a_valid_value() {
         let _guard = CONFIG_LOCK.lock().await;
-        hrdr_agent::remove_setting("effort").expect("clean slate");
+        hrdr_agent::remove_setting("effort", false).expect("clean slate");
         let dir = tempfile::tempdir().unwrap();
         let mut host = TestHost::new(dir.path().to_path_buf());
 
@@ -1714,7 +1740,7 @@ mod tests {
             "{:?}",
             config_contents()
         );
-        hrdr_agent::remove_setting("effort").expect("cleanup");
+        hrdr_agent::remove_setting("effort", false).expect("cleanup");
     }
 
     /// `/effort default` clears the override: the `effort` key leaves the
@@ -1722,7 +1748,7 @@ mod tests {
     #[tokio::test]
     async fn effort_default_clears_the_override() {
         let _guard = CONFIG_LOCK.lock().await;
-        hrdr_agent::remove_setting("effort").expect("clean slate");
+        hrdr_agent::remove_setting("effort", false).expect("clean slate");
         let dir = tempfile::tempdir().unwrap();
         let mut host = TestHost::new(dir.path().to_path_buf());
 
