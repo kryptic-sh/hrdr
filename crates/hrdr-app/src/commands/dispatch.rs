@@ -910,7 +910,7 @@ mod tests {
                 hrdr_tools::display_path(&untrusted.canonicalize().unwrap(), style)
             )));
             assert_eq!(host.cwd, here);
-            hrdr_agent::trust::trust(&target).unwrap();
+            hrdr_agent::trust::trust(&target, style).unwrap();
             assert!(dispatch(&mut host, &format!("/cwd {}", target.display())));
             let raw = target.canonicalize().unwrap();
             assert_eq!(
@@ -1209,7 +1209,7 @@ mod tests {
         let target = dir.path().join("target");
         std::fs::create_dir_all(&here).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        hrdr_agent::trust::trust(&target).expect("record the answer");
+        hrdr_agent::trust::trust(&target, true).expect("record the answer");
 
         let mut host = TestHost::new(here.clone());
         assert!(dispatch(&mut host, &format!("/cwd {}", target.display())));

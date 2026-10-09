@@ -82,7 +82,7 @@ pub fn is_trusted(dir: &Path) -> bool {
 /// question at the same moment cannot lose the first one's entry — an `O_APPEND`
 /// write of one short line is not interleaved with another. The file is created
 /// owner-only: it decides which directories may steer this user's agent.
-pub fn trust(dir: &Path) -> Result<()> {
+pub fn trust(dir: &Path, unix_style_paths: bool) -> Result<()> {
     let path = trusted_dirs_path().context("no cache directory to store trusted directories in")?;
     let k = key(dir);
     // A path containing a line break would split its own entry in the
@@ -97,15 +97,29 @@ pub fn trust(dir: &Path) -> Result<()> {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating {}",
+                hrdr_tools::display_path(parent, unix_style_paths)
+            )
+        })?;
     }
     let mut f = hrdr_llm::owner_only_options()
         .append(true)
         .create(true)
         .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    writeln!(f, "{k}").with_context(|| format!("writing {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "opening {}",
+                hrdr_tools::display_path(&path, unix_style_paths)
+            )
+        })?;
+    writeln!(f, "{k}").with_context(|| {
+        format!(
+            "writing {}",
+            hrdr_tools::display_path(&path, unix_style_paths)
+        )
+    })?;
     Ok(())
 }
 
@@ -145,11 +159,83 @@ mod tests {
     }
 
     #[test]
+    fn trust_store_path_styles() {
+        for style in [true, false] {
+            for scenario in ["creating", "opening", "success"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "trust::tests::trust_store_path_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("HRDR_TRUST_STORE_STYLE", style.to_string())
+                    .env("HRDR_TRUST_STORE_SCENARIO", scenario)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{style} {scenario}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated trust-store child"]
+    fn trust_store_path_child() {
+        let style: bool = std::env::var("HRDR_TRUST_STORE_STYLE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let scenario = std::env::var("HRDR_TRUST_STORE_SCENARIO").unwrap();
+        let store = trusted_dirs_path().unwrap();
+        let sandbox = PathBuf::from(std::env::var_os("HRDR_TEST_SANDBOX").unwrap());
+        assert!(store.starts_with(&sandbox));
+        let dir = sandbox.join(if cfg!(unix) {
+            r"literal\name"
+        } else {
+            "project"
+        });
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!is_trusted(&dir));
+        if scenario == "success" {
+            let expected = format!("{}\n", dir.canonicalize().unwrap().to_string_lossy());
+            trust(&dir, style).unwrap();
+            assert!(is_trusted(&dir));
+            assert_eq!(std::fs::read(&store).unwrap(), expected.as_bytes());
+            trust(&dir, !style).unwrap();
+            assert!(is_trusted(&dir));
+            assert_eq!(std::fs::read(&store).unwrap(), expected.as_bytes());
+        } else {
+            let operand = if scenario == "creating" {
+                std::fs::write(store.parent().unwrap(), b"obstruction").unwrap();
+                store.parent().unwrap()
+            } else {
+                assert_eq!(scenario, "opening");
+                std::fs::create_dir_all(&store).unwrap();
+                store.as_path()
+            };
+            let raw = operand.to_string_lossy();
+            let label = if cfg!(windows) && style {
+                raw.replace('\\', "/")
+            } else {
+                raw.into_owned()
+            };
+            let error = trust(&dir, style).unwrap_err();
+            assert_eq!(error.to_string(), format!("{scenario} {label}"));
+            assert!(!is_trusted(&dir));
+        }
+    }
+
+    #[test]
     fn an_unknown_directory_is_not_trusted_and_trusting_it_sticks() {
         let (_store, _lock) = private_store();
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_trusted(dir.path()), "nothing is trusted to begin with");
-        trust(dir.path()).unwrap();
+        trust(dir.path(), true).unwrap();
         assert!(is_trusted(dir.path()));
     }
 
@@ -162,7 +248,7 @@ mod tests {
         let child = parent.path().join("just-cloned");
         std::fs::create_dir(&child).unwrap();
 
-        trust(parent.path()).unwrap();
+        trust(parent.path(), true).unwrap();
 
         assert!(is_trusted(parent.path()));
         assert!(
@@ -176,8 +262,8 @@ mod tests {
     fn trusting_twice_records_one_entry() {
         let (_store, _lock) = private_store();
         let dir = tempfile::tempdir().unwrap();
-        trust(dir.path()).unwrap();
-        trust(dir.path()).unwrap();
+        trust(dir.path(), true).unwrap();
+        trust(dir.path(), true).unwrap();
         let text = std::fs::read_to_string(trusted_dirs_path().unwrap()).unwrap();
         assert_eq!(text.lines().filter(|l| !l.trim().is_empty()).count(), 1);
     }
@@ -194,7 +280,7 @@ mod tests {
         let link = link_parent.path().join("link");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
 
-        trust(&link).unwrap();
+        trust(&link, true).unwrap();
         assert!(
             is_trusted(real.path()),
             "the link was stored as its target, so the target reads as trusted"
@@ -222,7 +308,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let weird = parent.path().join("bad\nname");
 
-        let err = trust(&weird).unwrap_err();
+        let err = trust(&weird, true).unwrap_err();
         assert!(
             err.to_string().contains("newline"),
             "the error should name the reason: {err}"

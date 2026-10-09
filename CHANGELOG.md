@@ -40,17 +40,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   popups, while insertion text, matching, ranking, and nonpath rows stay
   unchanged. Startup trust-screen and headless jail-notice cwd labels honor the
   preference without changing trust decisions; the screen still sanitizes
-  terminal controls after formatting. `/export` overwrite refusals and `/edit`
-  success notices also style their path labels without changing export targets
-  or editor arguments. Wire-log rotation warnings retain a structured raw path
-  until the agent renders the notice with its active preference; other warning
-  text remains verbatim. Access checks, LSP protocol paths, and diagnostic
-  message text remain unchanged. Stale-read errors preserve the original culprit
-  command. Headline caches refresh on configuration reload, which also updates
-  subsequent main-agent tool calls and newly spawned children; existing children
-  retain their own setting. Unix rendering, stored tool arguments/results, file
-  contents, and filesystem targets are unchanged. Other path presentation
-  surfaces remain pending.
+  terminal controls after formatting. Trust-store creation/open/write errors
+  also use the preference without changing stored canonical trust keys.
+  `/export` overwrite refusals and `/edit` success notices also style their path
+  labels without changing export targets or editor arguments. Wire-log rotation
+  warnings retain a structured raw path until the agent renders the notice with
+  its active preference; other warning text remains verbatim. Access checks, LSP
+  protocol paths, and diagnostic message text remain unchanged. Stale-read
+  errors preserve the original culprit command. Headline caches refresh on
+  configuration reload, which also updates subsequent main-agent tool calls and
+  newly spawned children; existing children retain their own setting. Unix
+  rendering, stored tool arguments/results, file contents, and filesystem
+  targets are unchanged. Other path presentation surfaces remain pending.
 - **Cross-client messaging library groundwork.** `hrdr-tools::local_ipc`
   provides same-user native transport and bounded session registrations with
   kernel-held leases; `hrdr-agent::messaging::Messaging` adds live probes,

@@ -10822,7 +10822,7 @@ async fn cwd_changes_rediscover_skills_for_the_new_directory() {
     // A fresh, trusted directory with no such skill.
     let new = tempfile::tempdir().unwrap();
     let new_path = new.path().canonicalize().unwrap();
-    hrdr_agent::trust::trust(&new_path).expect("record the trust answer");
+    hrdr_agent::trust::trust(&new_path, true).expect("record the trust answer");
     h.submit(&format!("/cwd {}", new_path.display())).await;
 
     assert!(

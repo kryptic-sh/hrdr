@@ -905,7 +905,7 @@ fn trust_gate_with(
     }
     match ask(cwd) {
         trust::TrustChoice::Trusted => {
-            if let Err(e) = trust::trust(cwd) {
+            if let Err(e) = trust::trust(cwd, unix_style_paths) {
                 // Recording failed, but the user did answer. Honour the answer for
                 // this session and say the answer will not stick, rather than
                 // silently downgrading them to a jail they did not ask for.
@@ -1284,6 +1284,73 @@ mod trust_gate_tests {
             trust_gate_with(&cwd, true, false, style, never_asked),
             TrustGate::Jail
         ));
+    }
+
+    #[test]
+    fn trust_recording_failure_stderr() {
+        for style in [true, false] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "trust_gate_tests::trust_recording_failure_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HRDR_TRUST_PATH_STYLE", style.to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            let expected = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("EXPECTED_NOTICE="))
+                .expect("the child exercised the failing store");
+            assert_eq!(
+                stderr.replace("\r\n", "\n"),
+                format!(
+                    "{expected}\nhrdr: continuing for this session; you will be asked again.\n"
+                )
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated stderr child"]
+    fn trust_recording_failure_child() {
+        let style: bool = std::env::var("HRDR_TRUST_PATH_STYLE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = hrdr_agent::trust::trusted_dirs_path().unwrap();
+        let sandbox = std::path::PathBuf::from(std::env::var_os("HRDR_TEST_SANDBOX").unwrap());
+        assert!(store.starts_with(&sandbox));
+        std::fs::create_dir_all(&store).unwrap();
+        let cause = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&store)
+            .unwrap_err();
+        let raw = store.to_string_lossy();
+        let label = if cfg!(windows) && style {
+            raw.replace('\\', "/")
+        } else {
+            raw.into_owned()
+        };
+        println!(
+            "EXPECTED_NOTICE=hrdr: could not record this directory as trusted: opening {label}: {cause}"
+        );
+        let mut asked = false;
+        assert!(matches!(
+            trust_gate_with(&sandbox, false, false, style, |cwd| {
+                assert_eq!(cwd, sandbox);
+                asked = true;
+                TrustChoice::Trusted
+            }),
+            TrustGate::Proceed
+        ));
+        assert!(asked);
+        assert!(!hrdr_agent::trust::is_trusted(&sandbox));
     }
 
     #[test]
