@@ -124,7 +124,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
     let chunks = Layout::vertical(constraints).split(area);
 
-    let mut logo_cells = draw_transcript(f, app, chunks[0]);
+    app.logo_visible = draw_transcript(f, app, chunks[0]);
     draw_input(f, app, chunks[input_idx]);
     if let Some(i) = statusbar_idx {
         draw_statusbar(f, app, chunks[i], &sb_left, &sb_right);
@@ -134,41 +134,26 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // open it owns the screen (and every key), so the completion popup stands
     // down.
     if let Some(sel) = &app.model_selector {
-        draw_model_selector(
-            f,
-            &mut logo_cells,
-            &app.theme,
-            sel,
-            app.model_loading,
-            app.model_source,
-        );
+        draw_model_selector(f, &app.theme, sel, app.model_loading, app.model_source);
     } else if let Some(sel) = &app.session_selector {
         let unix_style_paths = app.unix_style_paths();
-        draw_session_selector(
-            f,
-            &mut logo_cells,
-            &app.theme,
-            sel,
-            &mut app.session_rows,
-            unix_style_paths,
-        );
+        draw_session_selector(f, &app.theme, sel, &mut app.session_rows, unix_style_paths);
     } else if let Some(sel) = &app.theme_selector {
-        draw_theme_selector(f, &mut logo_cells, &app.theme, sel);
+        draw_theme_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.effort_selector {
-        draw_effort_selector(f, &mut logo_cells, &app.theme, sel);
+        draw_effort_selector(f, &app.theme, sel);
     } else if let Some(sel) = &app.command_selector {
-        draw_command_selector(f, &mut logo_cells, &app.theme, sel);
+        draw_command_selector(f, &app.theme, sel);
     } else if let Some(modal) = &app.login_modal {
-        draw_login_modal(f, &mut logo_cells, &app.theme, modal);
+        draw_login_modal(f, &app.theme, modal);
     } else if let Some(popup) = &app.popup {
         // A slash command's data output (`/status`, `/cost`, `/help`, …).
-        draw_notice_popup(f, &mut logo_cells, &app.theme, popup);
+        draw_notice_popup(f, &app.theme, popup);
     } else if let Some(comp) = app.active_completions() {
         // Completion popup (slash command or `@file`), overlaid above the input.
         app.completion_idx = app.completion_idx.min(comp.items.len() - 1);
-        draw_completion(f, &mut logo_cells, app, chunks[input_idx], &comp);
+        draw_completion(f, app, chunks[input_idx], &comp);
     }
-    app.logo_visible = !logo_cells.is_empty();
 
     // Last, over everything: the mouse selection (which reads the cells the rest
     // of the frame just painted) and the toast stack.
@@ -241,13 +226,6 @@ struct PickRow {
     right: String,
 }
 
-/// Clearing an overlay removes logo provenance even if its content paints the
-/// same glyphs back into those cells.
-fn clear_overlay(f: &mut Frame, rect: Rect, logo_cells: &mut Vec<Position>) {
-    f.render_widget(Clear, rect);
-    logo_cells.retain(|pos| !rect.contains(*pos));
-}
-
 /// The shared, centered picker-modal frame: solid background, 1×2 padding, no
 /// border — the same chrome as the blocks and the completion popup. Clears the
 /// region, draws the block, and returns the inner drawing rect, or `None` when
@@ -255,7 +233,6 @@ fn clear_overlay(f: &mut Frame, rect: Rect, logo_cells: &mut Vec<Position>) {
 /// into. `width_max`/`height_max` clamp the modal against the available area.
 fn modal_frame(
     f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
     theme: &Theme,
     width_max: u16,
     height_max: u16,
@@ -270,7 +247,7 @@ fn modal_frame(
         width,
         height,
     };
-    clear_overlay(f, rect, logo_cells);
+    f.render_widget(Clear, rect);
     let block = Block::default()
         .style(Style::default().bg(theme.user_bg))
         .padding(Padding::new(BLOCK_PAD_X as u16, BLOCK_PAD_X as u16, 1, 1));
@@ -306,13 +283,8 @@ fn popup_bar(theme: &Theme, height: u16) -> Vec<Line<'static>> {
 /// centered, Esc-dismissible popup — the same modal chrome as the pickers,
 /// rendering the command's text as-is with a dim hint. Scrolls with Up/Down
 /// when the text is taller than the popup.
-fn draw_notice_popup(
-    f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
-    theme: &Theme,
-    popup: &crate::app::NoticePopup,
-) {
-    let Some(inner) = modal_frame(f, logo_cells, theme, 92, 30, 3) else {
+fn draw_notice_popup(f: &mut Frame, theme: &Theme, popup: &crate::app::NoticePopup) {
+    let Some(inner) = modal_frame(f, theme, 92, 30, 3) else {
         return;
     };
     let bg = theme.user_bg;
@@ -425,13 +397,12 @@ fn draw_pick_body(
 /// blocks and the completion popup — solid background, 1×2 padding, no border.
 fn draw_model_selector(
     f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
     theme: &Theme,
     sel: &crate::app::ModelSelector,
     loading: bool,
     source: Option<hrdr_agent::CatalogSource>,
 ) {
-    let Some(inner) = modal_frame(f, logo_cells, theme, 92, 32, 3) else {
+    let Some(inner) = modal_frame(f, theme, 92, 32, 3) else {
         return;
     };
     let rows: Vec<PickRow> = sel
@@ -478,13 +449,8 @@ fn draw_model_selector(
 /// `:name` namespace — commands and skills, the shadowed and invalid skills
 /// included and labelled by
 /// [`PromptEntry::detail`](hrdr_app::PromptEntry::detail).
-fn draw_command_selector(
-    f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
-    theme: &Theme,
-    sel: &crate::app::CommandSelector,
-) {
-    let Some(inner) = modal_frame(f, logo_cells, theme, 92, 24, 3) else {
+fn draw_command_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::CommandSelector) {
+    let Some(inner) = modal_frame(f, theme, 92, 24, 3) else {
         return;
     };
     let rows: Vec<PickRow> = sel
@@ -516,16 +482,11 @@ fn draw_command_selector(
 /// every other picker (label · auth method). Key phase: a masked input field
 /// under the plaintext-storage warning — the key never touches the editor,
 /// history, or transcript.
-fn draw_login_modal(
-    f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
-    theme: &Theme,
-    modal: &crate::app::LoginModal,
-) {
+fn draw_login_modal(f: &mut Frame, theme: &Theme, modal: &crate::app::LoginModal) {
     let width = f.area().width.saturating_sub(4).clamp(1, 76);
     match modal {
         crate::app::LoginModal::Providers(sel) => {
-            let Some(inner) = modal_frame(f, logo_cells, theme, 76, 16, 3) else {
+            let Some(inner) = modal_frame(f, theme, 76, 16, 3) else {
                 return;
             };
             let rows: Vec<PickRow> = sel
@@ -563,7 +524,7 @@ fn draw_login_modal(
             let warn_rows = (warning.chars().count() / (width.saturating_sub(6) as usize).max(1)
                 + warning.matches('\n').count()
                 + 1) as u16;
-            let Some(inner) = modal_frame(f, logo_cells, theme, 76, warn_rows + 6, 4) else {
+            let Some(inner) = modal_frame(f, theme, 76, warn_rows + 6, 4) else {
                 return;
             };
             let masked: String = std::iter::repeat_n('•', input.chars().count())
@@ -595,7 +556,7 @@ fn draw_login_modal(
         crate::app::LoginModal::Authorizing { label, .. }
         | crate::app::LoginModal::Switching { label, .. } => {
             let switching = matches!(modal, crate::app::LoginModal::Switching { .. });
-            let Some(inner) = modal_frame(f, logo_cells, theme, 76, 5, 2) else {
+            let Some(inner) = modal_frame(f, theme, 76, 5, 2) else {
                 return;
             };
             let (title, hint) = if switching {
@@ -623,13 +584,8 @@ fn draw_login_modal(
 /// (level label · detail) of the reasoning levels the current model accepts,
 /// highest first with "Default" on top, narrowed by the fuzzy filter. Same
 /// chrome as the other pickers.
-fn draw_effort_selector(
-    f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
-    theme: &Theme,
-    sel: &crate::app::EffortSelector,
-) {
-    let Some(inner) = modal_frame(f, logo_cells, theme, 64, 20, 3) else {
+fn draw_effort_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::EffortSelector) {
+    let Some(inner) = modal_frame(f, theme, 64, 20, 3) else {
         return;
     };
     let rows: Vec<PickRow> = sel
@@ -663,13 +619,8 @@ fn draw_effort_selector(
 /// narrowed by the fuzzy filter. Same chrome as the `/model` selector — and
 /// since the highlighted theme is live-previewed, the modal itself repaints in
 /// the candidate's colors as the highlight moves.
-fn draw_theme_selector(
-    f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
-    theme: &Theme,
-    sel: &crate::app::ThemeSelector,
-) {
-    let Some(inner) = modal_frame(f, logo_cells, theme, 92, 32, 3) else {
+fn draw_theme_selector(f: &mut Frame, theme: &Theme, sel: &crate::app::ThemeSelector) {
+    let Some(inner) = modal_frame(f, theme, 92, 32, 3) else {
         return;
     };
     let rows: Vec<PickRow> = sel
@@ -775,7 +726,6 @@ impl SessionRows {
 /// first, narrowed by the fuzzy filter. Same chrome as the `/model` selector.
 fn draw_session_selector(
     f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
     theme: &Theme,
     sel: &crate::app::SessionSelector,
     cache: &mut Option<SessionRows>,
@@ -783,7 +733,7 @@ fn draw_session_selector(
 ) {
     // A wider modal than the two-column pickers, and a custom four-column body,
     // so it keeps its own layout on top of the shared `modal_frame` chrome.
-    let Some(inner) = modal_frame(f, logo_cells, theme, 110, 32, 3) else {
+    let Some(inner) = modal_frame(f, theme, 110, 32, 3) else {
         return;
     };
     let inner_w = inner.width as usize;
@@ -891,13 +841,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Rows the completion popup shows at once; the selection scrolls the window.
 const COMPLETION_MAX_ROWS: usize = 5;
 
-fn draw_completion(
-    f: &mut Frame,
-    logo_cells: &mut Vec<Position>,
-    app: &App,
-    input_area: Rect,
-    comp: &crate::app::Completions,
-) {
+fn draw_completion(f: &mut Frame, app: &App, input_area: Rect, comp: &crate::app::Completions) {
     let theme = &app.theme;
     // Clamped to the frame itself, not just the input pane: on a very short
     // or narrow terminal, an unclamped popup could ask for more rows/columns
@@ -951,7 +895,7 @@ fn draw_completion(
         width,
         height,
     };
-    clear_overlay(f, rect, logo_cells);
+    f.render_widget(Clear, rect);
     // Same chrome as the transcript blocks: solid background, two columns of
     // padding either side and one padded row above and below, plus the ┃ left
     // edge inside the box, in the status bar's cwd color.
@@ -1017,7 +961,7 @@ fn content_rect(area: Rect) -> crate::app::HitRect {
     })
 }
 
-fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) -> Vec<Position> {
+fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) -> bool {
     // Reserve the rightmost column for the scrollbar. Left padding is applied
     // per-block via pad_line's leading bg-coloured space.
     let text_area = Rect {
@@ -1057,13 +1001,13 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) -> Vec<Position> {
     app.tool_hits = frame.tool_hits;
     app.row_hits = frame.row_hits;
     draw_scrollbar(f, app, area, frame.max_scroll, frame.scroll_offset);
-    frame.logo_cells
+    frame.logo_visible
 }
 
 /// What laying the transcript out told the frame: where the reader ended up, how
 /// far there is to scroll, and where a click would land on something.
 struct TranscriptFrame {
-    logo_cells: Vec<Position>,
+    logo_visible: bool,
     scroll_offset: usize,
     max_scroll: usize,
     /// Visible tool blocks → the transcript index each one toggles.
@@ -1154,8 +1098,8 @@ fn draw_chunks(
     // Follow the header's real wrapping, not just its block bounds: padding,
     // details-only rows and clipped whitespace do not animate. The logo is the
     // glyph prefix of each header body line, before the details column.
-    let mut logo_cells = Vec::new();
-    for (i, _) in chunks.iter().enumerate().filter(|(_, c)| c.logo) {
+    let mut logo_visible = false;
+    'logo: for (i, _) in chunks.iter().enumerate().filter(|(_, c)| c.logo) {
         if cum[i] >= view_end || cum[i + 1] <= scroll_us {
             continue;
         }
@@ -1175,12 +1119,8 @@ fn draw_chunks(
                             && width > 0
                             && !ch.is_whitespace()
                         {
-                            logo_cells.extend((col..col + width).map(|x| {
-                                Position::new(
-                                    text_area.x + x as u16,
-                                    text_area.y + (row - scroll_us) as u16,
-                                )
-                            }));
+                            logo_visible = true;
+                            break 'logo;
                         }
                         remaining -= 1;
                     }
@@ -1286,7 +1226,7 @@ fn draw_chunks(
     f.render_widget(para, text_area);
 
     TranscriptFrame {
-        logo_cells,
+        logo_visible,
         scroll_offset: offset as usize,
         max_scroll: max_scroll as usize,
         tool_hits,

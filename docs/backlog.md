@@ -2529,11 +2529,11 @@ and **not** fixed.
   tests. If not fixable in hrdr, record the verified limitation and reason here,
   including any external setting/workaround and unverified reproduction gaps. Do
   not attribute the cause to Alacritty without evidence.
-- **Idle logo verification gaps:** Timer-driven redraw and modal/completion
-  occlusion are covered through the production event wait and TestBackend.
-  Visual behavior in Windows Terminal/Alacritty was not reproduced. Toast-stack
-  occlusion is not included in visibility tracking; wide/combining glyph
-  clipping and the additional header-visibility pass's cost remain unmeasured.
+- **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
+  was not reproduced. Wide/combining glyph clipping and the additional
+  header-visibility pass's cost remain unmeasured. Overlay coverage
+  intentionally does not affect animation eligibility; only transcript viewport
+  visibility does.
 - **The Job Object is assigned after spawn.** A descendant forked in that window
   escapes the tree kill; documented in the `proc` module docs. The race-free
   form (`CREATE_SUSPENDED` → assign → resume) is awkward through tokio.

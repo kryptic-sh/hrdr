@@ -536,7 +536,8 @@ pub(crate) struct App {
     /// Persistent clock anchor for the header's logo animation. Captured once:
     /// re-anchoring per frame would pin the animation's tick at 0.
     pub(crate) header_anchor: Instant,
-    /// Whether the last draw's transcript viewport contained logo glyphs.
+    /// Whether the last draw's transcript viewport contained logo glyphs,
+    /// regardless of overlays painted above them.
     pub(crate) logo_visible: bool,
     /// Per-message timestamp style: none / relative / exact (`/timestamps`).
     /// Status-bar mode: none / truncate / wrap (`/statusbar`).

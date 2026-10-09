@@ -649,7 +649,7 @@ async fn idle_logo_redraws_on_timer_only_while_its_glyphs_are_visible() {
 }
 
 #[tokio::test]
-async fn idle_logo_overlay_occlusion_controls_production_wait() {
+async fn idle_logo_overlays_do_not_suppress_production_wait() {
     use crate::tui::{Wake, wait_for_event};
     use std::time::Duration;
 
@@ -671,23 +671,31 @@ async fn idle_logo_overlay_occlusion_controls_production_wait() {
     assert!(h.app.popup.is_some());
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert_eq!(glyphs(term.backend().buffer()), 0);
-    assert!(
+    assert!(matches!(
         tokio::time::timeout(
-            Duration::from_millis(ui::SPINNER_FRAME_MS * 3),
+            Duration::from_secs(3),
             wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker),
         )
         .await
-        .is_err(),
-        "a fully covered logo must not wake the production wait"
-    );
-    assert!(!h.app.logo_visible);
+        .expect("a fully covered above-fold logo must wake the production wait"),
+        Wake::Animation
+    ));
+    assert!(h.app.logo_visible);
 
-    // Painting the same symbols over the logo does not preserve its provenance.
+    // Overlay symbols do not change the transcript's animation eligibility.
     h.app.popup.as_mut().unwrap().text = "█".repeat(82).repeat(20);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     assert!(glyphs(term.backend().buffer()) > 0);
-    assert!(!h.app.logo_visible);
-    assert!(!h.app.spinner_live());
+    assert!(h.app.logo_visible);
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_event(&h.app, &mut events, &mut h.rx, &mut ticker),
+        )
+        .await
+        .expect("same-symbol overlays must not suppress the production timer"),
+        Wake::Animation
+    ));
 
     // The centered popup leaves the logo's left columns exposed on a wide frame.
     let mut wide = Terminal::new(TestBackend::new(140, 30)).unwrap();
