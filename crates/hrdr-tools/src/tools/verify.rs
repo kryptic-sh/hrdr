@@ -148,6 +148,7 @@ impl Tool for VerifyTool {
                 &check.command,
                 &ctx.sandbox,
                 &ctx.sandbox_notices,
+                ctx.unix_style_paths,
             );
             cmd.current_dir(&ctx.cwd);
             // A check that rewrites files — a formatter run without `--check`,

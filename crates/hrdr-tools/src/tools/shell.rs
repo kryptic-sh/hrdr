@@ -403,6 +403,7 @@ impl Tool for ShellTool {
             &a.command,
             &ctx.sandbox,
             &ctx.sandbox_notices,
+            ctx.unix_style_paths,
         );
         cmd.current_dir(&ctx.cwd);
         // `shell` opts out of the registry's deadline (see `timeout_secs`), so it

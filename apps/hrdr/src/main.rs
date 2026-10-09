@@ -474,16 +474,34 @@ fn run_sandbox_exec_wrapper() -> Option<Result<i32>> {
         return None;
     }
     Some((|| {
-        let rest: Vec<std::ffi::OsString> = argv.skip_while(|a| a == "--").collect();
-        let (program, args) = rest
-            .split_first()
+        let mut next = argv.next();
+        let mut unix_style_paths = true;
+        if next.as_deref() == Some(std::ffi::OsStr::new("--unix-style-paths")) {
+            unix_style_paths = match argv.next().as_deref().and_then(|value| value.to_str()) {
+                Some("true") => true,
+                Some("false") => false,
+                _ => anyhow::bail!("__sandbox-exec: --unix-style-paths requires `true` or `false`"),
+            };
+            next = argv.next();
+        }
+        anyhow::ensure!(
+            next.as_deref() == Some(std::ffi::OsStr::new("--")),
+            "__sandbox-exec: expected `--` before program"
+        );
+        let program = argv
+            .next()
             .context("__sandbox-exec: no program after `--`")?;
         hrdr_tools::sandbox::lower_current_process_to_low_integrity()
             .context("__sandbox-exec: could not lower this process to Low integrity")?;
-        let status = std::process::Command::new(program)
-            .args(args)
+        let status = std::process::Command::new(&program)
+            .args(argv)
             .status()
-            .with_context(|| format!("__sandbox-exec: spawning {}", program.display()))?;
+            .with_context(|| {
+                format!(
+                    "__sandbox-exec: spawning {}",
+                    hrdr_tools::display_path(std::path::Path::new(&program), unix_style_paths)
+                )
+            })?;
         // Propagate the child's code, whole, so the caller's exit-status handling
         // is unchanged by the extra process in between: `cargo test`'s 101 and
         // grep's 2 mean something, and Windows codes do not fit in a `u8`.

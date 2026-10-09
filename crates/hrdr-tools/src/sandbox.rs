@@ -1043,11 +1043,19 @@ pub fn sandboxed_shell_command(
     cmd_str: &str,
     policy: &SandboxPolicy,
     notices: &SandboxNotices,
+    unix_style_paths: bool,
 ) -> tokio::process::Command {
     if policy.mode == SandboxMode::None {
         return shell.command(cmd_str);
     }
-    shell_command_with_backend(detect_backend(), shell, cmd_str, policy, notices)
+    shell_command_with_backend(
+        detect_backend(),
+        shell,
+        cmd_str,
+        policy,
+        notices,
+        unix_style_paths,
+    )
 }
 
 /// [`sandboxed_shell_command`] with the backend chosen for it.
@@ -1078,7 +1086,10 @@ fn shell_command_with_backend(
     cmd_str: &str,
     policy: &SandboxPolicy,
     notices: &SandboxNotices,
+    unix_style_paths: bool,
 ) -> tokio::process::Command {
+    #[cfg(not(windows))]
+    let _ = unix_style_paths;
     match backend {
         #[cfg(target_os = "linux")]
         OsSandboxBackend::Landlock => landlock_command(shell, cmd_str, policy),
@@ -1111,7 +1122,7 @@ fn shell_command_with_backend(
             match std::env::current_exe() {
                 Ok(exe) => {
                     let mut cmd = tokio::process::Command::new(exe);
-                    cmd.args(low_integrity_args(shell, cmd_str));
+                    cmd.args(low_integrity_args(shell, cmd_str, unix_style_paths));
                     cmd
                 }
                 Err(_) => {
@@ -1253,8 +1264,8 @@ const SEATBELT_PROGRAM: &str = "/usr/bin/sandbox-exec";
 /// Windows backend, not a command anyone should type.
 pub const SANDBOX_EXEC_ARG: &str = "__sandbox-exec";
 
-/// The full argv for the Low-integrity wrapper: `__sandbox-exec -- <shell>
-/// <invoke args> <cmd>`, to be passed to our own executable.
+/// The full argv for the Low-integrity wrapper: `__sandbox-exec
+/// --unix-style-paths <bool> -- <shell> <invoke args> <cmd>`, passed to our executable.
 ///
 /// No writable roots are threaded through yet. `Read` (and `Jail`, which holds
 /// no shell at all) is the whole of what this delivers: every write refused,
@@ -1263,9 +1274,15 @@ pub const SANDBOX_EXEC_ARG: &str = "__sandbox-exec";
 /// separate slice — until then `Write` keeps the software path-guard and the
 /// no-OS-sandbox notice, exactly as it did before this backend existed.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn low_integrity_args(shell: crate::Shell, cmd_str: &str) -> Vec<std::ffi::OsString> {
+fn low_integrity_args(
+    shell: crate::Shell,
+    cmd_str: &str,
+    unix_style_paths: bool,
+) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec![
         SANDBOX_EXEC_ARG.into(),
+        "--unix-style-paths".into(),
+        unix_style_paths.to_string().into(),
         "--".into(),
         shell.executable().into(),
     ];
@@ -2573,11 +2590,51 @@ mod tests {
     /// search System32 first and find WSL's `bash` on Windows.
     #[test]
     fn low_integrity_args_wrap_the_shell_invocation() {
-        let args = argv(&low_integrity_args(crate::Shell::Bash, "echo hi"));
+        let args = argv(&low_integrity_args(crate::Shell::Bash, "echo hi", true));
         assert_eq!(args[0], SANDBOX_EXEC_ARG);
-        assert_eq!(args[1], "--");
-        assert_eq!(args[2], crate::Shell::Bash.executable().to_string_lossy());
-        assert_eq!(args[3..], ["-c", "echo hi"]);
+        assert_eq!(args[1..4], ["--unix-style-paths", "true", "--"]);
+        assert_eq!(args[4], crate::Shell::Bash.executable().to_string_lossy());
+        assert_eq!(args[5..], ["-c", "echo hi"]);
+    }
+
+    #[test]
+    fn low_integrity_args_preserve_raw_shell_argv_for_both_styles() {
+        let command = r#"-- C:\raw\path "quoted value" \\server\share"#;
+        for style in [true, false] {
+            let shell = crate::Shell::Bash;
+            let args = low_integrity_args(shell, command, style);
+            assert_eq!(args[1], "--unix-style-paths");
+            assert_eq!(args[2], style.to_string().as_str());
+            assert_eq!(args[3], "--");
+            let raw = shell.command(command);
+            let raw = raw.as_std();
+            assert_eq!(args[4], raw.get_program());
+            assert_eq!(args[5..], raw.get_args().collect::<Vec<_>>());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_backend_forwards_path_style_without_changing_shell_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
+        for style in [true, false] {
+            let shell = crate::Shell::Bash;
+            let command = r"-- C:\raw\path";
+            let cmd = shell_command_with_backend(
+                OsSandboxBackend::LowIntegrity,
+                shell,
+                command,
+                &policy,
+                &notices(),
+                style,
+            );
+            assert_eq!(cmd.as_std().get_program(), std::env::current_exe().unwrap());
+            assert_eq!(
+                cmd.as_std().get_args().collect::<Vec<_>>(),
+                low_integrity_args(shell, command, style)
+            );
+        }
     }
 
     /// A Low-integrity child can write nowhere the user owns, so the backend is
@@ -2602,6 +2659,7 @@ mod tests {
             "echo hi",
             &policy,
             &n,
+            true,
         );
         assert_eq!(n.take().as_deref(), Some(NO_OS_SANDBOX_NOTICE));
     }
@@ -2649,6 +2707,7 @@ mod tests {
             &format!("echo x > {}", target.display()),
             &policy,
             &notices(),
+            true,
         );
         cmd.current_dir(dir.path());
         let out = cmd.output().await.unwrap();
@@ -2664,6 +2723,7 @@ mod tests {
             &format!("echo x > {}", inside.display()),
             &policy,
             &notices(),
+            true,
         );
         cmd.current_dir(dir.path());
         let out = cmd.output().await.unwrap();
@@ -3059,7 +3119,7 @@ mod tests {
         let mine = notices();
         for mode in [SandboxMode::Write, SandboxMode::Read] {
             let policy = SandboxPolicy::for_agent(mode, dir.path(), &[]);
-            let mut cmd = sandboxed_shell_command(shell, &probe, &policy, &mine);
+            let mut cmd = sandboxed_shell_command(shell, &probe, &policy, &mine, true);
             cmd.current_dir(dir.path());
             let out = cmd.output().await.unwrap();
             assert!(
@@ -3110,6 +3170,7 @@ mod tests {
             &format!("echo x > {}", target.display()),
             &policy,
             &notices(),
+            true,
         );
         cmd.current_dir(dir.path());
         let out = cmd.output().await.unwrap();
@@ -3126,6 +3187,7 @@ mod tests {
             &format!("echo x > {}", inside.display()),
             &policy,
             &notices(),
+            true,
         );
         cmd.current_dir(dir.path());
         let out = cmd.output().await.unwrap();
@@ -3151,6 +3213,7 @@ mod tests {
             "true",
             &policy,
             &mine,
+            true,
         );
         assert_eq!(
             mine.take().as_deref(),
@@ -3164,6 +3227,7 @@ mod tests {
             "true",
             &policy,
             &mine,
+            true,
         );
         assert_eq!(
             mine.take(),
@@ -3180,6 +3244,7 @@ mod tests {
             "true",
             &policy,
             &sibling,
+            true,
         );
         assert_eq!(sibling.take().as_deref(), Some(NO_OS_SANDBOX_NOTICE));
     }

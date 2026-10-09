@@ -307,6 +307,7 @@ async fn poll_watch(
             &check,
             &ctx.sandbox,
             &ctx.sandbox_notices,
+            ctx.unix_style_paths,
         );
         cmd.current_dir(&ctx.cwd);
         // Staleness pairing, like `shell`: a mutating check names itself as the

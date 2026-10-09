@@ -21,6 +21,95 @@ extern crate hrdr_test_support;
 
 use std::process::Command;
 
+#[test]
+fn wrapper_spawn_failure_uses_requested_path_style_and_defaults_to_unix() {
+    let dir = tempfile::tempdir().unwrap();
+    let program = dir.path().join("missing program.exe");
+    assert!(!program.exists());
+    for style in [None, Some(true), Some(false)] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hrdr"));
+        cmd.arg("__sandbox-exec");
+        if let Some(style) = style {
+            cmd.args(["--unix-style-paths", &style.to_string()]);
+        }
+        let out = cmd.arg("--").arg(&program).output().unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected = if style == Some(false) {
+            program.to_string_lossy().into_owned()
+        } else {
+            program.to_string_lossy().replace('\\', "/")
+        };
+        assert!(
+            stderr.contains(&format!("__sandbox-exec: spawning {expected}")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("os error 2"),
+            "must reach the real spawn failure: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn wrapper_rejects_invalid_protocol() {
+    for args in [
+        vec!["--unix-style-paths"],
+        vec!["--unix-style-paths", "--", "cmd"],
+        vec!["--unix-style-paths", "TRUE", "--", "cmd"],
+        vec!["--unix-style-paths", "1", "--", "cmd"],
+        vec!["--unix-style-paths", "false", "cmd"],
+        vec!["--unknown", "--", "cmd"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_hrdr"))
+            .arg("__sandbox-exec")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected = if args[0] == "--unix-style-paths" && args.get(1) != Some(&"false") {
+            "--unix-style-paths requires `true` or `false`"
+        } else {
+            "expected `--` before program"
+        };
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+        assert!(!stderr.contains("spawning"), "{stderr}");
+    }
+}
+
+#[test]
+fn wrapper_preserves_leading_separator_after_protocol_separator() {
+    let out = Command::new(env!("CARGO_BIN_EXE_hrdr"))
+        .args(["__sandbox-exec", "--", "--", "cmd", "/c", "exit 0"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("__sandbox-exec: spawning --"), "{stderr}");
+}
+
+#[test]
+fn wrapper_preserves_child_arguments_and_output_for_both_styles() {
+    for style in ["true", "false"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_hrdr"))
+            .args([
+                "__sandbox-exec",
+                "--unix-style-paths",
+                style,
+                "--",
+                "cmd",
+                "/d",
+                "/c",
+                r"echo --unix-style-paths false -- C:\raw\path",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(out.stdout, b"--unix-style-paths false -- C:\\raw\\path\r\n");
+    }
+}
+
 /// Run `hrdr __sandbox-exec -- cmd /c <command>` and hand back (success, stdout).
 ///
 /// `cmd.exe` rather than a shell hrdr detects: it is present on every Windows
