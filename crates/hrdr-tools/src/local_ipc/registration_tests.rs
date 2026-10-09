@@ -391,13 +391,48 @@ async fn rejects_malicious_records_and_bounds() {
 }
 
 #[tokio::test]
+async fn bind_retries_after_observed_mutation_contention() {
+    let root = root();
+    let directory = UserDirectory::open_in(root.path()).unwrap();
+    let guard = storage::MutationGuard::acquire(&directory).unwrap();
+    assert_eq!(
+        Listener::bind(&directory).err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let (contended, observed) = tokio::sync::oneshot::channel();
+    let mut contended = Some(contended);
+    let bind = async {
+        let operation = || {
+            let result = Listener::bind(&directory);
+            if let Some(contended) = contended.take() {
+                assert_eq!(
+                    result.as_ref().err().unwrap().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                contended.send(()).unwrap();
+            }
+            result
+        };
+        retry_busy(operation).await
+    };
+    let release = async {
+        observed.await.unwrap();
+        drop(guard);
+    };
+    let (listener, ()) = tokio::join!(bind, release);
+    let expected = descriptor(&listener);
+    let _record = Registration::publish(&listener, expected.clone()).unwrap();
+    assert_eq!(directory.list_candidates().unwrap(), vec![expected]);
+}
+
+#[tokio::test]
 async fn socket_only_turnover_stays_bounded_with_live_survivor() {
     let root = root();
     let directory = UserDirectory::open_in(root.path()).unwrap();
-    let mut survivor = Listener::bind(&directory).unwrap();
+    let mut survivor = retry_busy(|| Listener::bind(&directory)).await;
     let record = Registration::publish(&survivor, descriptor(&survivor)).unwrap();
     for _ in 0..=MAX_DIRECTORY_ENTRIES {
-        let listener = Listener::bind(&directory).unwrap();
+        let listener = retry_busy(|| Listener::bind(&directory)).await;
         assert_eq!(listener.endpoint().pid(), survivor.endpoint().pid());
         drop(listener);
         assert!(std::fs::read_dir(&directory.path).unwrap().count() <= 6);
