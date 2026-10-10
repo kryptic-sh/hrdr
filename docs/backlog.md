@@ -162,8 +162,22 @@ push each verified slice to `main` before proceeding to the next slice.
     processes continue. Resolve the detailed recovery protocol before
     implementation. Test actual process replacement, version identity, automatic
     turn continuation, exact goal/TODO preservation, and failure recovery on the
-    supported platform matrix.
-12. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
+    supported platform matrix. CI eligibility is approved: require the latest
+    `push` CI run and latest attempt on `main` for the exact origin-repository
+    hash, with verification and packaging jobs successful; only tag-only
+    publishing jobs may be skipped. Manual and older runs do not qualify.
+12. **Windows multiline-paste transport investigation — deferred branch.**
+    Pending work is preserved and pushed at `wip/windows-paste-transport` commit
+    `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY
+    LF/CRLF regressions, approved `crossterm_winapi` test-only probes, and the
+    config-test isolation fix. It intentionally fails the paste regressions: the
+    inbox `conhost.exe` loses prefixes of fragmented VT paste delimiters even
+    with VT input enabled, while complete frames survive. Test the pinned
+    Microsoft ConPTY host before choosing the conditionally approved vendored
+    Crossterm parser path; verify loaded DLL and host paths so fallback cannot
+    masquerade as a result. Do not merge this branch or release from it until
+    the regressions pass across the required matrix.
+13. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
     implementation: usage accounting, request categorization, and credit usage
