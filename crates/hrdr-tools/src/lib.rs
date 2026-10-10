@@ -56,7 +56,7 @@ pub use lsp::{
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use presentation::display_path;
-pub use proc::{process_alive, resolve_program};
+pub use proc::{GitRun, GitRunKind, GitRunner, process_alive, resolve_program};
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::cron::{CronTool, arm_crons};

@@ -38,6 +38,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 /// The program to hand `Command::new` for a configured program name: a bare name
 /// resolved through `PATH` (the child's own `PATH` when `path` overrides it) to the
@@ -67,6 +72,222 @@ pub fn resolve_program(program: &str, path: Option<&OsStr>) -> OsString {
         .ok()
         .and_then(|mut found| found.next())
         .map_or_else(|| program.into(), OsString::from)
+}
+
+/// Bounded, argv-only runner for the update diagnostic's Git probes.
+///
+/// It never invokes a shell, inherits no stdin, captures both streams concurrently
+/// up to `OUTPUT_LIMIT`, and kills/reaps the process tree when the deadline expires.
+pub struct GitRunner {
+    program: PathBuf,
+    timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitRunKind {
+    Completed,
+    SpawnFailed,
+    TimedOut,
+    OutputOverflow,
+}
+
+#[derive(Debug)]
+pub struct GitRun {
+    pub kind: GitRunKind,
+    pub status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl GitRunner {
+    pub const OUTPUT_LIMIT: usize = 16 * 1024;
+
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        let program = program.into();
+        let program = program
+            .to_str()
+            .filter(|program| Path::new(program).components().count() == 1)
+            .map(|program| PathBuf::from(resolve_program(program, None)))
+            .unwrap_or(program);
+        Self {
+            program,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_timeout(program: impl Into<PathBuf>, timeout: Duration) -> Self {
+        let mut runner = Self::new(program);
+        runner.timeout = timeout;
+        runner
+    }
+
+    pub async fn run(&self, cwd: &Path, args: &[&str]) -> GitRun {
+        let mut command = Command::new(&self.program);
+        command
+            .current_dir(cwd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        sanitize_git_environment(&mut command);
+        let Ok((mut child, mut group)) = spawn_group(&mut command) else {
+            return GitRun {
+                kind: GitRunKind::SpawnFailed,
+                status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+        };
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let (read_tx, mut read_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stdout_task = tokio::spawn({
+            let read_tx = read_tx.clone();
+            async move {
+                let _ = read_tx.send((Stream::Stdout, read_limited(stdout).await));
+            }
+        });
+        let stderr_task = tokio::spawn(async move {
+            let _ = read_tx.send((Stream::Stderr, read_limited(stderr).await));
+        });
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut status = None;
+        let mut pending_reads = 2;
+        let deadline = tokio::time::sleep(self.timeout);
+        tokio::pin!(deadline);
+        let outcome = loop {
+            if status.is_some() && pending_reads == 0 {
+                break RunOutcome::Completed;
+            }
+            tokio::select! {
+                wait = child.wait(), if status.is_none() => match wait {
+                    Ok(child_status) => status = Some(child_status),
+                    Err(_) => break RunOutcome::Failed,
+                },
+                read = read_rx.recv(), if pending_reads > 0 => match read {
+                    Some((stream, (output, overflow))) => {
+                        match stream {
+                            Stream::Stdout => stdout = output,
+                            Stream::Stderr => stderr = output,
+                        }
+                        pending_reads -= 1;
+                        if overflow {
+                            break RunOutcome::OutputOverflow;
+                        }
+                    }
+                    None => break RunOutcome::OutputOverflow,
+                },
+                _ = &mut deadline => {
+                    break RunOutcome::TimedOut;
+                }
+            }
+        };
+
+        if outcome == RunOutcome::Completed {
+            group.release();
+        } else {
+            group.kill();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+        }
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+
+        let kind = match outcome {
+            RunOutcome::Completed => GitRunKind::Completed,
+            RunOutcome::TimedOut | RunOutcome::Failed => GitRunKind::TimedOut,
+            RunOutcome::OutputOverflow => GitRunKind::OutputOverflow,
+        };
+        GitRun {
+            kind,
+            status: status.and_then(|status| status.code()),
+            stdout,
+            stderr,
+        }
+    }
+}
+
+/// Remove inherited Git variables that can redirect a probe outside `cwd` or
+/// inject configuration. Other environment variables, including `PATH` and
+/// authentication variables, remain inherited.
+fn sanitize_git_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if is_git_injection_variable(&key) {
+            command.env_remove(key.as_ref());
+        }
+    }
+}
+
+fn is_git_injection_variable(key: &str) -> bool {
+    #[cfg(windows)]
+    let matches = |candidate: &str| key.eq_ignore_ascii_case(candidate);
+    #[cfg(not(windows))]
+    let matches = |candidate: &str| key == candidate;
+
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+    ]
+    .into_iter()
+    .any(matches)
+        || matches("GIT_CONFIG_KEY_")
+        || matches("GIT_CONFIG_VALUE_")
+        || {
+            #[cfg(windows)]
+            {
+                key.to_ascii_uppercase().starts_with("GIT_CONFIG_KEY_")
+                    || key.to_ascii_uppercase().starts_with("GIT_CONFIG_VALUE_")
+            }
+            #[cfg(not(windows))]
+            {
+                key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_")
+            }
+        }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    Completed,
+    Failed,
+    TimedOut,
+    OutputOverflow,
+}
+
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+async fn read_limited<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> (Vec<u8>, bool) {
+    let mut output = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        let Ok(read) = reader.read(&mut buf).await else {
+            return (output, true);
+        };
+        if read == 0 {
+            return (output, false);
+        }
+        let remaining = GitRunner::OUTPUT_LIMIT.saturating_sub(output.len());
+        let keep = remaining.min(read);
+        output.extend_from_slice(&buf[..keep]);
+        if keep != read {
+            return (output, true);
+        }
+    }
 }
 
 /// Whether process `pid` is still running.
@@ -246,6 +467,20 @@ impl GroupKill {
         }
         self.pid = None;
     }
+
+    /// Release a normally completed group without leaving the Windows job handle
+    /// open. Unlike [`Self::disarm`], this closes the underlying OS resource
+    /// after making its drop harmless.
+    pub(crate) fn release(&mut self) {
+        if let Some(mut group) = self.group.take()
+            && group.release().is_err()
+        {
+            // Preserving normal-completion semantics is safer than dropping an
+            // armed Windows job, which would kill descendants after success.
+            std::mem::forget(group);
+        }
+        self.pid = None;
+    }
 }
 
 /// Handle to whatever OS resource lets [`kill`](ProcessGroup::kill) take down
@@ -298,6 +533,21 @@ impl ProcessGroup {
         {
             let _ = pid;
             self.job.terminate();
+        }
+    }
+
+    /// Make normal completion harmless before this guard closes its OS resource.
+    /// GitRunner calls this only after reaping the leader and observing EOF on
+    /// both captured streams.
+    pub(crate) fn release(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.pgid = None;
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            self.job.release()
         }
     }
 }
@@ -368,6 +618,11 @@ mod windows_job {
     unsafe impl Sync for Job {}
 
     impl Job {
+        #[cfg(test)]
+        pub(crate) fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+            self.handle
+        }
+
         /// Create a fresh kill-on-close job and assign `child` to it.
         pub(crate) fn new_and_assign(child: &tokio::process::Child) -> io::Result<Self> {
             // SAFETY: FFI calls per the documented Win32 Job Object API,
@@ -410,6 +665,27 @@ mod windows_job {
             unsafe {
                 TerminateJobObject(self.handle, 1);
             }
+        }
+
+        /// Clear `KILL_ON_JOB_CLOSE` so normal completion can close this handle
+        /// without terminating descendants that deliberately outlive the leader.
+        pub(crate) fn release(&mut self) -> io::Result<()> {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `handle` is valid and `info` is the documented structure
+            // for this information class. A failure leaves kill-on-close armed;
+            // the caller then preserves the existing disarmed semantics.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    self.handle,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::addr_of_mut!(info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
 
@@ -510,6 +786,238 @@ mod tests {
             !test_env::grandchild_finished(&marker, started).await,
             "the grandchild's sleep completed — dropping the guard did not reach it"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn releasing_a_completed_group_closes_its_job_handle() {
+        use windows_sys::Win32::Foundation::GetHandleInformation;
+
+        let mut command = tokio::process::Command::new("cmd");
+        command
+            .args(["/c", "timeout /t 60 /nobreak >nul"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut group = super::ProcessGroup::attach(&child).unwrap();
+        let handle = group.job.raw_handle();
+
+        group.release().unwrap();
+        drop(group);
+        let mut flags = 0;
+        // SAFETY: `handle` was a Job Object handle and is only passed back to
+        // Win32 to confirm Drop closed it.
+        assert_eq!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "release must not kill the child"
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn git_runner_uses_a_direct_program_path_and_bounds_output() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let program = dir.path().join("fake-git.cmd");
+        #[cfg(not(windows))]
+        let program = dir.path().join("fake-git");
+        #[cfg(windows)]
+        std::fs::write(
+            &program,
+            "@echo 0123456789012345678901234567890123456789\r\n",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &program,
+                "#!/bin/sh\nprintf '0123456789012345678901234567890123456789\\n'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let result = super::GitRunner::new(&program).run(dir.path(), &[]).await;
+        assert_eq!(result.kind, super::GitRunKind::Completed);
+        assert_eq!(result.status, Some(0));
+        assert_eq!(
+            std::str::from_utf8(&result.stdout).unwrap().trim(),
+            "0123456789012345678901234567890123456789"
+        );
+        assert!(result.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_runner_kills_an_overflowing_program_without_waiting_for_its_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let program = dir.path().join("overflowing-git.cmd");
+        #[cfg(not(windows))]
+        let program = dir.path().join("overflowing-git");
+        #[cfg(windows)]
+        std::fs::write(
+            &program,
+            "@for /L %%i in (1,1,10000) do @echo 0123456789\r\n@timeout /t 5 /nobreak >nul\r\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let pid = dir.path().join("pid");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nyes x | head -c {}\nsleep 5\n",
+                    pid.display(),
+                    super::GitRunner::OUTPUT_LIMIT + 1
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::GitRunner::with_timeout(&program, std::time::Duration::from_secs(5))
+                .run(dir.path(), &[]),
+        )
+        .await
+        .expect("output overflow must not wait for the five-second child timeout");
+        assert_eq!(result.kind, super::GitRunKind::OutputOverflow);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(result.stdout.len() <= super::GitRunner::OUTPUT_LIMIT);
+        assert!(result.stderr.len() <= super::GitRunner::OUTPUT_LIMIT);
+        #[cfg(unix)]
+        {
+            let pid = std::fs::read_to_string(dir.path().join("pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(!super::process_alive(pid), "overflowing child was reaped");
+        }
+    }
+
+    #[tokio::test]
+    async fn git_runner_deadline_covers_readers_after_the_leader_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let program = dir.path().join("pipe-holding-git.cmd");
+        #[cfg(not(windows))]
+        let program = dir.path().join("pipe-holding-git");
+        #[cfg(windows)]
+        std::fs::write(
+            &program,
+            "@start /b cmd /c \"ping -n 61 127.0.0.1 >nul\"\r\n@exit /b 0\r\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let pid = dir.path().join("pipe-holder.pid");
+            std::fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\n(sleep 60) &\necho $! > '{}'\nexit 0\n",
+                    pid.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::GitRunner::with_timeout(&program, std::time::Duration::from_millis(100))
+                .run(dir.path(), &[]),
+        )
+        .await
+        .expect("the inherited pipe holder must not keep GitRunner alive");
+        assert_eq!(result.kind, super::GitRunKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        #[cfg(unix)]
+        {
+            let pid = std::fs::read_to_string(dir.path().join("pipe-holder.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(
+                !super::process_alive(pid),
+                "the descendant holding the pipe was not killed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_runner_removes_git_location_and_config_environment() {
+        static ENVIRONMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _environment = ENVIRONMENT.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let program = dir.path().join("environment-git.cmd");
+        #[cfg(not(windows))]
+        let program = dir.path().join("environment-git");
+        #[cfg(windows)]
+        std::fs::write(
+            &program,
+            "@if defined GIT_DIR exit /b 1\r\n@if defined GIT_WORK_TREE exit /b 1\r\n@if defined GIT_COMMON_DIR exit /b 1\r\n@if defined GIT_INDEX_FILE exit /b 1\r\n@if defined GIT_OBJECT_DIRECTORY exit /b 1\r\n@if defined GIT_ALTERNATE_OBJECT_DIRECTORIES exit /b 1\r\n@if defined GIT_CEILING_DIRECTORIES exit /b 1\r\n@if defined GIT_CONFIG_COUNT exit /b 1\r\n@if defined GIT_CONFIG_KEY_7 exit /b 1\r\n@if defined GIT_CONFIG_VALUE_7 exit /b 1\r\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &program,
+                "#!/bin/sh\nfor name in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES GIT_CONFIG_COUNT GIT_CONFIG_KEY_7 GIT_CONFIG_VALUE_7; do eval \"test \\${$name+x} != x\" || exit 1; done\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let names = [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_7",
+            "GIT_CONFIG_VALUE_7",
+        ];
+        let old = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        for name in names {
+            // SAFETY: the test serializes its own environment mutation and restores
+            // every variable before returning.
+            unsafe { std::env::set_var(name, "hrdr-test") };
+        }
+
+        let result = super::GitRunner::new(&program).run(dir.path(), &[]).await;
+
+        for (name, value) in old {
+            // SAFETY: restores the process environment changed above.
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+        assert_eq!(result.kind, super::GitRunKind::Completed);
+        assert_eq!(result.status, Some(0));
     }
 
     /// A bare name resolves to the file a `PATH` search finds — on Windows that

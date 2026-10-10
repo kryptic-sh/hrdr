@@ -11,6 +11,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`hrdr --build-info` reports executable provenance without starting a
   session.** It prints version, source commit, target, and build-time source
   state for safe self-update admission diagnostics.
+- **`hrdr update-check --json` performs non-mutating source admission.** It
+  reports sanitized checkout and live-origin findings without loading session
+  configuration or authorizing installation; exact GitHub CI validation follows.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

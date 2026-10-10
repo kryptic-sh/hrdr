@@ -173,6 +173,37 @@ fn build_info_exits_before_reading_invalid_config() {
 }
 
 #[test]
+fn update_check_exits_before_reading_invalid_config() {
+    let config_root = tempfile::tempdir().unwrap();
+    fs::create_dir(config_root.path().join("hrdr")).unwrap();
+    fs::write(config_root.path().join("hrdr/config.toml"), "not = [valid").unwrap();
+    let out = Command::new(bin())
+        .args(["update-check", "--json"])
+        .env("XDG_CONFIG_HOME", config_root.path())
+        .output()
+        .unwrap();
+    assert!(matches!(out.status.code(), Some(1 | 2)));
+    assert!(out.stderr.is_empty(), "stderr must not expose Git output");
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["eligible"], false);
+    assert_eq!(value["restart_available"], false);
+    assert_eq!(value["ci_status"], "not_checked");
+    assert!(matches!(
+        value["outcome"].as_str(),
+        Some("ineligible" | "unavailable")
+    ));
+}
+
+#[test]
+fn update_check_requires_json() {
+    let out = Command::new(bin()).arg("update-check").output().unwrap();
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--json"));
+}
+
+#[test]
 fn unchanged_builds_do_not_rerun_the_build_script() {
     let project = isolated_build_project();
     let counter_dir = tempfile::tempdir().unwrap();

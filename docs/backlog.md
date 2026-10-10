@@ -166,12 +166,15 @@ push each verified slice to `main` before proceeding to the next slice.
     exposes compile-time version, full commit (or `unknown`), target, and
     clean/dirty/unknown source state before startup config, trust, model, or
     session initialization. It is diagnostic only, not installation
-    authorization. Next implement read-only live source/origin/CI admission
-    before exposing update or restart controls. CI eligibility is approved:
-    require the latest `push` CI run and latest attempt on `main` for the exact
-    origin-repository hash, with verification and packaging jobs successful;
-    only tag-only publishing jobs may be skipped. Manual and older runs do not
-    qualify.
+    authorization. `hrdr update-check --json` now validates local cleanliness,
+    `main`, and live origin-main equality before configuration/session startup;
+    it emits only sanitized fixed-status diagnostics, bounds Git probes, and
+    remains ineligible until the next slice validates origin-repository CI. Next
+    implement that exact GitHub run/job admission before exposing update or
+    restart controls. CI eligibility is approved: require the latest `push` CI
+    run and latest attempt on `main` for the exact origin-repository hash, with
+    verification and packaging jobs successful; only tag-only publishing jobs
+    may be skipped. Manual and older runs do not qualify.
 12. **Windows multiline-paste transport investigation — deferred branch.**
     Pending work is preserved and pushed at `wip/windows-paste-transport` commit
     `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY

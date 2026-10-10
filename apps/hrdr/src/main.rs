@@ -19,6 +19,8 @@
 #[cfg(test)]
 extern crate hrdr_test_support;
 
+mod update_check;
+
 use std::io::Write;
 use std::time::Duration;
 
@@ -346,6 +348,12 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
     },
+    /// Inspect this checkout's source/origin update admission state.
+    UpdateCheck {
+        /// Emit the machine-readable diagnostic (required).
+        #[arg(long, required = true)]
+        json: bool,
+    },
     /// List available models, as `provider://model`, across every provider this
     /// machine is set up for.
     Models,
@@ -551,6 +559,12 @@ async fn main() -> Result<()> {
         use clap::CommandFactory;
         clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
         return Ok(());
+    }
+
+    if matches!(cli.command, Some(Command::UpdateCheck { json: true })) {
+        let (output, code) = update_check::run_json(std::path::Path::new(".")).await;
+        println!("{output}");
+        std::process::exit(code);
     }
 
     // A config still written in the old two-key form (`provider = …` beside
@@ -867,6 +881,8 @@ async fn main() -> Result<()> {
             run_headless(config, prompt.join(" "), json, quiet).await
         }
         Some(Command::Models) => list_models(config).await,
+        // `update-check` exited before configuration/trust/session startup.
+        Some(Command::UpdateCheck { .. }) => unreachable!("handled before configuration startup"),
         // Trailing words are a command for the TUI to run at startup — the same
         // line the input box would take. Joined, so `hrdr /model gpt-5` and
         // `hrdr "/model gpt-5"` mean the same thing.
