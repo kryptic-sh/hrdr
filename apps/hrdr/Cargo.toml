@@ -74,3 +74,6 @@ tempfile.workspace = true
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target."cfg(windows)".dev-dependencies]
+crossterm_winapi = "0.9.1"

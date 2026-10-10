@@ -1328,6 +1328,7 @@ dependencies = [
  "clap_complete_nushell",
  "clap_mangen",
  "crossterm",
+ "crossterm_winapi",
  "hrdr-agent",
  "hrdr-app",
  "hrdr-llm",

@@ -1373,6 +1373,7 @@ mod tests {
     /// `tokio` because several arms post their output through spawned tasks.
     #[tokio::test]
     async fn every_registered_command_is_recognized_by_dispatch() {
+        let _guard = CONFIG_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let mut host = TestHost::new(dir.path().to_path_buf());
 
@@ -1382,6 +1383,12 @@ mod tests {
         const HANDLED_ABOVE_DISPATCH: &[&str] = &["/exit", "/find", "/next", "/prev"];
 
         for (name, _) in crate::SLASH_COMMANDS {
+            if *name == "/statusbar" {
+                assert!(
+                    CONFIG_LOCK.try_lock().is_err(),
+                    "config-writing commands must hold CONFIG_LOCK"
+                );
+            }
             if HANDLED_ABOVE_DISPATCH.contains(name) {
                 assert!(
                     !dispatch(&mut host, name),
