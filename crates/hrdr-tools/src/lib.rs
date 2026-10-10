@@ -56,15 +56,20 @@ pub use lsp::{
 pub use mcp::McpClient;
 pub use memory::MemoryTool;
 pub use presentation::display_path;
-pub use proc::{GitRun, GitRunKind, GitRunner, process_alive, resolve_program};
+pub use proc::{
+    CommandEnvironment, CommandRun as CommandProbeRun, CommandRunKind,
+    CommandRunKind as CommandProbeRunKind, CommandRunner, CommandRunner as CommandProbeRunner,
+    GitRun, GitRunKind, GitRunner, process_alive, resolve_program,
+};
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
 pub use tools::cron::{CronTool, arm_crons};
 pub use tools::{
-    CommandRun, DEFAULT_TOOL_TIMEOUT_SECS, DEFAULT_VERIFY_TIMEOUT_SECS,
-    DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, EditTool, FindTool, GoalTool,
-    GrepTool, LsTool, ReadTool, ReplaceTool, Shell, ShellTool, TodoTool, TreeTool, VerifyTool,
-    WatchTool, WriteTool, available_shell_tools, redact_secret_diffs, run_user_command,
+    CommandRun, CommandRun as ShellCommandRun, DEFAULT_TOOL_TIMEOUT_SECS,
+    DEFAULT_VERIFY_TIMEOUT_SECS, DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, EditTool,
+    FindTool, GoalTool, GrepTool, LsTool, ReadTool, ReplaceTool, Shell, ShellTool, TodoTool,
+    TreeTool, VerifyTool, WatchTool, WriteTool, available_shell_tools, redact_secret_diffs,
+    run_user_command,
 };
 pub use verification::{CheckKind, Scope, VerificationLedger};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -2611,6 +2616,19 @@ pub fn floor_char_boundary(s: &str, max: usize) -> usize {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn root_command_run_remains_the_shell_result() {
+        let run: CommandRun = CommandRun {
+            output: "shell output".to_string(),
+            passed: true,
+            exit_code: Some(0),
+        };
+        let alias: ShellCommandRun = run;
+        assert!(alias.passed);
+        assert_eq!(alias.output, "shell output");
+        assert_eq!(alias.exit_code, Some(0));
+    }
 
     #[test]
     fn normalizes_cron_and_goal_content() {

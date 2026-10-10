@@ -78,13 +78,20 @@ pub fn resolve_program(program: &str, path: Option<&OsStr>) -> OsString {
 ///
 /// It never invokes a shell, inherits no stdin, captures both streams concurrently
 /// up to `OUTPUT_LIMIT`, and kills/reaps the process tree when the deadline expires.
-pub struct GitRunner {
+pub struct CommandRunner {
     program: PathBuf,
     timeout: Duration,
+    environment: CommandEnvironment,
+}
+
+#[derive(Clone, Copy)]
+pub enum CommandEnvironment {
+    Inherit,
+    Git,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitRunKind {
+pub enum CommandRunKind {
     Completed,
     SpawnFailed,
     TimedOut,
@@ -92,17 +99,49 @@ pub enum GitRunKind {
 }
 
 #[derive(Debug)]
-pub struct GitRun {
-    pub kind: GitRunKind,
+pub struct CommandRun {
+    pub kind: CommandRunKind,
     pub status: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
+/// Backwards-compatible Git probe runner.
+///
+/// Unlike the generic [`CommandRunner`], this always strips inherited Git
+/// location and configuration variables before starting its child.
+pub struct GitRunner(CommandRunner);
+
+/// Result returned by [`GitRunner`].
+pub type GitRun = CommandRun;
+
+/// Completion kind returned by [`GitRunner`].
+pub type GitRunKind = CommandRunKind;
+
 impl GitRunner {
+    pub const OUTPUT_LIMIT: usize = CommandRunner::OUTPUT_LIMIT;
+
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self(CommandRunner::git(program))
+    }
+
+    pub async fn run(&self, cwd: &Path, args: &[&str]) -> GitRun {
+        self.0.run(cwd, args).await
+    }
+}
+
+impl CommandRunner {
     pub const OUTPUT_LIMIT: usize = 16 * 1024;
 
     pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self::with_environment(program, CommandEnvironment::Inherit)
+    }
+
+    pub fn git(program: impl Into<PathBuf>) -> Self {
+        Self::with_environment(program, CommandEnvironment::Git)
+    }
+
+    fn with_environment(program: impl Into<PathBuf>, environment: CommandEnvironment) -> Self {
         let program = program.into();
         let program = program
             .to_str()
@@ -112,6 +151,7 @@ impl GitRunner {
         Self {
             program,
             timeout: Duration::from_secs(5),
+            environment,
         }
     }
 
@@ -122,7 +162,7 @@ impl GitRunner {
         runner
     }
 
-    pub async fn run(&self, cwd: &Path, args: &[&str]) -> GitRun {
+    pub async fn run(&self, cwd: &Path, args: &[&str]) -> CommandRun {
         let mut command = Command::new(&self.program);
         command
             .current_dir(cwd)
@@ -131,10 +171,12 @@ impl GitRunner {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        sanitize_git_environment(&mut command);
+        if matches!(self.environment, CommandEnvironment::Git) {
+            sanitize_git_environment(&mut command);
+        }
         let Ok((mut child, mut group)) = spawn_group(&mut command) else {
-            return GitRun {
-                kind: GitRunKind::SpawnFailed,
+            return CommandRun {
+                kind: CommandRunKind::SpawnFailed,
                 status: None,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
@@ -200,11 +242,11 @@ impl GitRunner {
         let _ = stderr_task.await;
 
         let kind = match outcome {
-            RunOutcome::Completed => GitRunKind::Completed,
-            RunOutcome::TimedOut | RunOutcome::Failed => GitRunKind::TimedOut,
-            RunOutcome::OutputOverflow => GitRunKind::OutputOverflow,
+            RunOutcome::Completed => CommandRunKind::Completed,
+            RunOutcome::TimedOut | RunOutcome::Failed => CommandRunKind::TimedOut,
+            RunOutcome::OutputOverflow => CommandRunKind::OutputOverflow,
         };
-        GitRun {
+        CommandRun {
             kind,
             status: status.and_then(|status| status.code()),
             stdout,
@@ -281,7 +323,7 @@ async fn read_limited<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> (Vec<u8
         if read == 0 {
             return (output, false);
         }
-        let remaining = GitRunner::OUTPUT_LIMIT.saturating_sub(output.len());
+        let remaining = CommandRunner::OUTPUT_LIMIT.saturating_sub(output.len());
         let keep = remaining.min(read);
         output.extend_from_slice(&buf[..keep]);
         if keep != read {
@@ -537,7 +579,7 @@ impl ProcessGroup {
     }
 
     /// Make normal completion harmless before this guard closes its OS resource.
-    /// GitRunner calls this only after reaping the leader and observing EOF on
+    /// CommandRunner calls this only after reaping the leader and observing EOF on
     /// both captured streams.
     pub(crate) fn release(&mut self) -> io::Result<()> {
         #[cfg(unix)]
@@ -842,8 +884,10 @@ mod tests {
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let result = super::GitRunner::new(&program).run(dir.path(), &[]).await;
-        assert_eq!(result.kind, super::GitRunKind::Completed);
+        let result = super::CommandRunner::new(&program)
+            .run(dir.path(), &[])
+            .await;
+        assert_eq!(result.kind, super::CommandRunKind::Completed);
         assert_eq!(result.status, Some(0));
         assert_eq!(
             std::str::from_utf8(&result.stdout).unwrap().trim(),
@@ -874,7 +918,7 @@ mod tests {
                 format!(
                     "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nyes x | head -c {}\nsleep 5\n",
                     pid.display(),
-                    super::GitRunner::OUTPUT_LIMIT + 1
+                    super::CommandRunner::OUTPUT_LIMIT + 1
                 ),
             )
             .unwrap();
@@ -884,15 +928,15 @@ mod tests {
         let started = Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::GitRunner::with_timeout(&program, std::time::Duration::from_secs(5))
+            super::CommandRunner::with_timeout(&program, std::time::Duration::from_secs(5))
                 .run(dir.path(), &[]),
         )
         .await
         .expect("output overflow must not wait for the five-second child timeout");
-        assert_eq!(result.kind, super::GitRunKind::OutputOverflow);
+        assert_eq!(result.kind, super::CommandRunKind::OutputOverflow);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        assert!(result.stdout.len() <= super::GitRunner::OUTPUT_LIMIT);
-        assert!(result.stderr.len() <= super::GitRunner::OUTPUT_LIMIT);
+        assert!(result.stdout.len() <= super::CommandRunner::OUTPUT_LIMIT);
+        assert!(result.stderr.len() <= super::CommandRunner::OUTPUT_LIMIT);
         #[cfg(unix)]
         {
             let pid = std::fs::read_to_string(dir.path().join("pid"))
@@ -935,12 +979,12 @@ mod tests {
         let started = Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            super::GitRunner::with_timeout(&program, std::time::Duration::from_millis(100))
+            super::CommandRunner::with_timeout(&program, std::time::Duration::from_millis(100))
                 .run(dir.path(), &[]),
         )
         .await
-        .expect("the inherited pipe holder must not keep GitRunner alive");
-        assert_eq!(result.kind, super::GitRunKind::TimedOut);
+        .expect("the inherited pipe holder must not keep CommandRunner alive");
+        assert_eq!(result.kind, super::CommandRunKind::TimedOut);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         #[cfg(unix)]
         {
@@ -956,10 +1000,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn git_runner_removes_git_location_and_config_environment() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "proc::tests::git_runner_removes_git_location_and_config_environment_in_child",
+            ])
+            .env("GIT_DIR", "hrdr-test")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child test failed: {status}");
+    }
+
     #[tokio::test]
-    async fn git_runner_removes_git_location_and_config_environment() {
-        static ENVIRONMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _environment = ENVIRONMENT.lock().await;
+    async fn git_runner_removes_git_location_and_config_environment_in_child() {
+        if std::env::var_os("GIT_DIR").is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         #[cfg(windows)]
         let program = dir.path().join("environment-git.cmd");
@@ -968,7 +1026,7 @@ mod tests {
         #[cfg(windows)]
         std::fs::write(
             &program,
-            "@if defined GIT_DIR exit /b 1\r\n@if defined GIT_WORK_TREE exit /b 1\r\n@if defined GIT_COMMON_DIR exit /b 1\r\n@if defined GIT_INDEX_FILE exit /b 1\r\n@if defined GIT_OBJECT_DIRECTORY exit /b 1\r\n@if defined GIT_ALTERNATE_OBJECT_DIRECTORIES exit /b 1\r\n@if defined GIT_CEILING_DIRECTORIES exit /b 1\r\n@if defined GIT_CONFIG_COUNT exit /b 1\r\n@if defined GIT_CONFIG_KEY_7 exit /b 1\r\n@if defined GIT_CONFIG_VALUE_7 exit /b 1\r\n",
+            "@if \"%1\"==\"git\" (@if defined GIT_DIR exit /b 1) else (@if not \"%GIT_DIR%\"==\"hrdr-test\" exit /b 1)\r\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -976,47 +1034,65 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::write(
                 &program,
-                "#!/bin/sh\nfor name in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES GIT_CONFIG_COUNT GIT_CONFIG_KEY_7 GIT_CONFIG_VALUE_7; do eval \"test \\${$name+x} != x\" || exit 1; done\n",
+                "#!/bin/sh\nif [ \"$1\" = git ]; then test -z \"${GIT_DIR+x}\"; else test \"$GIT_DIR\" = hrdr-test; fi\n",
             )
             .unwrap();
             std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let names = [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_CEILING_DIRECTORIES",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_KEY_7",
-            "GIT_CONFIG_VALUE_7",
-        ];
-        let old = names
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect::<Vec<_>>();
-        for name in names {
-            // SAFETY: the test serializes its own environment mutation and restores
-            // every variable before returning.
-            unsafe { std::env::set_var(name, "hrdr-test") };
+        let git_result = super::GitRunner::new(&program)
+            .run(dir.path(), &["git"])
+            .await;
+        let generic_result = super::CommandRunner::new(&program)
+            .run(dir.path(), &["generic"])
+            .await;
+
+        assert_eq!(git_result.kind, super::GitRunKind::Completed);
+        assert_eq!(git_result.status, Some(0));
+        assert_eq!(generic_result.kind, super::CommandRunKind::Completed);
+        assert_eq!(generic_result.status, Some(0));
+    }
+
+    #[tokio::test]
+    async fn normal_runner_preserves_github_environment() {
+        static ENVIRONMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _environment = ENVIRONMENT.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let program = dir.path().join("environment-gh.cmd");
+        #[cfg(not(windows))]
+        let program = dir.path().join("environment-gh");
+        #[cfg(windows)]
+        std::fs::write(
+            &program,
+            "@if not \"%GH_TOKEN%\"==\"hrdr-test-token\" exit /b 1\r\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &program,
+                "#!/bin/sh\ntest \"$GH_TOKEN\" = hrdr-test-token\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-
-        let result = super::GitRunner::new(&program).run(dir.path(), &[]).await;
-
-        for (name, value) in old {
-            // SAFETY: restores the process environment changed above.
-            unsafe {
-                if let Some(value) = value {
-                    std::env::set_var(name, value);
-                } else {
-                    std::env::remove_var(name);
-                }
+        let old = std::env::var_os("GH_TOKEN");
+        // SAFETY: the test serializes and restores this process-wide variable.
+        unsafe { std::env::set_var("GH_TOKEN", "hrdr-test-token") };
+        let result = super::CommandRunner::new(&program)
+            .run(dir.path(), &[])
+            .await;
+        // SAFETY: restores the process environment changed above.
+        unsafe {
+            if let Some(value) = old {
+                std::env::set_var("GH_TOKEN", value)
+            } else {
+                std::env::remove_var("GH_TOKEN")
             }
-        }
-        assert_eq!(result.kind, super::GitRunKind::Completed);
+        };
+        assert_eq!(result.kind, super::CommandRunKind::Completed);
         assert_eq!(result.status, Some(0));
     }
 
