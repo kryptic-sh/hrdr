@@ -122,6 +122,10 @@ fn chrome_fragment(colour: crossterm::style::Color, text: &str) {
     subcommand_precedence_over_arg = true,
 )]
 struct Cli {
+    /// Print the executable's build identity and exit.
+    #[arg(long)]
+    build_info: bool,
+
     /// The model to run, as `provider://model` (`chatgpt://gpt-5.5`,
     /// `openrouter://deepseek/deepseek-chat`) — which also sets the provider's
     /// endpoint and key — or a bare model id (`gpt-5.5`), which is that model on
@@ -528,6 +532,14 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if cli.build_info {
+        println!("version: {}", env!("CARGO_PKG_VERSION"));
+        println!("commit: {}", env!("HRDR_BUILD_COMMIT"));
+        println!("target: {}", env!("HRDR_BUILD_TARGET"));
+        println!("source: {}", env!("HRDR_BUILD_SOURCE_STATE"));
+        return Ok(());
+    }
 
     // Packaging helpers (hidden): emit completions / man page and exit.
     if let Some(shell) = cli.completions {
