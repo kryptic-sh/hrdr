@@ -2487,6 +2487,15 @@ and **not** fixed.
   submissions, complete paste preservation within the existing paste cap, and
   ordinary explicit Enter submission afterward. Do not claim cross-platform
   correctness from Windows-only tests or synthetic `Event::Paste` tests alone.
+  Windows-only transport probes now use `crossterm_winapi` in the test target.
+  With VT input enabled after mouse setup (mode `664`), complete frames preserve
+  framing and payload, but fragmented delimiters lose their prefixes through
+  both raw console records and stdin. The affected inbox `conhost.exe` is
+  `10.0.26100.1`; Microsoft PR #17738 fixes this class of ConPTY loss upstream.
+  Before vendoring Crossterm, run the isolated pinned ConPTY-host comparison
+  recorded on `wip/windows-paste-transport`, verifying loaded DLL and host
+  paths. The real LF/CRLF regressions remain intentionally red: each submits two
+  requests before explicit Enter. Do not weaken their fragmented framing.
 - **`cwd_slug` hashes the raw `current_dir()`.** Windows keeps whatever drive
   and path case the shell was started with (VS Code's terminal uses `c:\`), so
   one project can get two session folders and `/resume` cannot see the other's
@@ -2523,13 +2532,14 @@ and **not** fixed.
   or guarantee terminal blink timing; restoration after output failure is best
   effort. Coverage still excludes `Write` forwarding/short writes, autoresize
   size/clear failures, and restoration-flush failure/panic injection.
-- **Parallel config-mutation test failure:** During cursor-adapter verification,
-  the ordinary parallel workspace suite failed in
-  `config_mutation_path_style_host_forwarding` at
-  `host.info_log.last().unwrap()`. The serial suite and nextest passed.
-  Investigate shared environment/config state before attributing the failure or
-  changing the test; do not treat serial success as proof that parallel
-  execution is reliable.
+- **Config-test isolation fix awaiting commit:** The registry-dispatch test
+  invokes config-writing `/statusbar` without the mutex used by
+  `config_mutation_path_style_host_forwarding` and its invalid-UTF8 fixture. Its
+  pending fix takes `CONFIG_LOCK`; the guard-coverage assertion failed without
+  the lock and passed with it. `cargo test --locked -p hrdr-app --lib` reported
+  176 passed. The full gate remains blocked by the real paste regressions (2364
+  passed, 2 failed, 7 skipped), so this fix is uncommitted. The historical race
+  schedule was not reproduced.
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage

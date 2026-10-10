@@ -66,3 +66,6 @@ hrdr-test-support.workspace = true
 # panic hook, the terminal restore. Those are exactly the parts that break per-OS.
 portable-pty = "0.9"
 tempfile.workspace = true
+
+[target."cfg(windows)".dev-dependencies]
+crossterm_winapi = "0.9.1"

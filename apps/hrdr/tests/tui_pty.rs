@@ -519,6 +519,321 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            if let Err(error) = self.child.kill() {
+                eprintln!("could not kill PTY child during cleanup: {error}");
+                return;
+            }
+            if let Err(error) = self.child.wait() {
+                eprintln!("could not reap PTY child during cleanup: {error}");
+            }
+        }
+    }
+}
+
+fn bracketed_paste_stays_in_the_draft(newline: &str) {
+    if skip_for_want_of_a_pty() {
+        return;
+    }
+    let server = MockServer::start(vec![Chat::Sse(vec![
+        text_chunk("paste", "PASTE_REPLY_COMPLETE"),
+        stop_chunk("paste"),
+        "[DONE]".to_string(),
+    ])]);
+    let mut session = Session::spawn(&server.base_url());
+    session.wait_for("mock-model", BOOT);
+    let payload = format!("paste café 🦀{newline}second line{newline}PASTE_INPUT_CONSUMEDΩ");
+    // Separate writes exercise partial framing without relying on an OS read
+    // preserving write boundaries.
+    for fragment in ["\x1b[20", "0~", &payload, "\x1b[2", "01~"] {
+        session.send(fragment);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // The final glyph follows every newline and is absent from the initial UI.
+    // A single glyph also survives incremental terminal redraws splitting words.
+    session.wait_for("Ω", EXIT);
+    let before_enter = server.chat_bodies();
+    assert!(
+        before_enter.is_empty(),
+        "paste submitted {} requests before explicit Enter ({newline:?})",
+        before_enter.len()
+    );
+    session.send("\r");
+    session.wait_for("PASTE_REPLY_COMPLETE", EXIT);
+    session.send("\x11");
+    assert!(session.wait_exit(EXIT).success());
+    let bodies = server.chat_bodies();
+    assert_eq!(
+        bodies.len(),
+        1,
+        "one paste must produce one request: {bodies:#?}"
+    );
+    let messages = bodies[0]["messages"].as_array().expect("messages array");
+    let user = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .expect("user message");
+    assert_eq!(user["content"], payload.replace("\r\n", "\n"));
+}
+
+#[test]
+fn bracketed_paste_lf_waits_for_explicit_enter() {
+    bracketed_paste_stays_in_the_draft("\n");
+}
+
+#[test]
+fn bracketed_paste_crlf_waits_for_explicit_enter() {
+    bracketed_paste_stays_in_the_draft("\r\n");
+}
+
+/// Explicit child entry point: never reads the invoking terminal unless the
+/// isolated PTY parent supplied the guard variable.
+#[cfg(windows)]
+#[test]
+#[ignore = "spawned only by console_records_preserve_framed_paste"]
+fn console_record_child() -> std::io::Result<()> {
+    console_input_child(false)
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "spawned only by console_stream_preserves_framed_paste"]
+fn console_stream_child() -> std::io::Result<()> {
+    console_input_child(true)
+}
+
+#[cfg(windows)]
+fn console_input_child(stream: bool) -> std::io::Result<()> {
+    if std::env::var_os("HRDR_PTY_EVENT_CHILD").is_none() {
+        return Ok(());
+    }
+    use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
+    use crossterm_winapi::{Console, ConsoleMode, Handle, InputRecord};
+
+    // SetConsoleMode's ENABLE_VIRTUAL_TERMINAL_INPUT ABI flag.
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    struct RestoreMode(ConsoleMode, u32);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            if let Err(error) = self.0.set_mode(self.1) {
+                eprintln!("restore input mode failed: {error}");
+            }
+        }
+    }
+    let mode = ConsoleMode::from(Handle::current_in_handle()?);
+    let original = mode.mode()?;
+    let restore = RestoreMode(mode, original);
+    let mut out = std::io::stdout();
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(out, EnableBracketedPaste, EnableMouseCapture)?;
+    let after_mouse = restore.0.mode()?;
+    let requested = if std::env::var_os("HRDR_PTY_NO_VT").is_some() {
+        after_mouse & !ENABLE_VIRTUAL_TERMINAL_INPUT
+    } else {
+        after_mouse | ENABLE_VIRTUAL_TERMINAL_INPUT
+    };
+    restore.0.set_mode(requested)?;
+    let readback = restore.0.mode()?;
+    writeln!(
+        out,
+        "MODE {original} {after_mouse} {requested} {readback}\r"
+    )?;
+    assert_eq!(readback, requested);
+    writeln!(out, "EVENT_CHILD_READY\r")?;
+    out.flush()?;
+    if stream {
+        // Blocking stdin is bounded only by the parent's timeout/kill; this is
+        // a preservation experiment, not a production cancellation mechanism.
+        let mut input = std::io::stdin().lock();
+        let mut bytes = [0; 256];
+        loop {
+            let count = input.read(&mut bytes)?;
+            assert_ne!(count, 0, "stdin ended before sentinel");
+            for byte in &bytes[..count] {
+                writeln!(out, "BYTE {byte} END\r")?;
+            }
+            out.flush()?;
+            if bytes[..count].contains(&b'!') {
+                restore.0.set_mode(original)?;
+                writeln!(out, "RESTORED {}\r", restore.0.mode()?)?;
+                out.flush()?;
+                return Ok(());
+            }
+        }
+    }
+    let console = Console::from(Handle::current_in_handle()?);
+    let deadline = Instant::now() + EXIT;
+    loop {
+        assert!(Instant::now() < deadline, "raw record child timed out");
+        for record in console.read_console_input()? {
+            if let InputRecord::KeyEvent(key) = record {
+                let modifiers = (0..u32::BITS)
+                    .map(|bit| 1u32 << bit)
+                    .filter(|bit| key.control_key_state.has_state(*bit))
+                    .fold(0, |state, bit| state | bit);
+                writeln!(
+                    out,
+                    "RECORD {} {} {} {} {} END\r",
+                    key.u_char,
+                    u8::from(key.key_down),
+                    key.virtual_key_code,
+                    modifiers,
+                    key.repeat_count
+                )?;
+                out.flush()?;
+                // This ASCII sentinel is outside the payload, independent of
+                // control-key translation and the bracketed-paste delimiters.
+                if key.key_down && key.u_char == u16::from(b'!') {
+                    restore.0.set_mode(original)?;
+                    writeln!(out, "RESTORED {}\r", restore.0.mode()?)?;
+                    out.flush()?;
+                    return Ok(());
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn console_records_preserve_framed_paste() {
+    console_input_preserves_framed_paste(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn console_stream_preserves_framed_paste() {
+    console_input_preserves_framed_paste(true);
+}
+
+#[cfg(windows)]
+fn console_input_preserves_framed_paste(stream: bool) {
+    if skip_for_want_of_a_pty() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("event pty");
+    let mut cmd = CommandBuilder::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        if stream {
+            "console_stream_child"
+        } else {
+            "console_record_child"
+        },
+        "--ignored",
+        "--nocapture",
+    ]);
+    cmd.env("HRDR_PTY_EVENT_CHILD", "1");
+    cmd.env("TERM", "xterm-256color");
+    cmd.cwd(project.path());
+    let child = pty.slave.spawn_command(cmd).expect("spawn event child");
+    drop(pty.slave);
+    let writer = Arc::new(Mutex::new(pty.master.take_writer().unwrap()));
+    let screen = common::drain_pty(pty.master.try_clone_reader().unwrap(), Arc::clone(&writer));
+    let mut session = Session {
+        child,
+        master: pty.master,
+        writer,
+        screen,
+        _home: home,
+        _project: project,
+        _runtime: runtime,
+    };
+    session.wait_for("EVENT_CHILD_READY", BOOT);
+    let payload = "paste café 🦀\nLF\rCR\r\nCRLF\t\x01\x08\x7fΩ";
+    let framed = format!("\x1b[200~{payload}\x1b[201~");
+    session.send(&framed);
+    for fragment in ["\x1b[20", "0~", payload, "\x1b[2", "01~"] {
+        session.send(fragment);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    session.send("!");
+    assert!(session.wait_exit(EXIT).success());
+    std::thread::sleep(DRAIN);
+    let trace = session.snapshot();
+    println!("{trace}");
+    if stream {
+        let bytes: Vec<u8> = trace
+            .split("BYTE ")
+            .skip(1)
+            .map(|record| {
+                record
+                    .split(" END")
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .expect("numeric byte")
+            })
+            .collect();
+        assert_eq!(
+            bytes,
+            format!("{framed}{framed}!").as_bytes(),
+            "stdin UTF-8 must preserve both write shapes; trace:\n{trace}"
+        );
+    } else {
+        let units: Vec<u16> = trace
+            .split("RECORD ")
+            .skip(1)
+            .flat_map(|record| {
+                let fields: Vec<u16> = record
+                    .split(" END")
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .map(|field| field.parse().expect("numeric record field"))
+                    .collect();
+                assert_eq!(fields.len(), 5, "malformed record: {record}");
+                // Alt-code text arrives on VK_MENU release, including surrogate
+                // units. Modifier-only records have no text; do not restrict text
+                // to virtual-key zero or key-down records.
+                const VK_MENU: u16 = 0x12;
+                let carries_text =
+                    fields[0] != 0 && (fields[1] == 1 || (fields[1] == 0 && fields[2] == VK_MENU));
+                std::iter::repeat_n(
+                    fields[0],
+                    if carries_text {
+                        usize::from(fields[4])
+                    } else {
+                        0
+                    },
+                )
+            })
+            .collect();
+        let expected: Vec<u16> = format!("{framed}{framed}!").encode_utf16().collect();
+        assert_eq!(
+            units, expected,
+            "raw UTF-16 must preserve both write shapes; trace:\n{trace}"
+        );
+    }
+    let mode_fields: Vec<u32> = trace
+        .split("MODE ")
+        .nth(1)
+        .expect("mode trace")
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .map(|field| field.parse().expect("numeric mode field"))
+        .collect();
+    assert_eq!(mode_fields.len(), 4);
+    assert_eq!(mode_fields[2], mode_fields[3]);
+    assert!(trace.contains(&format!("RESTORED {}", mode_fields[0])));
+}
+
 /// 7. A submitted prompt drives a turn against the mock, and the streamed reply
 ///    renders on screen; the app then quits cleanly.
 #[test]
