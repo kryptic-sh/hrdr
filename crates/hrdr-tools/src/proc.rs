@@ -964,12 +964,12 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let pid = dir.path().join("pipe-holder.pid");
+            let marker = dir.path().join("pipe-holder-finished");
             std::fs::write(
                 &program,
                 format!(
-                    "#!/bin/sh\n(sleep 60) &\necho $! > '{}'\nexit 0\n",
-                    pid.display()
+                    "#!/bin/sh\n(\n  sleep 1\n  : > '{}'\n  sleep 60\n) >&1 2>&2 &\nexit 0\n",
+                    marker.display()
                 ),
             )
             .unwrap();
@@ -988,14 +988,13 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         #[cfg(unix)]
         {
-            let pid = std::fs::read_to_string(dir.path().join("pipe-holder.pid"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            // The background subshell inherits both captured streams and writes
+            // the marker after a delay before its long sleep. An escaped
+            // descendant reaches the marker; a killed one never does.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             assert!(
-                !super::process_alive(pid),
-                "the descendant holding the pipe was not killed"
+                !dir.path().join("pipe-holder-finished").exists(),
+                "the descendant holding the pipes was not killed"
             );
         }
     }
