@@ -24,6 +24,12 @@ use serde::{Deserialize, Serialize};
 /// deadlock while avoiding false reaping of a lock that a slow filesystem or
 /// a concurrent process legitimately holds.
 const STALE_LOCK_AGE_SECS: u64 = 60;
+/// Retry a Windows delete-pending open-lock before refusing recovery. A source
+/// process may have exited and released its guard while NTFS still holds the
+/// final deletion handle; treating that brief `PermissionDenied` as a live owner
+/// would strand a committed handoff.
+const OPEN_LOCK_ACQUIRE_ATTEMPTS: u32 = 100;
+const OPEN_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// v2: the identity is ONE key — `model: "provider://model"` — where v1 wrote
 /// `model` and `provider` side by side. A v1 file still loads (see
@@ -736,7 +742,7 @@ fn acquire_open_lock_mode(
     allow_degraded: bool,
 ) -> Result<SessionLock, SessionBusy> {
     let lock_path = open_lock_path(dir, id);
-    loop {
+    for _ in 0..OPEN_LOCK_ACQUIRE_ATTEMPTS {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -762,6 +768,12 @@ fn acquire_open_lock_mode(
                 }
                 return Err(read_open_lock_owner(&lock_path));
             }
+            Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Windows reports a just-deleted lock as access denied until its
+                // last handle closes. It cannot prove a live owner, so wait for
+                // that cleanup to settle, then retry the exclusive create.
+                std::thread::sleep(OPEN_LOCK_RETRY_DELAY);
+            }
             // New-session creation may retain the documented best-effort mode.
             // Existing sessions fail closed: an unbacked guard cannot prove exclusive
             // ownership, so report it as unavailable rather than loading the snapshot.
@@ -776,6 +788,7 @@ fn acquire_open_lock_mode(
             Err(_) => return Err(SessionBusy { pid: 0, started: 0 }),
         }
     }
+    Err(SessionBusy { pid: 0, started: 0 })
 }
 
 /// Acquire the open-lock for an already-saved session. Lock creation failures are
@@ -3266,6 +3279,37 @@ mod tests {
             !lock_path.exists(),
             "an un-backed guard leaves no lock file behind"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_open_lock_retries_delete_pending_cleanup() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_ALL: u32 = 0x0000_0007;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".chat.open.lock");
+        std::fs::write(&lock_path, b"old lock").unwrap();
+        let (ready, wait_for_cleanup) = std::sync::mpsc::channel();
+        let cleanup_path = lock_path.clone();
+        let cleanup = std::thread::spawn(move || {
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_ALL)
+                .open(&cleanup_path)
+                .unwrap();
+            std::fs::remove_file(&cleanup_path).unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        wait_for_cleanup.recv().unwrap();
+
+        let acquired = acquire_existing_open_lock(dir.path(), "chat");
+        cleanup.join().unwrap();
+        let lock = acquired.expect("delete-pending cleanup is retried");
+        assert!(lock.is_backed());
     }
 
     #[test]

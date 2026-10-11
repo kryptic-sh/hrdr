@@ -1260,17 +1260,17 @@ mod tests {
         .unwrap();
 
         assert!(launch(&script, "saved-session", temp.path(), None));
+        let expected = format!(
+            "{}|__recover-handoff|saved-session\r\n",
+            temp.path().display()
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !marker.exists() && std::time::Instant::now() < deadline {
+        while fs::read_to_string(&marker).ok().as_deref() != Some(expected.as_str())
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(
-            fs::read_to_string(marker).unwrap(),
-            format!(
-                "{}|__recover-handoff|saved-session\r\n",
-                temp.path().display()
-            )
-        );
+        assert_eq!(fs::read_to_string(marker).unwrap(), expected);
     }
 
     #[cfg(windows)]
