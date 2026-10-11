@@ -39,6 +39,16 @@ impl UpdateOperationId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Mint an opaque operation id from operating-system randomness.
+    pub fn random() -> Self {
+        use rand::RngExt;
+
+        let mut bytes = [0u8; 16];
+        rand::rng().fill(&mut bytes);
+        let value = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        Self(value)
+    }
 }
 
 /// Durable evidence returned by a completed update tool call.
@@ -129,11 +139,7 @@ pub fn validate_successful_update(
             {
                 continue;
             }
-            let Ok(evidence) = serde_json::from_str::<SuccessfulUpdate>(&call.function.arguments)
-            else {
-                continue;
-            };
-            if evidence.operation_id != *operation_id {
+            if call.function.arguments != "{}" {
                 continue;
             }
             let Some(result) = messages.get(index + 1) else {
@@ -642,7 +648,7 @@ mod tests {
         let operation = UpdateOperationId::new("op-1").unwrap();
         let assistant: crate::Message = serde_json::from_value(serde_json::json!({
             "role": "assistant",
-            "tool_calls": [{"id":"call-1","type":"function","function":{"name":"update","arguments":"{\"operation_id\":\"op-1\"}"}}]
+            "tool_calls": [{"id":"call-1","type":"function","function":{"name":"update","arguments":"{}"}}]
         }))
         .unwrap();
         let result = crate::Message::tool_result("call-1", r#"{"operation_id":"op-1"}"#);

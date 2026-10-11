@@ -87,7 +87,10 @@ mod completion;
 use completion::CompletionKind;
 mod handoff;
 pub(crate) use handoff::validate_handoff_payload;
-pub use handoff::{AdmittedUpdate, PreparedUpdateCoordinator};
+pub use handoff::{
+    AdmittedUpdate, DeferredUpdate, PreparedUpdateCoordinator, UpdateRequestReceiver,
+    UpdateRequestSender, update_request_bridge,
+};
 mod selector;
 mod session;
 mod util;
@@ -281,6 +284,8 @@ pub(crate) enum TurnMsg {
     UserShell(AgentEvent, Option<String>),
     /// Turn finished; `Some` carries an error string.
     Done(Option<String>),
+    /// A deferred update coordinator was prepared after the requesting turn ended.
+    UpdatePrepared(Result<AdmittedUpdate, String>),
     /// An off-thread session save finished: `Ok(path)` once the snapshot is
     /// atomically on disk, or the error. Sent by the save task spawned by
     /// [`App::enqueue_save`]; the coalescer's in-flight flag clears here.
@@ -768,6 +773,11 @@ pub(crate) struct App {
     /// NOT a steer — a steer reaches the model mid-turn; a compaction must wait
     /// for the turn to finish so the summary sees the whole conversation.
     pending_compaction: Option<(hrdr_app::PaneId, Option<String>)>,
+    /// A frontend-owned update request, deferred until the requesting turn is done.
+    update_requests: Option<UpdateRequestReceiver>,
+    pending_update: Option<Box<dyn DeferredUpdate>>,
+    update_preparing: bool,
+    admitted_update: Option<AdmittedUpdate>,
     /// A slash command's data output (`/status`, `/cost`, `/help`, …) shown
     /// in an Esc-dismissible popup. `None` when nothing is open.
     pub(crate) popup: Option<NoticePopup>,
@@ -1081,6 +1091,10 @@ impl App {
             todo_ttl,
             steering: hrdr_agent::steering_queue(),
             pending_compaction: None,
+            update_requests: None,
+            pending_update: None,
+            update_preparing: false,
+            admitted_update: None,
             popup: None,
             end_button: None,
             tool_hits: Vec::new(),
@@ -1261,32 +1275,34 @@ impl App {
         })
     }
 
+    /// Activate an attested update continuation exactly once, without introducing
+    /// user input or replaying the model/tool exchange that produced the handoff.
+    pub(crate) fn activate_update_continuation(&mut self) -> bool {
+        if self.passive_recovery != Some(HandoffIntent::UpdateContinuation)
+            || self.recovery_confirmation_used
+        {
+            return false;
+        }
+        self.recovery_confirmation_used = true;
+        let Some(state) = self.recovery_state.take() else {
+            self.system("recovery checkpoint is unavailable".to_string());
+            self.should_quit = true;
+            return false;
+        };
+        self.handoff_gate = false;
+        self.passive_recovery = None;
+        self.steering = hrdr_agent::steering_queue();
+        self.adopt_recovery_state(state);
+        self.launch_turn();
+        true
+    }
+
     /// Handle a passive recovery key without starting any runtime work.
     pub(crate) fn on_recovery_key(&mut self, key: KeyEvent) {
-        let Some(intent) = self.passive_recovery else {
-            return;
-        };
-        if key.kind == KeyEventKind::Release {
+        if self.passive_recovery.is_none() {
             return;
         }
-        if intent == HandoffIntent::UpdateContinuation
-            && !self.recovery_confirmation_used
-            && key.modifiers.is_empty()
-            && key.code == KeyCode::Char('c')
-        {
-            // Claim the one-shot capability before adopting any state or starting
-            // work, so a repeated key cannot open another continuation turn.
-            self.recovery_confirmation_used = true;
-            let Some(state) = self.recovery_state.take() else {
-                self.system("recovery checkpoint is unavailable".to_string());
-                self.should_quit = true;
-                return;
-            };
-            self.handoff_gate = false;
-            self.passive_recovery = None;
-            self.steering = hrdr_agent::steering_queue();
-            self.adopt_recovery_state(state);
-            self.launch_turn();
+        if key.kind == KeyEventKind::Release {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -3225,6 +3241,63 @@ impl App {
         }
     }
 
+    pub(crate) async fn install_update_tool(
+        &mut self,
+        receiver: UpdateRequestReceiver,
+        tool: std::sync::Arc<dyn hrdr_tools::Tool>,
+    ) {
+        if self.agent.lock().await.register_tool(tool) {
+            self.update_requests = Some(receiver);
+        }
+    }
+
+    pub(crate) async fn commit_pending_update(&mut self) {
+        self.commit_pending_update_now();
+    }
+
+    fn release_update_request_slot(&self) {
+        if let Some(receiver) = self.update_requests.as_ref() {
+            receiver.release();
+        }
+    }
+
+    fn commit_pending_update_now(&mut self) {
+        if self.admitted_update.is_none() || !self.handoff_quiescent() {
+            return;
+        }
+        if let Err(error) = self.commit_stored_admitted_update() {
+            self.admitted_update = None;
+            self.release_update_request_slot();
+            self.handoff_gate = false;
+            self.system(format!("update handoff failed: {error:#}"));
+        }
+    }
+
+    fn prepare_deferred_update(&mut self) {
+        if self.pending_update.is_none() {
+            self.pending_update = self
+                .update_requests
+                .as_mut()
+                .and_then(|rx| rx.try_recv().ok());
+        }
+        if self.update_preparing || self.pending_update.is_none() || !self.handoff_quiescent() {
+            return;
+        }
+        let Some(session_id) = self.state().id.clone() else {
+            return;
+        };
+        let request = self.pending_update.take().expect("checked above");
+        self.update_preparing = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || request.prepare(&session_id))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = tx.send(TurnMsg::UpdatePrepared(result)).await;
+        });
+    }
+
     /// Ring the terminal bell when a turn finishes (shared gate: enabled +
     /// ran at least [`hrdr_app::BELL_MIN_SECS`], so quick replies stay silent).
     fn maybe_bell(&self) {
@@ -3447,6 +3520,7 @@ impl App {
                     return;
                 }
                 self.registry.end_turn(hrdr_agent::MAIN_KEY);
+                self.prepare_deferred_update();
                 // `refresh_subagent_dir` may have skipped this while the completed
                 // turn held the mutex. Retry now, before saving or launching queued
                 // steering, so every following request carries the durable id.
@@ -3474,8 +3548,12 @@ impl App {
                 // context on every request.
                 // Notify on completion of a non-trivial turn (if enabled).
                 self.maybe_bell();
-                // Persist the completed turn into the active session, if any.
-                self.autosave();
+                // Persist the completed turn into the active session, if any. An
+                // admitted update persists its own durable evidence at commit; do not
+                // start a normal save or queued turn while its handoff is pending.
+                if !self.update_preparing {
+                    self.autosave();
+                }
                 // NOTE: an `/init` turn does NOT re-seed the system prompt with the
                 // `AGENTS.md` it just wrote. The agent wrote it — it has the content
                 // in its context already, and injecting it again would say the same
@@ -3494,14 +3572,28 @@ impl App {
                 // emits `Steered`, which the frontend folds into the user entry. Any
                 // further queued messages steer that new turn, exactly as before.
                 let has_pending = self.steering.lock().map(|q| !q.is_empty()).unwrap_or(false);
-                if has_pending {
+                if has_pending && !self.update_preparing {
                     self.launch_turn();
                 }
                 // A `/compact` queued while the turn ran waits for a quiet moment:
                 // this one, unless the relaunch above made the agent busy again
                 // (then it waits for that turn too — a compaction must see the
                 // whole conversation, and the steer that just started is part of it).
-                self.drain_pending_compaction();
+                if !self.update_preparing {
+                    self.drain_pending_compaction();
+                }
+            }
+            TurnMsg::UpdatePrepared(result) => {
+                self.update_preparing = false;
+                match result {
+                    Ok(update) => self.admitted_update = Some(update),
+                    Err(error) => {
+                        self.release_update_request_slot();
+                        self.handoff_gate = false;
+                        self.system(format!("update preparation failed: {error}"));
+                    }
+                }
+                self.commit_pending_update_now();
             }
             TurnMsg::FileIndex(cwd, files) => {
                 self.file_index = files;
@@ -3518,7 +3610,11 @@ impl App {
                 }
             }
             TurnMsg::FileIndexDirty => self.on_file_index_dirty(),
-            TurnMsg::SaveDone(result) => self.on_save_done(result),
+            TurnMsg::SaveDone(result) => {
+                self.on_save_done(result);
+                self.prepare_deferred_update();
+                self.commit_pending_update_now();
+            }
             TurnMsg::Identity(id, reference, base_url, window, report) => {
                 // The agent has taken it; the chrome may now say so.
                 self.update_chrome(id, |s| s.model = reference);

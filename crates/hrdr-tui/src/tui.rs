@@ -314,11 +314,13 @@ pub(crate) async fn run_loop(
             },
             Wake::Message(msg) => {
                 app.on_turn_msg(msg);
+                app.commit_pending_update().await;
                 // Drain any further messages that arrived in the same burst so
                 // fast-streaming endpoints don't cause 100+ full redraws/sec —
                 // all buffered tokens are folded into state before the next draw.
                 while let Ok(msg) = rx.try_recv() {
                     app.on_turn_msg(msg);
+                    app.commit_pending_update().await;
                 }
             }
             Wake::Animation => {}

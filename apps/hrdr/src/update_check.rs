@@ -60,7 +60,7 @@ trait Probe {
         command: ProbeCommand,
         cwd: &'a Path,
         args: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = ProbeResult> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = ProbeResult> + Send + 'a>>;
 }
 
 struct SystemProbe {
@@ -81,7 +81,7 @@ impl Probe for SystemProbe {
         command: ProbeCommand,
         cwd: &'a Path,
         args: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = ProbeResult> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = ProbeResult> + Send + 'a>> {
         Box::pin(async move {
             let result = match command {
                 ProbeCommand::Git => self.git.run(cwd, args).await,
@@ -531,7 +531,7 @@ mod tests {
             command: ProbeCommand,
             _: &'a Path,
             args: &'a [&'a str],
-        ) -> Pin<Box<dyn Future<Output = ProbeResult> + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = ProbeResult> + Send + 'a>> {
             Box::pin(async move {
                 let expected = self
                     .0

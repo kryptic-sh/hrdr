@@ -12,6 +12,70 @@ pub trait PreparedUpdateCoordinator: Send {
     fn launch(self: Box<Self>) -> anyhow::Result<()>;
 }
 
+/// A one-shot update request held by the TUI until its current turn is over.
+pub trait DeferredUpdate: Send {
+    fn prepare(self: Box<Self>, session_id: &str) -> anyhow::Result<AdmittedUpdate>;
+}
+
+/// Sender exposed only to the frontend-owned update tool.
+#[derive(Clone)]
+pub struct UpdateRequestSender {
+    tx: tokio::sync::mpsc::UnboundedSender<Box<dyn DeferredUpdate>>,
+    sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl UpdateRequestSender {
+    pub fn send(&self, request: Box<dyn DeferredUpdate>) -> anyhow::Result<()> {
+        if self
+            .sent
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            anyhow::bail!("an update is already pending");
+        }
+        if self.tx.send(request).is_err() {
+            self.sent.store(false, std::sync::atomic::Ordering::Release);
+            anyhow::bail!("update request is unavailable");
+        }
+        Ok(())
+    }
+}
+
+pub struct UpdateRequestReceiver {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Box<dyn DeferredUpdate>>,
+    sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl UpdateRequestReceiver {
+    pub(crate) fn try_recv(
+        &mut self,
+    ) -> Result<Box<dyn DeferredUpdate>, tokio::sync::mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Release the request slot after a terminal admission or preparation failure.
+    pub(crate) fn release(&self) {
+        self.sent.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn update_request_bridge() -> (UpdateRequestSender, UpdateRequestReceiver) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (
+        UpdateRequestSender {
+            tx,
+            sent: sent.clone(),
+        },
+        UpdateRequestReceiver { rx, sent },
+    )
+}
+
 /// An update admitted by a frontend after it has prepared its coordinator.
 pub struct AdmittedUpdate {
     operation_id: hrdr_agent::UpdateOperationId,
@@ -98,17 +162,48 @@ impl App {
         Ok(true)
     }
 
+    fn append_handoff_record(
+        &self,
+        id: &str,
+        epoch: u64,
+        state: hrdr_agent::HandoffState,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        let lock = self
+            .active_lock
+            .as_ref()
+            .expect("quiescent handoff retains a backed session lock");
+        hrdr_agent::HandoffJournal::open(&self.current_cwd(), id, lock)?
+            .append(epoch, state, payload)
+    }
+
     /// Commit a prepared update handoff, then let its prepared owner take over.
     ///
     /// The coordinator is prepared before this method mutates the app, and is
     /// consumed exactly once only after the durable commit and input gate.
+    /// Commit a prepared update supplied by an internal caller.
+    ///
+    /// Kept for existing handoff callers; the deferred path retains its update in
+    /// `admitted_update` and uses `commit_stored_admitted_update` so an `Ok(false)`
+    /// cannot consume the one-shot coordinator.
     pub(crate) async fn commit_admitted_update(
         &mut self,
         admitted: AdmittedUpdate,
     ) -> anyhow::Result<bool> {
+        if self.admitted_update.is_some() {
+            return Ok(false);
+        }
+        self.admitted_update = Some(admitted);
+        self.commit_stored_admitted_update()
+    }
+
+    pub(crate) fn commit_stored_admitted_update(&mut self) -> anyhow::Result<bool> {
         if !self.handoff_quiescent() {
             return Ok(false);
         }
+        let Some(admitted) = self.admitted_update.as_ref() else {
+            return Ok(false);
+        };
         if !self
             .active_lock
             .as_ref()
@@ -120,43 +215,68 @@ impl App {
             return Ok(false);
         };
 
-        let AdmittedUpdate {
-            operation_id,
-            coordinator,
-        } = admitted;
-        let Some(result) =
-            self.with_agent(|agent| agent.append_successful_update(operation_id.clone()))
-        else {
+        let operation_id = admitted.operation_id.clone();
+        let payload = update_handoff_payload(&operation_id)?;
+        let epoch = hrdr_tools::unix_now();
+        self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Prepare, &payload)?;
+
+        let before_state = self.state().clone();
+        let Some(result) = self.with_agent(|agent| {
+            let before = agent.messages_owned();
+            agent.append_successful_update(operation_id.clone())?;
+            Ok::<_, anyhow::Error>((
+                before,
+                agent.messages_owned(),
+                agent.cwd().display().to_string(),
+            ))
+        }) else {
+            let _ =
+                self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
             return Ok(false);
         };
-        result?;
-        self.autosave();
-        self.await_saves().await;
-        if !self.handoff_quiescent() {
-            return Ok(false);
-        }
+        let (before, messages, cwd) = result?;
+        let todos = self.state().todos.clone();
+        let goals = self.state().goals.clone();
+        let crons = self.state().crons.clone();
+        self.state_mut()
+            .sync_from(messages, todos, goals, crons, cwd);
 
-        let payload = update_handoff_payload(&operation_id)?;
-        let lock = self
-            .active_lock
-            .as_ref()
-            .expect("quiescent handoff retains a backed session lock");
-        let journal = hrdr_agent::HandoffJournal::open(&self.current_cwd(), &id, lock)?;
-        let epoch = hrdr_tools::unix_now();
-        journal.append(epoch, hrdr_agent::HandoffState::Prepare, &payload)?;
-        journal.append(epoch, hrdr_agent::HandoffState::Commit, &payload)?;
+        if let Err(error) =
+            self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Commit, &payload)
+        {
+            let _ = self.with_agent(|agent| agent.set_messages(before));
+            *self.state_mut() = before_state;
+            let _ =
+                self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
+            return Err(error);
+        }
+        if let Err(error) = hrdr_app::Session::new(self.state().clone().persisted())
+            .save(&id, self.unix_style_paths())
+        {
+            let _ = self.with_agent(|agent| agent.set_messages(before));
+            *self.state_mut() = before_state.clone();
+            let _ =
+                self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
+            return Err(error);
+        }
         self.handoff_gate = true;
 
+        let AdmittedUpdate { coordinator, .. } =
+            self.admitted_update.take().expect("checked above");
         if let Err(launch_error) = coordinator.launch() {
-            if let Err(abort_error) =
-                journal.append(epoch, hrdr_agent::HandoffState::Abort, &payload)
-            {
-                return Err(launch_error.context(format!(
-                    "prepared update launch failed and recording handoff abort failed: {abort_error}"
-                )));
-            }
+            let _ = self.with_agent(|agent| agent.set_messages(before));
+            *self.state_mut() = before_state;
+            let restore = hrdr_app::Session::new(self.state().clone().persisted())
+                .save(&id, self.unix_style_paths());
+            let abort =
+                self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
             self.handoff_gate = false;
-            return Err(launch_error.context("prepared update launch failed; handoff aborted"));
+            return match (restore, abort) {
+                (Ok(_), Ok(())) => Err(launch_error.context("prepared update launch failed; handoff aborted")),
+                (restore, abort) => Err(launch_error.context(format!(
+                    "prepared update launch failed; restoring the pre-update session: {restore:?}; recording handoff abort: {abort:?}"
+                ))),
+            };
         }
 
         self.handoff_exit = true;
@@ -166,7 +286,7 @@ impl App {
 
     /// The TUI half of the handoff gate. This runs entirely on the UI task; the
     /// registry supplies its own locked snapshot for agent-owned runtime state.
-    fn handoff_quiescent(&self) -> bool {
+    pub(crate) fn handoff_quiescent(&self) -> bool {
         self.registry.is_handoff_quiescent()
             && self
                 .background_tasks

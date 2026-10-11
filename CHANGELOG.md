@@ -36,6 +36,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replay; activation is consumed after one launch.
 - **Prepared update handoffs abort safely on coordinator launch failure.** A
   successful coordinator launch exits without rewriting its bound checkpoint.
+- **Interactive Windows sessions can request a validated self-update.** The
+  `update` tool stages an admitted candidate after its turn, then preserves its
+  session through a one-shot recovery continuation.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

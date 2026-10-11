@@ -580,6 +580,8 @@ impl Agent {
             live_home: None,
             delegated: config.delegated,
             read_only: config.read_only,
+            allowed_tools: config.allowed_tools.clone(),
+            sandbox_mode,
             subagent_limits,
             gate,
             last_prompt_tokens: None,
@@ -760,7 +762,7 @@ impl Agent {
                 kind: "function".into(),
                 function: hrdr_llm::FunctionCall {
                     name: "update".into(),
-                    arguments: evidence.clone(),
+                    arguments: "{}".into(),
                     parsed_arguments: None,
                 },
             }]),
@@ -1431,6 +1433,26 @@ impl Agent {
                     .map(|(pattern, err)| (pattern.clone(), format!("NOT ACTIVE — {err}"))),
             )
             .collect()
+    }
+
+    /// Register a frontend-owned tool only for the trusted interactive main agent.
+    ///
+    /// Construction-time scoping remains authoritative: this cannot widen an
+    /// allow-list, a read-only agent, or a jail.
+    pub fn register_tool(&mut self, tool: Arc<dyn hrdr_tools::Tool>) -> bool {
+        if self.delegated
+            || self.read_only
+            || self.sandbox_mode == hrdr_tools::SandboxMode::Jail
+            || self
+                .allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == tool.name()))
+        {
+            return false;
+        }
+        self.tools.register(tool);
+        self.refresh_system_prompt_in_place();
+        true
     }
 
     /// Registered tools as `(name, description)` pairs.

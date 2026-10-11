@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 #[cfg(windows)]
-use super::{AdmittedUpdate, PreparedUpdateCoordinator};
+use super::{AdmittedUpdate, DeferredUpdate, PreparedUpdateCoordinator};
 use super::{App, Entry, EntryKind, LoginModal, StatusBarMode, TurnMsg};
 use crate::ui;
 use hrdr_agent::AgentConfig;
@@ -3620,7 +3620,7 @@ async fn update_recovery_continues_saved_tool_result_once_without_an_opener() {
     });
     let mut rx = app.rx.take().unwrap();
 
-    app.on_recovery_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert!(app.activate_update_continuation());
     while app.running() {
         app.on_turn_msg(rx.recv().await.unwrap());
     }
@@ -3644,11 +3644,11 @@ async fn update_recovery_continues_saved_tool_result_once_without_an_opener() {
         "recovery must not synthesize a user opener",
     );
     assert_eq!(app.steering_len_for_test(), 0);
-    app.on_recovery_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert!(!app.activate_update_continuation());
     assert_eq!(
         mock.request_count(),
         1,
-        "a second c cannot launch another turn"
+        "a second activation cannot launch another turn"
     );
 }
 
@@ -12745,6 +12745,175 @@ async fn ctrl_c_with_only_an_attachment_pending_clears_it_instead_of_arming_quit
 }
 
 #[cfg(windows)]
+struct TestDeferredUpdate {
+    prepared: Arc<AtomicUsize>,
+    launches: Arc<AtomicUsize>,
+}
+
+#[cfg(windows)]
+impl DeferredUpdate for TestDeferredUpdate {
+    fn prepare(self: Box<Self>, _: &str) -> anyhow::Result<AdmittedUpdate> {
+        self.prepared.fetch_add(1, Ordering::SeqCst);
+        Ok(AdmittedUpdate::new(
+            hrdr_agent::UpdateOperationId::new("deferred-update").unwrap(),
+            TestPreparedUpdate {
+                launches: self.launches.clone(),
+                fail: false,
+            },
+        ))
+    }
+}
+
+#[cfg(windows)]
+struct FailingDeferredUpdate {
+    prepared: Arc<AtomicUsize>,
+}
+
+#[cfg(windows)]
+impl DeferredUpdate for FailingDeferredUpdate {
+    fn prepare(self: Box<Self>, _: &str) -> anyhow::Result<AdmittedUpdate> {
+        self.prepared.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("test update preparation failure")
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn frontend_tool_registration_excludes_restricted_agents() {
+    let root = tempfile::tempdir().unwrap();
+    let agent_with = |mutate: fn(&mut AgentConfig)| {
+        let mut config = AgentConfig {
+            cwd: root.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            ..Default::default()
+        };
+        mutate(&mut config);
+        hrdr_agent::Agent::new(config).unwrap()
+    };
+    let install =
+        |agent: &mut hrdr_agent::Agent| agent.register_tool(Arc::new(hrdr_tools::ReadTool));
+
+    assert!(install(&mut agent_with(|_| {})));
+    assert!(!install(&mut agent_with(|config| {
+        config.sandbox = hrdr_tools::SandboxMode::Jail;
+        config.read_only = true;
+    })));
+    assert!(!install(&mut agent_with(|config| config.read_only = true)));
+    assert!(!install(&mut agent_with(|config| {
+        config.allowed_tools = Some(vec!["shell".to_string()]);
+    })));
+    assert!(!install(&mut agent_with(|config| config.delegated = true)));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn deferred_update_keeps_preexisting_drafts_editable_until_quiescent() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.reserve_session_id("deferred update handoff");
+    h.app.await_saves().await;
+
+    let (sender, receiver) = crate::update_request_bridge();
+    h.app.update_requests = Some(receiver);
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let launches = Arc::new(AtomicUsize::new(0));
+    sender
+        .send(Box::new(TestDeferredUpdate {
+            prepared: prepared.clone(),
+            launches: launches.clone(),
+        }))
+        .unwrap();
+
+    // The tool's request has arrived while a turn is live, but its admission is
+    // only driven by the terminal Done event.
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.turn_handle = Some(tokio::spawn(std::future::pending()));
+    assert_eq!(prepared.load(Ordering::SeqCst), 0);
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    assert_eq!(
+        prepared.load(Ordering::SeqCst),
+        0,
+        "prepare is asynchronous after Done"
+    );
+    assert!(
+        !h.app.handoff_gate,
+        "a queued update must not freeze input before quiescence"
+    );
+
+    h.type_str("a draft remains editable");
+    assert_eq!(h.app.editor.content(), "a draft remains editable");
+
+    // The prepared update stays owned by the app while the draft keeps the
+    // session nonquiescent, then commits after the draft is cleared.
+    h.wait_for("deferred update preparation", |msg| {
+        matches!(msg, TurnMsg::UpdatePrepared(_))
+    })
+    .await;
+    assert_eq!(prepared.load(Ordering::SeqCst), 1);
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert!(h.app.admitted_update.is_some());
+
+    h.app.editor.set_content("");
+    h.app.commit_pending_update().await;
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(h.app.should_quit);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn failed_update_preparation_leaves_no_success_evidence_and_releases_retry_slot() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.reserve_session_id("failed update preparation");
+    h.app.await_saves().await;
+    let (sender, receiver) = crate::update_request_bridge();
+    h.app.update_requests = Some(receiver);
+    let failed = Arc::new(AtomicUsize::new(0));
+    sender
+        .send(Box::new(FailingDeferredUpdate {
+            prepared: failed.clone(),
+        }))
+        .unwrap();
+    h.app.prepare_deferred_update();
+    h.wait_for("failed update preparation", |msg| {
+        matches!(msg, TurnMsg::UpdatePrepared(Err(_)))
+    })
+    .await;
+
+    assert_eq!(failed.load(Ordering::SeqCst), 1);
+    assert!(
+        !h.app
+            .agent
+            .lock()
+            .await
+            .messages_owned()
+            .iter()
+            .any(|message| message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.contains("successful_update"))),
+        "a failed preparation must not persist successful update evidence"
+    );
+
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let launches = Arc::new(AtomicUsize::new(0));
+    sender
+        .send(Box::new(TestDeferredUpdate {
+            prepared: prepared.clone(),
+            launches: launches.clone(),
+        }))
+        .unwrap();
+    h.app.prepare_deferred_update();
+    h.wait_for("retry update preparation", |msg| {
+        matches!(msg, TurnMsg::UpdatePrepared(Ok(_)))
+    })
+    .await;
+    assert_eq!(prepared.load(Ordering::SeqCst), 1);
+    h.app.commit_pending_update().await;
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(windows)]
 struct TestPreparedUpdate {
     launches: Arc<AtomicUsize>,
     fail: bool,
@@ -12816,4 +12985,37 @@ async fn failed_admitted_update_launch_aborts_and_keeps_the_tui_running() {
     );
     let journal = hrdr_agent::HandoffJournal::open(&h.app.current_cwd(), &id, lock).unwrap();
     assert!(journal.claimable().unwrap().is_none());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn update_evidence_save_failure_restores_messages_without_handoff_or_launch() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.reserve_session_id("save failure update handoff");
+    h.app.await_saves().await;
+    let id = h.app.state().id.clone().unwrap();
+    let path = hrdr_agent::session_file_path(&h.app.current_cwd(), &id);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let before = serde_json::to_value(h.app.agent.lock().await.messages_owned()).unwrap();
+    let launches = Arc::new(AtomicUsize::new(0));
+    let update = AdmittedUpdate::new(
+        hrdr_agent::UpdateOperationId::new("save-failure").unwrap(),
+        TestPreparedUpdate {
+            launches: launches.clone(),
+            fail: false,
+        },
+    );
+    assert!(h.app.commit_admitted_update(update).await.is_err());
+
+    assert_eq!(
+        serde_json::to_value(h.app.agent.lock().await.messages_owned()).unwrap(),
+        before
+    );
+    assert_eq!(launches.load(Ordering::SeqCst), 0);
+    assert!(!h.app.handoff_gate);
+    assert!(!h.app.should_quit);
+    assert!(!path.with_file_name(format!("{id}.handoff")).exists());
 }

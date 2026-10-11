@@ -933,7 +933,10 @@ pub struct Agent {
     /// agent — `task_revive`, through the sub-agent snapshot — can restore the
     /// same scope instead of assuming write capability.
     read_only: bool,
-    /// The `task` concurrency caps this session runs under, named in the prompt's
+    /// The explicit tool allow-list, if this agent was constructed with one.
+    allowed_tools: Option<Vec<String>>,
+    /// Effective sandbox mode; frontend tools cannot widen a jail after construction.
+    sandbox_mode: hrdr_tools::SandboxMode,
     /// Environment block. Kept on the agent because the prompt is REBUILT when
     /// memory or commands change, and a rebuild must not quietly drop them.
     subagent_limits: prompt::SubagentLimits,

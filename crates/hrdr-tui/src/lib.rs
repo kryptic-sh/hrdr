@@ -20,7 +20,10 @@ mod cursor_backend;
 mod theme;
 mod trust_prompt;
 mod tui;
-pub use app::{AdmittedUpdate, PreparedUpdateCoordinator};
+pub use app::{
+    AdmittedUpdate, DeferredUpdate, PreparedUpdateCoordinator, UpdateRequestReceiver,
+    UpdateRequestSender, update_request_bridge,
+};
 pub use trust_prompt::ask_trust;
 mod ui;
 
@@ -149,9 +152,13 @@ pub async fn run_handoff_recovery(
     let mut terminal: Tui = Terminal::new(backend)?;
     let mut app = App::new_recovery(config, ui, logo, recovery.intent)?;
     app.adopt_handoff_recovery(id.to_string(), recovery.session, recovery.lock);
-    tui::run_recovery_loop(&mut app, &mut terminal).await?;
-    if app.recovery_activated() {
+    if app.activate_update_continuation() {
         tui::run_loop(&mut app, &mut terminal, None, false).await?;
+    } else {
+        tui::run_recovery_loop(&mut app, &mut terminal).await?;
+        if app.recovery_activated() {
+            tui::run_loop(&mut app, &mut terminal, None, false).await?;
+        }
     }
     Ok(())
 }
@@ -172,6 +179,28 @@ pub async fn run(
     ui: hrdr_app::UiConfig,
     logo: &'static str,
     command: Option<String>,
+) -> Result<()> {
+    run_inner(config, ui, logo, command, None).await
+}
+
+/// Launch the interactive TUI with a frontend-owned tool installed on the main agent.
+pub async fn run_with_update_tool(
+    config: AgentConfig,
+    ui: hrdr_app::UiConfig,
+    logo: &'static str,
+    command: Option<String>,
+    receiver: UpdateRequestReceiver,
+    tool: std::sync::Arc<dyn hrdr_tools::Tool>,
+) -> Result<()> {
+    run_inner(config, ui, logo, command, Some((receiver, tool))).await
+}
+
+async fn run_inner(
+    config: AgentConfig,
+    ui: hrdr_app::UiConfig,
+    logo: &'static str,
+    command: Option<String>,
+    update_tool: Option<(UpdateRequestReceiver, std::sync::Arc<dyn hrdr_tools::Tool>)>,
 ) -> Result<()> {
     // Install a panic hook that restores the terminal to its normal state
     // *before* the panic message and backtrace are printed.  Without this the
@@ -214,6 +243,9 @@ pub async fn run(
     }
 
     let mut app = App::new(config, ui, logo)?;
+    if let Some((receiver, tool)) = update_tool {
+        app.install_update_tool(receiver, tool).await;
+    }
     app.connect_mcp().await;
     tui::run_loop(&mut app, &mut terminal, command, true).await?;
     Ok(())

@@ -44,7 +44,7 @@ struct Request {
 /// A Windows coordinator request fully prepared before a TUI handoff commits.
 #[cfg(windows)]
 #[allow(dead_code)]
-struct PreparedWindowsUpdateCoordinator {
+pub(crate) struct PreparedWindowsUpdateCoordinator {
     candidate_binary: PathBuf,
     request_path: PathBuf,
 }
@@ -52,7 +52,7 @@ struct PreparedWindowsUpdateCoordinator {
 #[cfg(windows)]
 #[allow(dead_code)]
 impl PreparedWindowsUpdateCoordinator {
-    fn prepare(
+    pub(crate) fn prepare(
         session_id: &str,
         operation_id: &hrdr_agent::UpdateOperationId,
         checkout: &AdmittedCheckout,

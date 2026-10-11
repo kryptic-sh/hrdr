@@ -21,6 +21,8 @@ extern crate hrdr_test_support;
 
 mod update_check;
 mod update_coordinator;
+#[cfg(windows)]
+mod update_tool;
 
 use std::io::Write;
 use std::time::Duration;
@@ -927,7 +929,23 @@ async fn main() -> Result<()> {
         // `hrdr "/model gpt-5"` mean the same thing.
         None => {
             let command = (!cli.input.is_empty()).then(|| cli.input.join(" "));
-            hrdr_tui::run(config, ui, LOGO_ART, command).await
+            #[cfg(windows)]
+            {
+                let (sender, receiver) = hrdr_tui::update_request_bridge();
+                hrdr_tui::run_with_update_tool(
+                    config,
+                    ui,
+                    LOGO_ART,
+                    command,
+                    receiver,
+                    update_tool::UpdateTool::new(sender),
+                )
+                .await
+            }
+            #[cfg(not(windows))]
+            {
+                hrdr_tui::run(config, ui, LOGO_ART, command).await
+            }
         }
     }
 }
