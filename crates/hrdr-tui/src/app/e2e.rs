@@ -7,6 +7,7 @@
 //! module of `app`, so it reaches `App`'s private methods and fields directly.
 
 use std::collections::VecDeque;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,10 +21,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use super::{
-    AdmittedUpdate, App, Entry, EntryKind, LoginModal, PreparedUpdateCoordinator, StatusBarMode,
-    TurnMsg,
-};
+#[cfg(windows)]
+use super::{AdmittedUpdate, PreparedUpdateCoordinator};
+use super::{App, Entry, EntryKind, LoginModal, StatusBarMode, TurnMsg};
 use crate::ui;
 use hrdr_agent::AgentConfig;
 
@@ -12744,11 +12744,13 @@ async fn ctrl_c_with_only_an_attachment_pending_clears_it_instead_of_arming_quit
     assert!(!h.app.should_quit);
 }
 
+#[cfg(windows)]
 struct TestPreparedUpdate {
     launches: Arc<AtomicUsize>,
     fail: bool,
 }
 
+#[cfg(windows)]
 impl PreparedUpdateCoordinator for TestPreparedUpdate {
     fn launch(self: Box<Self>) -> anyhow::Result<()> {
         self.launches.fetch_add(1, Ordering::SeqCst);
@@ -12759,6 +12761,7 @@ impl PreparedUpdateCoordinator for TestPreparedUpdate {
     }
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn admitted_update_commits_before_launching_and_exits_after_success() {
     let _data_home = isolated_data_home();
@@ -12781,6 +12784,7 @@ async fn admitted_update_commits_before_launching_and_exits_after_success() {
     assert!(h.app.should_quit);
 }
 
+#[cfg(windows)]
 #[tokio::test]
 async fn failed_admitted_update_launch_aborts_and_keeps_the_tui_running() {
     let _data_home = isolated_data_home();
