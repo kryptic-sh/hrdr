@@ -12965,6 +12965,7 @@ async fn admitted_update_commits_before_launching_and_exits_after_success() {
     assert!(h.app.commit_admitted_update(update).await.unwrap());
     assert_eq!(launches.load(Ordering::SeqCst), 1);
     assert!(h.app.handoff_gate);
+    assert!(h.app.active_lock.is_none());
     assert!(h.app.handoff_exit);
     assert!(h.app.should_quit);
 }

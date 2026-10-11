@@ -258,6 +258,10 @@ impl App {
             };
         }
 
+        // The coordinator now owns a committed checkpoint and will not launch
+        // recovery until this source process exits. Release our session lock before
+        // that exit so recovery does not have to reclaim a fresh lock from us.
+        self.active_lock = None;
         self.handoff_exit = true;
         self.should_quit = true;
         Ok(true)

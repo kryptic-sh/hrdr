@@ -33,8 +33,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it never claims Cargo ran before the coordinator installs the build.
 - **Normal startup recovers exactly one abandoned update handoff.** It claims a
   valid dead-owner checkpoint before opening a UI, fails closed for a live,
-  unknown, or ambiguous owner, and falls back to the retained binary if
-  operation marker I/O fails.
+  unknown, or ambiguous owner, releases the old lock only after coordinator
+  launch, and falls back to the retained binary if operation marker I/O fails.
 - **Attested handoff recovery can launch one continuation request.** It restores
   saved history without a synthetic user message, queue restoration, or tool
   replay; activation is consumed after one launch.
