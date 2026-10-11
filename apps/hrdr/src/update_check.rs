@@ -133,12 +133,42 @@ pub async fn run_json(cwd: &Path) -> (String, i32) {
     run_with(&SystemProbe::new(), cwd).await
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct AdmittedCandidate {
+    canonical_root: PathBuf,
+    head: String,
+}
+
+#[derive(Debug)]
+enum AdmissionFailure {
+    Ineligible(&'static str),
+    Unavailable(&'static str),
+}
+
+impl AdmissionFailure {
+    fn result(&self) -> (String, i32) {
+        match self {
+            Self::Ineligible(reason) => ineligible(reason),
+            Self::Unavailable(reason) => unavailable(reason),
+        }
+    }
+}
+
 async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
+    match admit_with(probe, cwd).await {
+        Ok(_) => eligible(),
+        Err(failure) => failure.result(),
+    }
+}
+
+async fn admit_with(probe: &impl Probe, cwd: &Path) -> Result<AdmittedCandidate, AdmissionFailure> {
     let root = probe
         .run(ProbeCommand::Git, cwd, &["rev-parse", "--show-toplevel"])
         .await;
     let Some(root) = output_line(&root) else {
-        return unavailable("repository_inspection_unavailable");
+        return Err(AdmissionFailure::Unavailable(
+            "repository_inspection_unavailable",
+        ));
     };
     let root = PathBuf::from(root);
     let clean = probe
@@ -149,10 +179,12 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
         )
         .await;
     if !clean.completed || !clean.success {
-        return unavailable("working_tree_inspection_unavailable");
+        return Err(AdmissionFailure::Unavailable(
+            "working_tree_inspection_unavailable",
+        ));
     }
     if !clean.stdout.is_empty() {
-        return ineligible("working_tree_dirty");
+        return Err(AdmissionFailure::Ineligible("working_tree_dirty"));
     }
     let branch = probe
         .run(
@@ -162,7 +194,7 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
         )
         .await;
     if output_line(&branch).as_deref() != Some("main") {
-        return ineligible("branch_not_main");
+        return Err(AdmissionFailure::Ineligible("branch_not_main"));
     }
     let head = probe
         .run(
@@ -172,19 +204,21 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
         )
         .await;
     let Some(head) = valid_object_id(output_line(&head).as_deref()) else {
-        return unavailable("head_inspection_unavailable");
+        return Err(AdmissionFailure::Unavailable("head_inspection_unavailable"));
     };
     let origin = probe
         .run(ProbeCommand::Git, &root, &["remote", "get-url", "origin"])
         .await;
     let Some(origin) = output_line(&origin) else {
-        return ineligible("origin_not_configured");
+        return Err(AdmissionFailure::Ineligible("origin_not_configured"));
     };
     if origin_has_credentials(&origin) {
-        return unavailable("origin_credentials_unsupported");
+        return Err(AdmissionFailure::Unavailable(
+            "origin_credentials_unsupported",
+        ));
     }
     let Some(repo) = parse_github_origin(&origin) else {
-        return ineligible("origin_incompatible");
+        return Err(AdmissionFailure::Ineligible("origin_incompatible"));
     };
     let live = probe
         .run(
@@ -194,10 +228,12 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
         )
         .await;
     let Some(live) = exact_live_main(&live) else {
-        return unavailable("live_main_inspection_unavailable");
+        return Err(AdmissionFailure::Unavailable(
+            "live_main_inspection_unavailable",
+        ));
     };
     if live != head {
-        return ineligible("live_main_not_at_head");
+        return Err(AdmissionFailure::Ineligible("live_main_not_at_head"));
     }
     let selector = repo.selector();
     if selector != "kryptic-sh/hrdr" {
@@ -216,13 +252,15 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
             )
             .await;
         let Some(view) = parse_repo_view(&view) else {
-            return unavailable("origin_validation_unavailable");
+            return Err(AdmissionFailure::Unavailable(
+                "origin_validation_unavailable",
+            ));
         };
         if view.name_with_owner != selector
             || !view.is_fork
             || view.parent_name_with_owner.as_deref() != Some("kryptic-sh/hrdr")
         {
-            return ineligible("origin_not_approved");
+            return Err(AdmissionFailure::Ineligible("origin_not_approved"));
         }
     }
     let endpoint = format!("repos/{selector}/actions/runs?branch=main&event=push&per_page=100");
@@ -234,7 +272,7 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
         )
         .await;
     let Some(runs) = parse_runs(&runs) else {
-        return unavailable("ci_inspection_unavailable");
+        return Err(AdmissionFailure::Unavailable("ci_inspection_unavailable"));
     };
     let selected = runs
         .into_iter()
@@ -248,10 +286,10 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
             (left.created_at.as_str(), left.id).cmp(&(right.created_at.as_str(), right.id))
         });
     let Some(selected) = selected else {
-        return ineligible("ci_run_not_found");
+        return Err(AdmissionFailure::Ineligible("ci_run_not_found"));
     };
     if selected.status != "completed" || selected.conclusion.as_deref() != Some("success") {
-        return ineligible("ci_run_not_successful");
+        return Err(AdmissionFailure::Ineligible("ci_run_not_successful"));
     }
     let id = selected.id.to_string();
     let attempt = selected.run_attempt.to_string();
@@ -273,12 +311,15 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
         )
         .await;
     let Some(jobs) = parse_jobs(&details) else {
-        return unavailable("ci_inspection_unavailable");
+        return Err(AdmissionFailure::Unavailable("ci_inspection_unavailable"));
     };
     if !jobs_approved(&jobs) {
-        return ineligible("ci_jobs_not_approved");
+        return Err(AdmissionFailure::Ineligible("ci_jobs_not_approved"));
     }
-    (json!({"schema_version":1,"eligible":true,"outcome":"eligible","reasons":[],"ci_status":"passed","restart_available":false}).to_string(), 0)
+    Ok(AdmittedCandidate {
+        canonical_root: root,
+        head,
+    })
 }
 
 fn jobs_approved(jobs: &[Job]) -> bool {
@@ -299,6 +340,12 @@ fn jobs_approved(jobs: &[Job]) -> bool {
         }
     }
     required.len() == REQUIRED_JOBS.len()
+}
+fn eligible() -> (String, i32) {
+    (
+        json!({"schema_version":1,"eligible":true,"outcome":"eligible","reasons":[],"ci_status":"passed","restart_available":false}).to_string(),
+        0,
+    )
 }
 fn result(outcome: &str, reason: &str) -> String {
     json!({"schema_version":1,"eligible":false,"outcome":outcome,"reasons":[reason],"ci_status":"not_checked","restart_available":false}).to_string()
@@ -596,6 +643,55 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(run.id, 12_345_678_901);
+    }
+
+    #[tokio::test]
+    async fn eligible_admission_retains_canonical_root_and_exact_head() {
+        let probe = ScriptedProbe::new(ci(
+            base("https://github.com/kryptic-sh/hrdr.git"),
+            RUNS,
+            approved_jobs(),
+        ));
+
+        let candidate = admit_with(&probe, Path::new(".")).await.unwrap();
+        probe.assert_finished();
+
+        assert_eq!(candidate.canonical_root, PathBuf::from("/checkout"));
+        assert_eq!(candidate.head, "0123456789012345678901234567890123456789");
+    }
+
+    #[tokio::test]
+    async fn failed_admissions_do_not_construct_candidates() {
+        let mut dirty = base("https://github.com/kryptic-sh/hrdr.git");
+        dirty[1] = expect(
+            ProbeCommand::Git,
+            &["status", "--porcelain=v1", "--untracked-files=all", "-z"],
+            ok("M private-file\0"),
+        );
+        dirty.truncate(2);
+        let probe = ScriptedProbe::new(dirty);
+        assert!(matches!(
+            admit_with(&probe, Path::new(".")).await,
+            Err(AdmissionFailure::Ineligible("working_tree_dirty"))
+        ));
+        probe.assert_finished();
+
+        let probe = ScriptedProbe::new([expect(
+            ProbeCommand::Git,
+            &["rev-parse", "--show-toplevel"],
+            ProbeResult {
+                completed: false,
+                success: false,
+                stdout: Vec::new(),
+            },
+        )]);
+        assert!(matches!(
+            admit_with(&probe, Path::new(".")).await,
+            Err(AdmissionFailure::Unavailable(
+                "repository_inspection_unavailable"
+            ))
+        ));
+        probe.assert_finished();
     }
 
     #[tokio::test]
