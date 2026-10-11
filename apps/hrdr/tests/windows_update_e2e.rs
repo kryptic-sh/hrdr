@@ -1,0 +1,787 @@
+#![cfg(windows)]
+
+// The Windows updater cannot be covered by an in-process test: it replaces the
+// executable that is currently running. These ignored tests instead install the
+// test binary into a private Cargo home and drive its real TUI through ConPTY.
+extern crate hrdr_test_support;
+
+mod common;
+
+use common::{
+    Chat, MockServer, stop_chunk, tool_args_chunk, tool_calls_stop_chunk, tool_start_chunk,
+};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use sha2::{Digest, Sha256};
+use std::ffi::OsString;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const WAIT: Duration = Duration::from_secs(180);
+const POLL: Duration = Duration::from_millis(100);
+const REQUIRED_JOBS: &[&str] = &[
+    "rustfmt",
+    "clippy ubuntu-latest",
+    "clippy macos-latest",
+    "clippy windows-latest",
+    "cargo-machete (unused deps)",
+    "cargo-deny",
+    "cargo-audit",
+    "test ubuntu-latest",
+    "test macos-latest",
+    "test windows-latest",
+    "no test writes real user state ubuntu-latest",
+    "no test writes real user state macos-latest",
+    "no test writes real user state windows-latest",
+    "build + smoke ubuntu-latest",
+    "build + smoke macos-latest",
+    "build + smoke windows-latest",
+    "Build x86_64-unknown-linux-gnu",
+    "Build aarch64-unknown-linux-gnu",
+    "Build x86_64-unknown-linux-musl",
+    "Build aarch64-unknown-linux-musl",
+    "Build x86_64-pc-windows-msvc",
+    "Build aarch64-apple-darwin",
+    "Build x86_64-apple-darwin",
+];
+
+type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+
+struct Fixture {
+    _root: tempfile::TempDir,
+    home: PathBuf,
+    cargo_home: PathBuf,
+    checkout: PathBuf,
+    expected_commit: String,
+    git_log: PathBuf,
+    cargo_log: PathBuf,
+    installed: PathBuf,
+    old_binary: Vec<u8>,
+    env: Vec<(OsString, OsString)>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("private update fixture root");
+        let home = root.path().join("home");
+        let cargo_home = root.path().join("cargo-home");
+        let checkout = root.path().join("checkout");
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&home).expect("private home");
+        fs::create_dir_all(cargo_home.join("bin")).expect("private cargo bin");
+        fs::create_dir_all(&bin).expect("fixture command bin");
+
+        // Cargo itself must not touch the runner cache after the update child has
+        // started. Copy only dependency caches, never Cargo credentials/config.
+        let source_cargo = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".cargo"))
+            })
+            .expect("CARGO_HOME or USERPROFILE");
+        for name in ["registry", "git"] {
+            let source = source_cargo.join(name);
+            if source.exists() {
+                copy_tree(&source, &cargo_home.join(name));
+            }
+        }
+
+        let installed = cargo_home.join("bin/hrdr.exe");
+        fs::copy(env!("CARGO_BIN_EXE_hrdr"), &installed).expect("install test binary");
+        let old_binary = fs::read(&installed).expect("read installed binary");
+
+        let head = git_output(&["rev-parse", "--verify", "HEAD^{commit}"]);
+        let repository = PathBuf::from(git_output(&["rev-parse", "--show-toplevel"]));
+        run_git(&[
+            "clone",
+            "--no-local",
+            "--no-checkout",
+            repository.to_str().expect("utf-8 repository path"),
+            checkout.to_str().expect("utf-8 checkout path"),
+        ]);
+        run_git_in(&checkout, &["checkout", "--detach", &head]);
+        run_git_in(&checkout, &["switch", "-C", "main", &head]);
+        run_git_in(
+            &checkout,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/kryptic-sh/hrdr.git",
+            ],
+        );
+
+        let real_git = git_program();
+        let git_log = bin.join("git.log");
+        fs::write(
+            bin.join("git.cmd"),
+            format!(
+                "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"log={}\"\r\n>>\"%log%\" echo === git invocation ===\r\n>>\"%log%\" echo cwd: %CD%\r\n>>\"%log%\" echo argv: %*\r\nif \"%~1\"==\"ls-remote\" (\r\n  echo {head}\trefs/heads/main\r\n  set \"code=0\"\r\n) else (\r\n  \"{}\" %*\r\n  set \"code=!ERRORLEVEL!\"\r\n)\r\n>>\"%log%\" echo exit: !code!\r\nexit /b !code!\r\n",
+                git_log.display(),
+                real_git.display(),
+            ),
+        )
+        .expect("write git fixture");
+        let real_cargo = cargo_program();
+        let real_git_directory = real_git.parent().expect("git.exe parent");
+        let cargo_log = bin.join("cargo.log");
+        let cargo_stdout = bin.join("cargo-stdout.log");
+        let cargo_stderr = bin.join("cargo-stderr.log");
+        fs::write(
+            bin.join("cargo.cmd"),
+            format!(
+                "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"log={}\"\r\nset \"stdout={}\"\r\nset \"stderr={}\"\r\nset \"PATH={};%PATH%\"\r\n>>\"%log%\" echo === cargo invocation ===\r\n>>\"%log%\" echo cwd: %CD%\r\n>>\"%log%\" echo argv: %*\r\n\"{}\" %* >\"%stdout%\" 2>\"%stderr%\"\r\nset \"code=!ERRORLEVEL!\"\r\n>>\"%log%\" echo stdout:\r\n>>\"%log%\" type \"%stdout%\"\r\n>>\"%log%\" echo stderr:\r\n>>\"%log%\" type \"%stderr%\"\r\n>>\"%log%\" echo exit: !code!\r\ntype \"%stdout%\"\r\ntype \"%stderr%\" >&2\r\nexit /b !code!\r\n",
+                cargo_log.display(),
+                cargo_stdout.display(),
+                cargo_stderr.display(),
+                real_git_directory.display(),
+                real_cargo.display(),
+            ),
+        )
+        .expect("write cargo fixture");
+        fs::write(bin.join("gh.cmd"), gh_script(&head)).expect("write gh fixture");
+
+        let inherited_path = std::env::var_os("PATH").expect("PATH");
+        let path = std::env::join_paths([bin.as_os_str(), inherited_path.as_os_str()])
+            .expect("fixture PATH");
+        let runtime = root.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("private runtime");
+        let env = [
+            ("CARGO_HOME", cargo_home.as_os_str()),
+            ("CARGO_NET_OFFLINE", std::ffi::OsStr::new("true")),
+            ("HOME", home.as_os_str()),
+            ("USERPROFILE", home.as_os_str()),
+            ("APPDATA", home.as_os_str()),
+            ("LOCALAPPDATA", home.as_os_str()),
+            ("XDG_CONFIG_HOME", home.as_os_str()),
+            ("XDG_DATA_HOME", home.as_os_str()),
+            ("XDG_STATE_HOME", home.as_os_str()),
+            ("XDG_CACHE_HOME", home.as_os_str()),
+            ("XDG_RUNTIME_DIR", runtime.as_os_str()),
+            ("PATH", path.as_os_str()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (OsString::from(key), value.to_os_string()))
+        .collect();
+
+        Self {
+            _root: root,
+            home,
+            cargo_home,
+            checkout,
+            expected_commit: head,
+            git_log,
+            cargo_log,
+            installed,
+            old_binary,
+            env,
+        }
+    }
+
+    fn checkout_status(&self) -> String {
+        let output = Command::new("git")
+            .current_dir(&self.checkout)
+            .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+            .output()
+            .expect("read fixture checkout status");
+        assert!(
+            output.status.success(),
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf-8 fixture checkout status")
+    }
+
+    fn checkout_head(&self) -> String {
+        let output = Command::new("git")
+            .current_dir(&self.checkout)
+            .args(["rev-parse", "--verify", "HEAD"])
+            .output()
+            .expect("read fixture checkout head");
+        assert!(
+            output.status.success(),
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf-8 fixture checkout head")
+            .trim()
+            .to_owned()
+    }
+
+    fn assert_checkout_clean(&self, boundary: &str) {
+        let head = self.checkout_head();
+        let status = self.checkout_status();
+        assert_eq!(
+            head, self.expected_commit,
+            "fixture checkout changed commit at {boundary}"
+        );
+        assert!(
+            status.is_empty(),
+            "fixture checkout is dirty at {boundary}:\n{status}"
+        );
+    }
+
+    fn assert_cargo_builds_candidate(&self) {
+        let target_dir = self.checkout.join("op-target");
+        let mut command = Command::new(
+            self.checkout
+                .parent()
+                .expect("fixture root")
+                .join("bin/cargo.cmd"),
+        );
+        command
+            .current_dir(&self.checkout)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "hrdr",
+                "--target",
+                "x86_64-pc-windows-msvc",
+                "--target-dir",
+            ])
+            .arg(&target_dir);
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run fixture Cargo build");
+        assert!(
+            output.status.success(),
+            "fixture Cargo build failed\ncwd: {}\nargs: cargo build --release --locked -p hrdr --target x86_64-pc-windows-msvc --target-dir {}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            self.checkout.display(),
+            target_dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(&target_dir).expect("remove fixture Cargo target");
+    }
+
+    fn operation_diagnostic(&self) -> String {
+        let operations = fs::read_dir(self.cargo_home.join("bin"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(".hrdr-update-"))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(operation) = operations.first() else {
+            return "no update operation directory".to_owned();
+        };
+        let entries = fs::read_dir(operation)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let request = fs::read_dir(operation)
+            .ok()
+            .and_then(|mut entries| {
+                entries.find_map(|entry| {
+                    let path = entry.ok()?.path();
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("request-"))
+                        .then_some(path)
+                })
+            })
+            .and_then(|path| fs::read_to_string(path).ok())
+            .unwrap_or_else(|| "request was consumed or unavailable".to_owned());
+        let candidate = operation.join("target/x86_64-pc-windows-msvc/release/hrdr.exe");
+        let output = Command::new(&candidate).arg("--build-info").output();
+        format!(
+            "operation: {}\nentries:\n{entries}\nrequest:\n{request}\ncandidate: {}\ncandidate exists: {}\nbuild info: {output:?}",
+            operation.display(),
+            candidate.display(),
+            candidate.exists(),
+        )
+    }
+
+    fn recovery_diagnostic(&self, server: &MockServer, screen: &str) -> String {
+        let last_error = screen
+            .lines()
+            .rev()
+            .find(|line| line.contains("network error") || line.contains("[error]"))
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+            .unwrap_or("no recovery attempt error observed");
+        format!(
+            "fixture recovery endpoint: {}\nfixture recovery provider: mock\nfixture recovery model: mock-model\nobserved recovery chat attempts: {}\nlatest recovery attempt error: {last_error}",
+            server.base_url(),
+            server.chat_bodies().len().saturating_sub(2),
+        )
+    }
+
+    fn start(&self, server: &MockServer) -> Session {
+        common::write_config(&self.home, &server.base_url());
+        trust(&self.home, &self.checkout);
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 30,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open ConPTY");
+        let mut command = CommandBuilder::new(&self.installed);
+        command.args(["--no-auto-resume", "--no-bell"]);
+        command.cwd(&self.checkout);
+        command.env("TERM", "xterm-256color");
+        command.env_remove("HRDR_MODEL");
+        command.env_remove("HRDR_API_KEY");
+        command.env_remove("RUST_LOG");
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        let child = pty
+            .slave
+            .spawn_command(command)
+            .expect("spawn installed hrdr");
+        drop(pty.slave);
+        let reader = pty.master.try_clone_reader().expect("ConPTY reader");
+        let writer = Arc::new(Mutex::new(pty.master.take_writer().expect("ConPTY writer")));
+        let screen = common::drain_pty(reader, Arc::clone(&writer));
+        Session {
+            child,
+            _master: pty.master,
+            writer,
+            screen,
+        }
+    }
+
+    fn operation_root(&self) -> PathBuf {
+        wait_until("update operation", || {
+            fs::read_dir(self.cargo_home.join("bin"))
+                .ok()?
+                .find_map(|entry| {
+                    let path = entry.ok()?.path();
+                    let is_operation = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".hrdr-update-"));
+                    is_operation.then_some(path)
+                })
+        })
+    }
+}
+
+struct Session {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Writer,
+    screen: Arc<Mutex<String>>,
+}
+
+impl Session {
+    fn send(&self, text: &str) {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        writer.write_all(text.as_bytes()).expect("write ConPTY");
+        writer.flush().expect("flush ConPTY");
+    }
+
+    fn screen(&self) -> String {
+        common::visible(
+            &self
+                .screen
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+    }
+
+    fn wait_for(&mut self, needle: &str) {
+        let start = Instant::now();
+        while !self.screen().contains(needle) {
+            if let Some(status) = self.child.try_wait().expect("poll old process") {
+                panic!(
+                    "old process exited {status:?} before {needle:?}:\n{}",
+                    self.screen()
+                );
+            }
+            assert!(
+                start.elapsed() < WAIT,
+                "timed out waiting for {needle:?}:\n{}",
+                self.screen()
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn wait_for_exit(&mut self, fixture: &Fixture) -> Duration {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll old process") {
+                assert!(
+                    status.success(),
+                    "old installed process exited unsuccessfully {status:?}:\n{}",
+                    self.screen()
+                );
+                return start.elapsed();
+            }
+            let screen = self.screen();
+            assert!(
+                !screen.contains("update preparation failed"),
+                "update preparation failed; expected checkout head: {}\nactual checkout head: {}\nfixture checkout status:\n{}\nfixture git log:\n{}\nfixture Cargo log:\n{}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{screen}",
+                fixture.expected_commit,
+                fixture.checkout_head(),
+                fixture.checkout_status(),
+                fs::read_to_string(&fixture.git_log).unwrap_or_default(),
+                fs::read_to_string(&fixture.cargo_log).unwrap_or_default(),
+                fixture.operation_diagnostic(),
+            );
+            assert!(
+                start.elapsed() < WAIT,
+                "old installed process did not exit; expected checkout head: {}\nactual checkout head: {}\nfixture checkout status:\n{}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{screen}",
+                fixture.expected_commit,
+                fixture.checkout_head(),
+                fixture.checkout_status(),
+                fixture.operation_diagnostic(),
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+#[test]
+#[ignore = "replaces an executable; run only in Windows release CI"]
+fn update_promotes_the_candidate_and_recovers_once() {
+    let server = MockServer::start(update_conversation());
+    let fixture = Fixture::new();
+    fixture.assert_checkout_clean("fixture setup");
+    fixture.assert_cargo_builds_candidate();
+    let mut session = fixture.start(&server);
+    session.wait_for("mock-model");
+    fixture.assert_checkout_clean("initial TUI startup");
+    session.send("install update\r");
+    wait_until("tool-result continuation before handoff", || {
+        (server.chat_bodies().len() == 2 && session.screen().contains("turn-after-update"))
+            .then_some(())
+    });
+    let operation = fixture.operation_root();
+    let request_path = wait_until("coordinator request", || {
+        fs::read_dir(&operation).ok()?.find_map(|entry| {
+            let path = entry.ok()?.path();
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("request-"))
+                .then_some(path)
+        })
+    });
+    let request = fs::read(request_path).expect("read coordinator request before handoff");
+    let expected_candidate_checksum = serde_json::from_slice::<serde_json::Value>(&request)
+        .expect("parse coordinator request")
+        .get("prebuilt_checksum")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .expect("coordinator prebuilt checksum");
+    let old_exit_after = session.wait_for_exit(&fixture);
+    fixture.assert_checkout_clean("update handoff");
+
+    let candidate = operation.join("target/x86_64-pc-windows-msvc/release/hrdr.exe");
+    let promotion_started = Instant::now();
+    let promoted = loop {
+        if let Ok(bytes) = fs::read(&fixture.installed)
+            && bytes != fixture.old_binary
+        {
+            break bytes;
+        }
+        assert!(
+            promotion_started.elapsed() < WAIT,
+            "timed out waiting for promoted executable; expected candidate checksum: {expected_candidate_checksum}\nactual installed checksum: {:?}\nold process exit after: {old_exit_after:?}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{}",
+            fs::read(&fixture.installed)
+                .ok()
+                .map(|bytes| sha256_hex(&bytes)),
+            fixture.operation_diagnostic(),
+            session.screen(),
+        );
+        std::thread::sleep(POLL);
+    };
+    assert_eq!(sha256_hex(&promoted), expected_candidate_checksum);
+    assert!(
+        !candidate.exists(),
+        "successful Windows ReplaceFile promotion consumes its source candidate"
+    );
+    fixture.assert_checkout_clean("candidate promotion");
+
+    let recovery_started = Instant::now();
+    loop {
+        if server.chat_bodies().len() == 3 && session.screen().contains("continued-after-update") {
+            break;
+        }
+        assert!(
+            recovery_started.elapsed() < WAIT,
+            "timed out waiting for one recovered continuation; chat count: {}\nrecovery attempt diagnostic:\n{}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{}",
+            server.chat_bodies().len(),
+            fixture.recovery_diagnostic(&server, &session.screen()),
+            fixture.operation_diagnostic(),
+            session.screen(),
+        );
+        std::thread::sleep(POLL);
+    }
+    assert_eq!(
+        server.chat_bodies().len(),
+        3,
+        "the update turn, its normal tool continuation, and one recovery continuation must run"
+    );
+    fixture.assert_checkout_clean("recovered continuation");
+}
+
+#[test]
+#[ignore = "replaces an executable; run only in Windows release CI"]
+fn reused_request_does_not_replace_or_recover_again() {
+    let server = MockServer::start(update_conversation());
+    let fixture = Fixture::new();
+    let mut session = fixture.start(&server);
+    session.wait_for("mock-model");
+    session.send("install update\r");
+    let _ = session.wait_for_exit(&fixture);
+    let operation = fixture.operation_root();
+    wait_until("recovered continuation", || {
+        (server.chat_bodies().len() == 3).then_some(())
+    });
+    let destination = fs::read(&fixture.installed).expect("promoted destination");
+    let coordinator = single(&operation, "coordinator-");
+    let request = single(&operation, "request-");
+    let mut command = Command::new(coordinator);
+    command.args([
+        "__update-coordinator",
+        request.to_str().expect("utf-8 request"),
+    ]);
+    for (key, value) in &fixture.env {
+        command.env(key, value);
+    }
+    let status = command.output().expect("rerun coordinator");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("\"status\":\"reused\""),
+        "rerun coordinator stdout:\n{}\nstderr:\n{}\nfixture operation:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+        fixture.operation_diagnostic(),
+    );
+    assert_eq!(
+        fs::read(&fixture.installed).expect("destination after reuse"),
+        destination
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        server.chat_bodies().len(),
+        3,
+        "a reused request must not recover again"
+    );
+}
+
+#[test]
+#[ignore = "replaces an executable; run only in Windows release CI"]
+fn promotion_lock_preserves_destination_without_recovery() {
+    let server = MockServer::start(update_conversation());
+    let fixture = Fixture::new();
+    use std::os::windows::fs::OpenOptionsExt;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001)
+        .open(&fixture.installed)
+        .expect("exclusive promotion lock");
+    let mut session = fixture.start(&server);
+    session.wait_for("mock-model");
+    session.send("install update\r");
+    let _ = session.wait_for_exit(&fixture);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        fs::read(&fixture.installed).expect("locked destination"),
+        fixture.old_binary
+    );
+    assert_eq!(
+        server.chat_bodies().len(),
+        2,
+        "promotion failure must not start recovery; fixture operation:\n{}\ncoordinator output / recovery screen:\n{}",
+        fixture.operation_diagnostic(),
+        session.screen(),
+    );
+    assert!(
+        !session.screen().contains("continued-after-update"),
+        "promotion failure must not render recovery output"
+    );
+    drop(lock);
+}
+
+fn update_conversation() -> Vec<Chat> {
+    vec![
+        Chat::Sse(vec![
+            tool_start_chunk("update", "update-call", "update"),
+            tool_args_chunk("update", "{}"),
+            tool_calls_stop_chunk("update"),
+            "[DONE]".to_owned(),
+        ]),
+        Chat::Sse(vec![
+            common::text_chunk("continued", "turn-after-update"),
+            stop_chunk("continued"),
+            "[DONE]".to_owned(),
+        ]),
+        Chat::Sse(vec![
+            common::text_chunk("recovered", "continued-after-update"),
+            stop_chunk("recovered"),
+            "[DONE]".to_owned(),
+        ]),
+    ]
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn wait_until<T>(what: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+    let start = Instant::now();
+    loop {
+        if let Some(value) = observe() {
+            return value;
+        }
+        assert!(start.elapsed() < WAIT, "timed out waiting for {what}");
+        std::thread::sleep(POLL);
+    }
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create Cargo cache directory");
+    for entry in fs::read_dir(source).expect("read Cargo cache") {
+        let entry = entry.expect("Cargo cache entry");
+        let target = destination.join(entry.file_name());
+        let file_type = entry.file_type().expect("Cargo cache entry type");
+        if file_type.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target).expect("copy Cargo cache file");
+        }
+    }
+}
+
+fn cargo_program() -> PathBuf {
+    let output = Command::new("where.exe")
+        .arg("cargo.exe")
+        .output()
+        .expect("locate cargo.exe");
+    assert!(output.status.success(), "cargo.exe unavailable");
+    PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("utf-8 where output")
+            .lines()
+            .next()
+            .expect("cargo.exe path"),
+    )
+}
+
+fn git_program() -> PathBuf {
+    let output = Command::new("where.exe")
+        .arg("git.exe")
+        .output()
+        .expect("locate git.exe");
+    assert!(output.status.success(), "git.exe unavailable");
+    PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("utf-8 where output")
+            .lines()
+            .next()
+            .expect("git.exe path"),
+    )
+}
+
+fn git_output(args: &[&str]) -> String {
+    let output = Command::new("git").args(args).output().expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf-8 git output")
+        .trim()
+        .to_owned()
+}
+
+fn run_git(args: &[&str]) {
+    let output = Command::new("git").args(args).output().expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_git_in(directory: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn single(directory: &Path, prefix: &str) -> PathBuf {
+    fs::read_dir(directory)
+        .expect("read operation directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(prefix))
+        })
+        .unwrap_or_else(|| panic!("no {prefix} in {}", directory.display()))
+}
+
+fn trust(home: &Path, project: &Path) {
+    let directory = home.join("hrdr");
+    fs::create_dir_all(&directory).expect("trust directory");
+    fs::write(
+        directory.join("trusted-dirs"),
+        format!(
+            "{}\n",
+            fs::canonicalize(project)
+                .expect("canonical checkout")
+                .display()
+        ),
+    )
+    .expect("trust checkout");
+}
+
+fn gh_script(head: &str) -> String {
+    let jobs = REQUIRED_JOBS
+        .iter()
+        .map(|name| format!(r#"{{"name":"{name}","status":"completed","conclusion":"success"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "@echo off\r\nif \"%~1\"==\"api\" (echo [{{\"workflow_runs\":[{{\"name\":\"CI\",\"event\":\"push\",\"head_branch\":\"main\",\"head_sha\":\"{head}\",\"created_at\":\"2026-10-11T00:00:00Z\",\"id\":1,\"run_attempt\":1,\"status\":\"completed\",\"conclusion\":\"success\"}}]}}]& exit /b 0)\r\necho {{\"jobs\":[{jobs}]}}\r\n"
+    )
+}

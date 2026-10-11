@@ -548,6 +548,26 @@ fn handoff_recovery_arg_from(
     })())
 }
 
+fn hydrate_recovery_endpoint(config: &mut AgentConfig) -> Result<()> {
+    let name = config.model.provider().as_str().to_string();
+    let provider = config.resolve_provider(&name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown provider '{name}' (built-ins: {}; or define [providers.{name}] in config)",
+            hrdr_agent::BUILTIN_PROVIDERS.join(", ")
+        )
+    })?;
+    config.base_url = provider.base_url.clone();
+    if let Some(key) = hrdr_agent::resolve_api_key_or_public(&name, &provider, None, None) {
+        config.api_key = Some(key);
+    }
+    if config.context_window.is_none() && provider.base_url != hrdr_agent::CHATGPT_CODEX_BASE_URL {
+        config.context_window = provider.context_window;
+    }
+    config.headers = provider.headers.into_iter().collect();
+    config.api_version = provider.api_version;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if let Some(result) = update_coordinator::run_from_args() {
@@ -565,10 +585,11 @@ async fn main() -> Result<()> {
 
     if let Some(id) = handoff_recovery_arg() {
         let id = id?;
-        let (config, diagnostics) = AgentConfig::load_diagnosed();
+        let (mut config, diagnostics) = AgentConfig::load_diagnosed();
         if let Some(message) = diagnostics.error_message() {
             anyhow::bail!(message);
         }
+        hydrate_recovery_endpoint(&mut config)?;
         let (ui, _) = hrdr_app::UiConfig::load_diagnosed();
         return hrdr_tui::run_handoff_recovery(config, ui, LOGO_ART, &id).await;
     }
@@ -1834,6 +1855,35 @@ mod cli_tests {
             .resolve_provider(identity.provider().as_str())
             .expect("a [providers.*] table defines a provider");
         assert_eq!(p.base_url, "http://localhost:1234/v1");
+    }
+
+    #[test]
+    fn handoff_recovery_resolves_the_configured_provider_endpoint() {
+        use hrdr_agent::ProviderConfig;
+
+        let mut cfg = AgentConfig {
+            model: "mock://mock-model".parse().unwrap(),
+            ..Default::default()
+        };
+        cfg.providers.insert(
+            "mock".to_string(),
+            ProviderConfig {
+                base_url: "http://127.0.0.1:9876/v1".to_string(),
+                key_env: None,
+                api_key: None,
+                model: None,
+                remote: Some(false),
+                context_window: Some(200_000),
+                headers: Default::default(),
+                api_version: None,
+            },
+        );
+
+        hydrate_recovery_endpoint(&mut cfg).unwrap();
+
+        assert_eq!(cfg.model.to_string(), "mock://mock-model");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:9876/v1");
+        assert_eq!(cfg.context_window, Some(200_000));
     }
 
     /// No command → nothing to run at startup (the plain TUI).

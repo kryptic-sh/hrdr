@@ -375,6 +375,33 @@ fn cargo_program() -> PathBuf {
 }
 
 #[cfg(windows)]
+fn cargo_target_dir(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let verbatim = ['\\' as u16, '\\' as u16, '?' as u16, '\\' as u16];
+    let unc = [
+        '\\' as u16,
+        '\\' as u16,
+        '?' as u16,
+        '\\' as u16,
+        'U' as u16,
+        'N' as u16,
+        'C' as u16,
+        '\\' as u16,
+    ];
+    if path.starts_with(&unc) {
+        let mut normalized = vec!['\\' as u16, '\\' as u16];
+        normalized.extend_from_slice(&path[unc.len()..]);
+        PathBuf::from(std::ffi::OsString::from_wide(&normalized))
+    } else if path.starts_with(&verbatim) {
+        PathBuf::from(std::ffi::OsString::from_wide(&path[verbatim.len()..]))
+    } else {
+        PathBuf::from(std::ffi::OsString::from_wide(&path))
+    }
+}
+
+#[cfg(windows)]
 fn build_prebuilt_candidate(
     checkout_root: &Path,
     expected_commit: &str,
@@ -400,7 +427,7 @@ fn build_prebuilt_candidate(
                 expected_target,
                 "--target-dir",
             ])
-            .arg(target_dir),
+            .arg(cargo_target_dir(target_dir)),
         deadline,
         false,
     )
@@ -487,6 +514,12 @@ fn promote_prebuilt_candidate(candidate: &Path, destination: &Path) -> bool {
 
 #[cfg(windows)]
 fn sanitized_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let program = program.as_ref();
+    let program = program
+        .to_str()
+        .filter(|program| Path::new(program).components().count() == 1)
+        .map(|program| hrdr_tools::resolve_program(program, None))
+        .unwrap_or_else(|| program.to_os_string());
     let mut command = Command::new(program);
     for (key, _) in std::env::vars_os() {
         let key = key.to_string_lossy();
@@ -643,9 +676,9 @@ fn run_command(
             Some(bytes)
         })
     });
-    loop {
-        if child.try_wait().map_err(|_| ())?.is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|_| ())? {
+            break status;
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -656,8 +689,8 @@ fn run_command(
             return Err(());
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    if !child.wait().map_err(|_| ())?.success() {
+    };
+    if !status.success() {
         return Err(());
     }
     match reader {
@@ -667,7 +700,10 @@ fn run_command(
 }
 
 fn claim(path: &Path) -> Result<PathBuf, ()> {
-    if !path.is_absolute() || contains_control_path(path) {
+    if !path.is_absolute()
+        || contains_control_path(path)
+        || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+    {
         return Err(());
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
@@ -924,15 +960,17 @@ mod tests {
             format!(
                 "build --release --locked -p hrdr --target {} --target-dir {}\r\n",
                 env!("HRDR_BUILD_TARGET"),
-                request
-                    .prebuilt_binary
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .display(),
+                cargo_target_dir(
+                    request
+                        .prebuilt_binary
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap(),
+                )
+                .display(),
             )
         );
         assert_eq!(

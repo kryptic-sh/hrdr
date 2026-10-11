@@ -218,7 +218,6 @@ impl App {
         let operation_id = admitted.operation_id.clone();
         let payload = update_handoff_payload(&operation_id)?;
         let epoch = hrdr_tools::unix_now();
-        self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Prepare, &payload)?;
 
         let before_state = self.state().clone();
         let Some(result) = self.with_agent(|agent| {
@@ -230,8 +229,6 @@ impl App {
                 agent.cwd().display().to_string(),
             ))
         }) else {
-            let _ =
-                self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
             return Ok(false);
         };
         let (before, messages, cwd) = result?;
@@ -241,20 +238,27 @@ impl App {
         self.state_mut()
             .sync_from(messages, todos, goals, crons, cwd);
 
+        if let Err(error) = hrdr_app::Session::new(self.state().clone().persisted())
+            .save(&id, self.unix_style_paths())
+        {
+            let _ = self.with_agent(|agent| agent.set_messages(before));
+            *self.state_mut() = before_state;
+            return Err(error);
+        }
+        if let Err(error) =
+            self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Prepare, &payload)
+        {
+            let _ = self.with_agent(|agent| agent.set_messages(before));
+            *self.state_mut() = before_state.clone();
+            let _ =
+                hrdr_app::Session::new(before_state.persisted()).save(&id, self.unix_style_paths());
+            return Err(error);
+        }
         if let Err(error) =
             self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Commit, &payload)
         {
             let _ = self.with_agent(|agent| agent.set_messages(before));
             *self.state_mut() = before_state;
-            let _ =
-                self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
-            return Err(error);
-        }
-        if let Err(error) = hrdr_app::Session::new(self.state().clone().persisted())
-            .save(&id, self.unix_style_paths())
-        {
-            let _ = self.with_agent(|agent| agent.set_messages(before));
-            *self.state_mut() = before_state.clone();
             let _ =
                 self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
             return Err(error);
@@ -268,13 +272,18 @@ impl App {
             *self.state_mut() = before_state;
             let restore = hrdr_app::Session::new(self.state().clone().persisted())
                 .save(&id, self.unix_style_paths());
-            let abort =
-                self.append_handoff_record(&id, epoch, hrdr_agent::HandoffState::Abort, &payload);
+            let handoff = hrdr_agent::session_file_path(&self.current_cwd(), &id)
+                .with_file_name(format!("{id}.handoff"));
+            let clear = match std::fs::remove_file(&handoff) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            };
             self.handoff_gate = false;
-            return match (restore, abort) {
+            return match (restore, clear) {
                 (Ok(_), Ok(())) => Err(launch_error.context("prepared update launch failed; handoff aborted")),
-                (restore, abort) => Err(launch_error.context(format!(
-                    "prepared update launch failed; restoring the pre-update session: {restore:?}; recording handoff abort: {abort:?}"
+                (restore, clear) => Err(launch_error.context(format!(
+                    "prepared update launch failed; restoring the pre-update session: {restore:?}; clearing the handoff journal: {clear:?}"
                 ))),
             };
         }

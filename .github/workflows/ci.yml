@@ -163,6 +163,11 @@ jobs:
       # that ships, and the debug one is already covered by the `test` matrix.
       - name: TUI starts in a real terminal
         run: cargo test --locked --release -p hrdr --test tui_pty
+      # The updater replaces its own installed executable, so this is intentionally
+      # an ignored Windows-only release test after the binary build above.
+      - name: Windows self-update E2E
+        if: matrix.os == 'windows-latest'
+        run: cargo test --locked --release -p hrdr --test windows_update_e2e -- --ignored
       - name: Completions + man page generate cleanly
         shell: bash
         run: |
