@@ -5,11 +5,12 @@
 //! starts the installed binary's handoff recovery exactly once.
 
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::process::Command;
 use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const SCHEMA_VERSION: u32 = 2;
@@ -198,12 +199,19 @@ pub fn run_from_args() -> Option<anyhow::Result<()>> {
 enum Status {
     Invalid,
     Reused,
+    #[cfg(windows)]
     Stale,
+    #[cfg(windows)]
     WaitTimeout,
+    #[cfg(windows)]
     SourceUnknown,
+    #[cfg(windows)]
     InstallFailed,
+    #[cfg(windows)]
     IdentityFailed,
+    #[cfg(windows)]
     LaunchFailed,
+    #[cfg(windows)]
     Launched,
     #[cfg(not(windows))]
     Unsupported,
@@ -214,12 +222,19 @@ impl Status {
         match self {
             Self::Invalid => "invalid",
             Self::Reused => "reused",
+            #[cfg(windows)]
             Self::Stale => "stale",
+            #[cfg(windows)]
             Self::WaitTimeout => "wait_timeout",
+            #[cfg(windows)]
             Self::SourceUnknown => "source_unknown",
+            #[cfg(windows)]
             Self::InstallFailed => "install_failed",
+            #[cfg(windows)]
             Self::IdentityFailed => "identity_failed",
+            #[cfg(windows)]
             Self::LaunchFailed => "launch_failed",
+            #[cfg(windows)]
             Self::Launched => "launched",
             #[cfg(not(windows))]
             Self::Unsupported => "unsupported",
