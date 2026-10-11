@@ -332,6 +332,134 @@ async fn read_limited<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> (Vec<u8
     }
 }
 
+/// A process identity that resists PID reuse where the operating system exposes
+/// a creation timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessLease {
+    pub pid: u32,
+    pub created: u64,
+}
+
+/// Whether a process lease is certainly live, dead, replaced, or could not be probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessLiveness {
+    Live,
+    Dead,
+    Replaced,
+    Unknown,
+}
+
+/// Capture the current process identity.
+///
+/// On Windows `created` is the `GetProcessTimes` creation FILETIME. Other
+/// platforms deliberately return no lease: a PID alone is not a safe owner
+/// identity after reuse.
+pub fn current_process_lease() -> Option<ProcessLease> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let current = unsafe { GetCurrentProcess() };
+        // SAFETY: all pointers are valid writable FILETIME values for this call.
+        let ok =
+            unsafe { GetProcessTimes(current, &mut created, &mut exited, &mut kernel, &mut user) };
+        if ok == 0 {
+            return None;
+        }
+        Some(ProcessLease {
+            pid: std::process::id(),
+            created: u64::from(created.dwLowDateTime) | (u64::from(created.dwHighDateTime) << 32),
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Determine whether `lease` is live without treating probe failures as death.
+///
+/// Only [`ProcessLiveness::Dead`] and [`ProcessLiveness::Replaced`] authorize
+/// recovery. Access, wait, and timestamp probe failures remain [`ProcessLiveness::Unknown`].
+pub fn process_lease_liveness(lease: ProcessLease) -> ProcessLiveness {
+    if lease.pid == 0 {
+        return ProcessLiveness::Unknown;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, WaitForSingleObject,
+        };
+
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT_MS: u32 = 258;
+        // SAFETY: by-value arguments only; the non-null handle is closed below.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                0,
+                lease.pid,
+            )
+        };
+        if handle.is_null() {
+            return if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+                ProcessLiveness::Dead
+            } else {
+                ProcessLiveness::Unknown
+            };
+        }
+        // SAFETY: `handle` is valid and the timeout is zero.
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        if wait == WAIT_OBJECT_0 {
+            unsafe { CloseHandle(handle) };
+            return ProcessLiveness::Dead;
+        }
+        if wait != WAIT_TIMEOUT_MS {
+            unsafe { CloseHandle(handle) };
+            return ProcessLiveness::Unknown;
+        }
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: the handle and all out-pointers are valid.
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return ProcessLiveness::Unknown;
+        }
+        let created = u64::from(created.dwLowDateTime) | (u64::from(created.dwHighDateTime) << 32);
+        if lease.created == created {
+            ProcessLiveness::Live
+        } else {
+            ProcessLiveness::Replaced
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = lease;
+        ProcessLiveness::Unknown
+    }
+}
+
+/// True only when `lease` still denotes the same live Windows process.
+///
+/// Prefer [`process_lease_liveness`] where recovery decisions distinguish an
+/// inaccessible process from a confirmed-dead process.
+pub fn same_live_process(lease: ProcessLease) -> bool {
+    matches!(process_lease_liveness(lease), ProcessLiveness::Live)
+}
+
 /// Whether process `pid` is still running.
 ///
 /// For telling an abandoned lock or per-process directory from one a live hrdr
@@ -1131,6 +1259,26 @@ mod tests {
             super::resolve_program("./bin/tool", path),
             OsStr::new("./bin/tool")
         );
+    }
+
+    #[test]
+    fn process_lease_probe_is_conservative_when_unavailable() {
+        #[cfg(not(windows))]
+        {
+            let lease = super::ProcessLease { pid: 1, created: 1 };
+            assert_eq!(
+                super::process_lease_liveness(lease),
+                super::ProcessLiveness::Unknown
+            );
+        }
+        #[cfg(windows)]
+        {
+            let current = super::current_process_lease().unwrap();
+            assert_eq!(
+                super::process_lease_liveness(current),
+                super::ProcessLiveness::Live
+            );
+        }
     }
 
     /// A running process reads as alive, and one that has exited and been reaped

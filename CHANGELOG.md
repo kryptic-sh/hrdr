@@ -17,6 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`hrdr update-check --json` validates exact origin CI eligibility.** It
   accepts only the newest matching `main` push attempt whose required validation
   and packaging jobs succeed, while allowing only tag-release publishing skips.
+- **Best-effort handoff journals validate saved session checkpoints.** Future
+  update recovery can use bounded checksummed frames, backed session locks, and
+  process-instance leases without claiming Windows crash durability.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

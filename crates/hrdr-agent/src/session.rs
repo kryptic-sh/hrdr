@@ -636,9 +636,40 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
 #[derive(Debug)]
 pub struct SessionLock {
     lock_path: PathBuf,
+    session_id: String,
+    backed: bool,
     /// PID written into the lock file at acquire — the only identity that may
     /// release this lock.
     pid: u32,
+}
+
+impl SessionLock {
+    /// Whether acquiring this lock created its on-disk open-lock file.
+    pub fn is_backed(&self) -> bool {
+        self.backed
+    }
+
+    /// Whether this guard belongs to exactly `id` after normalizing its file stem.
+    pub fn guards(&self, id: &str) -> bool {
+        self.session_id == sanitize_name(id)
+    }
+
+    /// Whether this guard owns the exact derived open-lock for `session_path`.
+    pub fn guards_path(&self, session_path: &Path) -> bool {
+        let id = session_id_from_path(session_path);
+        let dir = session_path.parent();
+        matches!((id, dir), (Some(id), Some(dir)) if self.lock_path == open_lock_path(dir, &id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_unbacked() -> Self {
+        Self {
+            lock_path: PathBuf::new(),
+            session_id: String::new(),
+            backed: false,
+            pid: 0,
+        }
+    }
 }
 
 impl Drop for SessionLock {
@@ -694,7 +725,16 @@ fn read_open_lock_owner(path: &Path) -> SessionBusy {
 /// user out of their own session it degrades to a best-effort guard whose file
 /// was never created (its `Drop`'s `remove_file` is benign) — the same graceful
 /// fallback [`unique_session_id`] takes.
-pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBusy> {
+/// Acquire the per-session open-lock for `id` in `dir`.
+///
+/// `allow_degraded` is reserved for a new session that has no existing snapshot.
+/// Resuming an existing snapshot must never return an unbacked guard: a failure to
+/// create its lock is indistinguishable from an ownership check that did not run.
+fn acquire_open_lock_mode(
+    dir: &Path,
+    id: &str,
+    allow_degraded: bool,
+) -> Result<SessionLock, SessionBusy> {
     let lock_path = open_lock_path(dir, id);
     loop {
         match std::fs::OpenOptions::new()
@@ -709,6 +749,8 @@ pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBus
                 drop(f);
                 return Ok(SessionLock {
                     lock_path,
+                    session_id: sanitize_name(id),
+                    backed: true,
                     pid: std::process::id(),
                 });
             }
@@ -720,16 +762,31 @@ pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBus
                 }
                 return Err(read_open_lock_owner(&lock_path));
             }
-            // Not a contention error — degrade to an un-backed guard rather than
-            // refusing the owner access to their own session.
-            Err(_) => {
+            // New-session creation may retain the documented best-effort mode.
+            // Existing sessions fail closed: an unbacked guard cannot prove exclusive
+            // ownership, so report it as unavailable rather than loading the snapshot.
+            Err(_) if allow_degraded => {
                 return Ok(SessionLock {
                     lock_path,
+                    session_id: sanitize_name(id),
+                    backed: false,
                     pid: std::process::id(),
                 });
             }
+            Err(_) => return Err(SessionBusy { pid: 0, started: 0 }),
         }
     }
+}
+
+/// Acquire the open-lock for an already-saved session. Lock creation failures are
+/// refusals because returning an unbacked guard would permit concurrent writers.
+fn acquire_existing_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBusy> {
+    acquire_open_lock_mode(dir, id, false)
+}
+
+/// Acquire the per-session lock while creating a new snapshot.
+pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBusy> {
+    acquire_open_lock_mode(dir, id, true)
 }
 
 /// Acquire the open-lock for session `id` living under `cwd`'s directory.
@@ -1156,7 +1213,7 @@ impl Session {
     ) -> Result<(Session, SessionLock), OpenError> {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let id = session_id_from_path(path).unwrap_or_else(|| "session".to_string());
-        let lock = acquire_open_lock(dir, &id)
+        let lock = acquire_existing_open_lock(dir, &id)
             .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
         match Self::load_path(path, unix_style_paths) {
             Ok(session) => Ok((session, lock)),
@@ -2044,6 +2101,36 @@ mod tests {
                 Some("round-trip"),
                 "id from the filename"
             );
+        });
+    }
+
+    #[test]
+    fn handoff_journal_requires_the_saved_session_and_its_backed_lock() {
+        with_test_env(|_tmp| {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            Session::new(state("handoff", &cwd))
+                .save("handoff", false)
+                .unwrap();
+            let lock = acquire_session_lock(&cwd, "handoff").unwrap();
+            let journal = crate::HandoffJournal::open(&cwd, "handoff", &lock).unwrap();
+            assert!(journal.claimable().unwrap().is_none());
+            let wrong = acquire_open_lock(&session_dir(&cwd), "other").unwrap();
+            assert!(crate::HandoffJournal::open(&cwd, "handoff", &wrong).is_err());
+            let other_cwd = format!("{cwd}-other");
+            Session::new(state("handoff", &other_cwd))
+                .save("handoff", false)
+                .unwrap();
+            assert!(crate::HandoffJournal::open(&other_cwd, "handoff", &lock).is_err());
+            let unbacked = SessionLock {
+                lock_path: session_dir(&cwd).join(".unbacked.open.lock"),
+                session_id: "handoff".to_string(),
+                backed: false,
+                pid: std::process::id(),
+            };
+            assert!(crate::HandoffJournal::open(&cwd, "handoff", &unbacked).is_err());
         });
     }
 
@@ -3002,6 +3089,8 @@ mod tests {
         let lock_path = dir.path().join(".never-created.open.lock");
         let guard = SessionLock {
             lock_path: lock_path.clone(),
+            session_id: "never-created".to_string(),
+            backed: false,
             pid: std::process::id(),
         };
         drop(guard);
@@ -3009,6 +3098,31 @@ mod tests {
             !lock_path.exists(),
             "an un-backed guard leaves no lock file behind"
         );
+    }
+
+    #[test]
+    fn existing_session_lock_creation_error_refuses_unbacked_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        assert!(
+            acquire_existing_open_lock(&not_a_directory, "chat").is_err(),
+            "the strict existing-session path must not fabricate an unbacked lock"
+        );
+        let degraded = acquire_open_lock(&not_a_directory, "chat").unwrap();
+        assert!(
+            !degraded.is_backed(),
+            "new-session mode preserves degradation"
+        );
+    }
+
+    #[test]
+    fn open_lock_records_its_backing_and_exact_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = acquire_open_lock(dir.path(), "My Session").unwrap();
+        assert!(lock.is_backed());
+        assert!(lock.guards("my-session"));
+        assert!(!lock.guards("other-session"));
     }
 
     /// A second acquire while the first guard is alive is refused with the live

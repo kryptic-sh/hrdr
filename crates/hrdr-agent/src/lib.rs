@@ -72,6 +72,8 @@ mod attachment_store;
 pub use attachment_store::{
     AttachmentLoss, AttachmentLossReason, AttachmentRef, MessageAttachments,
 };
+mod handoff_journal;
+pub use handoff_journal::*;
 mod session;
 pub use session::*;
 mod pane;

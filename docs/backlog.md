@@ -175,11 +175,17 @@ push each verified slice to `main` before proceeding to the next slice.
     process-instance (not PID-only) ownership; anti-symlink journal storage; and
     a cross-platform crash-durable record replacement API whose parent-directory
     durability failures are surfaced. Do not add an update/restart surface until
-    those invariants have focused recovery tests. CI eligibility is approved:
-    require the latest `push` CI run and latest attempt on `main` for the exact
-    origin-repository hash, with verification and packaging jobs successful;
-    only tag-only publishing jobs may be skipped. Manual and older runs do not
-    qualify.
+    those invariants have focused recovery tests. A best-effort foundation now
+    exists: an append-only checksummed, flushed journal binds a backed
+    session-lock holder to a parseable hashed saved checkpoint and recovers only
+    the newest validated frame. Sudden Windows power loss may lose or
+    ambiguously preserve the newest handoff; no update/restart surface may claim
+    otherwise. Next persist actual continuation queues and wire dedicated
+    recovery before exposing update or restart controls. CI eligibility is
+    approved: require the latest `push` CI run and latest attempt on `main` for
+    the exact origin-repository hash, with verification and packaging jobs
+    successful; only tag-only publishing jobs may be skipped. Manual and older
+    runs do not qualify.
 12. **Windows multiline-paste transport investigation — deferred branch.**
     Pending work is preserved and pushed at `wip/windows-paste-transport` commit
     `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY

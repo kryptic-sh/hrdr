@@ -59,7 +59,8 @@ pub use presentation::display_path;
 pub use proc::{
     CommandEnvironment, CommandRun as CommandProbeRun, CommandRunKind,
     CommandRunKind as CommandProbeRunKind, CommandRunner, CommandRunner as CommandProbeRunner,
-    GitRun, GitRunKind, GitRunner, process_alive, resolve_program,
+    GitRun, GitRunKind, GitRunner, ProcessLease, ProcessLiveness, current_process_lease,
+    process_alive, process_lease_liveness, resolve_program, same_live_process,
 };
 pub use sandbox::{SandboxMode, SandboxNotices, SandboxPolicy};
 pub use test_nudge::{TEST_NUDGE_NOTE, TestNudgeState};
