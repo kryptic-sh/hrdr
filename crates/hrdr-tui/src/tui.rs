@@ -181,7 +181,7 @@ pub(crate) async fn run_recovery_loop(app: &mut App, terminal: &mut Tui) -> Resu
             app.editor.is_insert(),
             &mut cursor_insert,
         )?;
-        if app.should_quit {
+        if app.should_quit || app.recovery_activated() {
             break;
         }
 
@@ -199,15 +199,18 @@ pub(crate) async fn run_loop(
     app: &mut App,
     terminal: &mut Tui,
     command: Option<String>,
+    start_runtime: bool,
 ) -> Result<()> {
-    // Probe the endpoint in the background and warn if it's unreachable or
-    // doesn't have the configured model — surfaced before the first turn.
-    app.spawn_health_check();
-    // The endpoint's advertised context window drives the status bar's gauge and
-    // the auto-compaction threshold; probed once, in the background.
-    app.spawn_context_probe();
-    // `session_start` lifecycle hooks, off-thread like the probes.
-    app.spawn_session_start_hooks();
+    if start_runtime {
+        // Probe the endpoint in the background and warn if it's unreachable or
+        // doesn't have the configured model — surfaced before the first turn.
+        app.spawn_health_check();
+        // The endpoint's advertised context window drives the status bar's gauge and
+        // the auto-compaction threshold; probed once, in the background.
+        app.spawn_context_probe();
+        // `session_start` lifecycle hooks, off-thread like the probes.
+        app.spawn_session_start_hooks();
+    }
     let mut events = EventStream::new();
     let mut rx = app.rx.take().expect("run_loop called once");
     // Periodic wake so the inference spinner animates between tokens.

@@ -148,7 +148,11 @@ pub async fn run_handoff_recovery(
     let mut terminal: Tui = Terminal::new(backend)?;
     let mut app = App::new_recovery(config, ui, logo, recovery.intent)?;
     app.adopt_handoff_recovery(id.to_string(), recovery.session, recovery.lock);
-    tui::run_recovery_loop(&mut app, &mut terminal).await
+    tui::run_recovery_loop(&mut app, &mut terminal).await?;
+    if app.recovery_activated() {
+        tui::run_loop(&mut app, &mut terminal, None, false).await?;
+    }
+    Ok(())
 }
 
 /// Launch the interactive TUI against the configured agent, with `ui` holding
@@ -210,6 +214,6 @@ pub async fn run(
 
     let mut app = App::new(config, ui, logo)?;
     app.connect_mcp().await;
-    tui::run_loop(&mut app, &mut terminal, command).await?;
+    tui::run_loop(&mut app, &mut terminal, command, true).await?;
     Ok(())
 }

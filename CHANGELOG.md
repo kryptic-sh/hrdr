@@ -31,6 +31,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Future update continuations require durable success evidence.** A typed
   `update` tool-call/result pair is saved and checkpoint-bound before recovery
   can validate a continuation intent.
+- **Attested handoff recovery can launch one continuation request.** It restores
+  saved history without a synthetic user message, queue restoration, or tool
+  replay; activation is consumed after one launch.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

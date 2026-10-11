@@ -3583,6 +3583,72 @@ async fn resuming_a_session_repoints_the_agent_to_its_provider() {
 }
 
 #[tokio::test]
+async fn update_recovery_continues_saved_tool_result_once_without_an_opener() {
+    let mock = MockServer::start(vec![MockReply::Text("continued".to_string())]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        base_url: mock.base_url.clone(),
+        model: "local://test-model".parse().unwrap(),
+        cwd: tmp.path().to_path_buf(),
+        context_window: Some(1000),
+        sandbox: hrdr_tools::SandboxMode::None,
+        ..Default::default()
+    };
+    let ui = hrdr_app::UiConfig {
+        auto_resume: false,
+        ..Default::default()
+    };
+    let mut app = App::new_recovery(
+        config,
+        ui,
+        TEST_LOGO,
+        hrdr_agent::HandoffIntent::UpdateContinuation,
+    )
+    .unwrap();
+    app.recovery_state = Some(hrdr_app::SessionState {
+        cwd: tmp.path().to_string_lossy().into_owned(),
+        model: "local://test-model".parse().unwrap(),
+        messages: vec![
+            hrdr_agent::Message::user("run update"),
+            hrdr_agent::Message::tool_result("call_0", "saved update result"),
+        ],
+        ..Default::default()
+    });
+    let mut rx = app.rx.take().unwrap();
+
+    app.on_recovery_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    while app.running() {
+        app.on_turn_msg(rx.recv().await.unwrap());
+    }
+    while let Ok(msg) = rx.try_recv() {
+        app.on_turn_msg(msg);
+    }
+
+    assert!(app.recovery_activated());
+    assert_eq!(
+        mock.request_count(),
+        1,
+        "only the continuation is requested"
+    );
+    assert_eq!(
+        app.state()
+            .messages
+            .iter()
+            .filter(|message| message.content.as_deref() == Some("run update"))
+            .count(),
+        1,
+        "recovery must not synthesize a user opener",
+    );
+    assert_eq!(app.steering_len_for_test(), 0);
+    app.on_recovery_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    assert_eq!(
+        mock.request_count(),
+        1,
+        "a second c cannot launch another turn"
+    );
+}
+
+#[tokio::test]
 async fn resumed_history_is_never_compacted_by_the_launch_provider() {
     let mut h = Harness::new(vec![MockReply::Text("must not be requested".into())]).await;
     let saved = hrdr_app::SessionState {

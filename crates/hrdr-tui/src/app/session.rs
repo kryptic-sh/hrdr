@@ -185,7 +185,9 @@ impl super::App {
         }
     }
 
-    /// Adopt a checkpoint claimed by the dedicated handoff-recovery path.
+    /// Hold a checkpoint for the recovery confirmation. The handoff journal was
+    /// claimed before this method is reached; activation consumes the local
+    /// one-shot capability before adopting this state.
     pub(crate) fn adopt_handoff_recovery(
         &mut self,
         id: String,
@@ -195,17 +197,29 @@ impl super::App {
         self.active_lock = Some(lock);
         let mut state = session.state.restored();
         state.id = Some(id);
-        *self.state_mut() = state;
+        let mut preview = state.clone();
+        preview.messages.clear();
+        preview.todos.clear();
+        preview.goals.clear();
+        preview.crons.clear();
+        *self.state_mut() = preview;
+        self.recovery_state = Some(state);
         match self.passive_recovery {
             Some(hrdr_agent::HandoffIntent::UpdateContinuation) => self.system(
-                "recovered update-continuation checkpoint — press c to acknowledge that continuation is unavailable"
-                    .to_string(),
+                "recovered update-continuation checkpoint — press c to continue".to_string(),
             ),
             Some(hrdr_agent::HandoffIntent::Idle) => {
                 self.system("recovered committed handoff checkpoint".to_string())
             }
             None => {}
         }
+    }
+
+    /// Restore only durable state that can safely resume an already-attested
+    /// continuation. Crons and other startup work remain inactive.
+    pub(super) fn adopt_recovery_state(&mut self, state: hrdr_app::SessionState) {
+        let id = state.id.clone();
+        self.adopt_state_inner(state, id, false);
     }
 
     /// The state-swap half of [`Self::auto_resume_latest`], split out so it can
@@ -566,6 +580,15 @@ impl super::App {
     /// is not valid. The bar said one thing; the socket did another. A conversation's
     /// provider is part of the conversation.
     fn adopt_state(&mut self, state: hrdr_app::SessionState, id: Option<String>) {
+        self.adopt_state_inner(state, id, true);
+    }
+
+    fn adopt_state_inner(
+        &mut self,
+        state: hrdr_app::SessionState,
+        id: Option<String>,
+        restore_crons: bool,
+    ) {
         // Attachments the load could not restore. Taken before the state is
         // adopted, and reported below once the swap is done — a resumed message
         // still carries the "--- Attached files ---" block naming the file, so a
@@ -598,6 +621,9 @@ impl super::App {
                 (!cron.content.is_empty()).then_some(cron)
             })
             .collect();
+        if !restore_crons {
+            state.crons.clear();
+        }
         let transcript = std::mem::take(&mut state.transcript);
         *self.state_mut() = state;
         self.panes.main_mut().replace_transcript(transcript);
@@ -720,10 +746,12 @@ impl super::App {
         if let Ok(mut c) = self.crons.lock() {
             *c = crons;
         }
-        // A resumed session's crons must keep firing: the scheduler tasks die
-        // with the old process, so re-arm every restored cron. Idempotent — a
-        // cron whose scheduler is already live is skipped.
-        self.with_agent(|a| a.arm_crons());
+        if restore_crons {
+            // A resumed session's crons must keep firing: the scheduler tasks die
+            // with the old process, so re-arm every restored cron. Idempotent — a
+            // cron whose scheduler is already live is skipped.
+            self.with_agent(|a| a.arm_crons());
+        }
         // A resumed session is a different transcript — every index-based view
         // state (opened thoughts and tools) from the session we left is meaningless here.
         self.tool_groups.clear();

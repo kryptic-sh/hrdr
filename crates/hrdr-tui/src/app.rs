@@ -520,11 +520,13 @@ pub(crate) struct App {
     /// Once a handoff commit is durable, input is frozen until its owner takes
     /// recovery action outside this frontend.
     handoff_gate: bool,
-    /// This app only renders a committed handoff checkpoint and accepts its
-    /// explicitly safe recovery interaction. It must never start or deliver work.
+    /// This app renders a committed handoff checkpoint until its explicitly safe
+    /// recovery interaction activates it.
     passive_recovery: Option<HandoffIntent>,
-    /// `UpdateContinuation` accepts exactly one confirmation, which only reports
-    /// that continuation is unavailable and exits without launching anything.
+    /// The claimed checkpoint held until an update continuation is activated.
+    recovery_state: Option<hrdr_app::SessionState>,
+    /// `UpdateContinuation` accepts exactly one confirmation and launches exactly
+    /// one opener-less continuation turn.
     recovery_confirmation_used: bool,
     /// The open-lock for the session currently loaded, if any. Held for the whole
     /// time this session is active so a second hrdr instance can't resume the same
@@ -1005,6 +1007,7 @@ impl App {
             save_done: Arc::new(tokio::sync::Notify::new()),
             handoff_gate: recovery.is_some(),
             passive_recovery: recovery,
+            recovery_state: None,
             recovery_confirmation_used: false,
             active_lock: None,
             pending_reservation: None,
@@ -1266,12 +1269,19 @@ impl App {
             && key.modifiers.is_empty()
             && key.code == KeyCode::Char('c')
         {
+            // Claim the one-shot capability before adopting any state or starting
+            // work, so a repeated key cannot open another continuation turn.
             self.recovery_confirmation_used = true;
-            self.system(
-                "update continuation is not available in this build; no update was started"
-                    .to_string(),
-            );
-            self.should_quit = true;
+            let Some(state) = self.recovery_state.take() else {
+                self.system("recovery checkpoint is unavailable".to_string());
+                self.should_quit = true;
+                return;
+            };
+            self.handoff_gate = false;
+            self.passive_recovery = None;
+            self.steering = hrdr_agent::steering_queue();
+            self.adopt_recovery_state(state);
+            self.launch_turn();
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1279,6 +1289,10 @@ impl App {
         {
             self.should_quit = true;
         }
+    }
+
+    pub(crate) fn recovery_activated(&self) -> bool {
+        self.recovery_confirmation_used && self.passive_recovery.is_none() && !self.handoff_gate
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
@@ -3807,7 +3821,7 @@ mod tests {
     }
 
     #[test]
-    fn update_continuation_confirms_once_then_exits_without_work() {
+    fn update_continuation_stays_passive_until_confirmed() {
         let tmp = tempfile::tempdir().unwrap();
         let config = AgentConfig {
             base_url: "http://127.0.0.1:1/v1".to_string(),
@@ -3830,26 +3844,12 @@ mod tests {
 
         app.on_paste("!echo unsafe");
         app.maybe_deliver_background();
-        app.on_recovery_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-
-        assert!(app.recovery_confirmation_used);
-        assert!(app.should_quit);
+        assert!(!app.recovery_confirmation_used);
+        assert!(!app.should_quit);
         assert!(app.composer_is_empty());
         assert!(app.user_shell.is_none());
         assert_eq!(app.steering_len_for_test(), 0);
         assert!(app.registry.is_handoff_quiescent());
-
-        app.on_recovery_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert!(
-            app.recovery_confirmation_used,
-            "a second confirmation is inert"
-        );
     }
 
     #[test]
