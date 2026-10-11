@@ -822,6 +822,14 @@ impl std::fmt::Display for HandoffPending {
 
 impl std::error::Error for HandoffPending {}
 
+/// A claimed handoff snapshot held under its existing open-lock.
+#[derive(Debug)]
+pub struct HandoffRecovery {
+    pub session: Session,
+    pub lock: SessionLock,
+    pub record: crate::HandoffRecord,
+}
+
 /// Why [`Session::open_path`] couldn't take ownership of a session.
 #[derive(Debug)]
 pub enum OpenError {
@@ -1263,6 +1271,53 @@ impl Session {
         unix_style_paths: bool,
     ) -> Result<(Session, SessionLock), OpenError> {
         Self::open_path(&session_file_path(cwd, id), unix_style_paths)
+    }
+
+    /// Recover a committed handoff under the saved session's exact existing lock.
+    ///
+    /// This path never falls back to an unbacked lock. It loads the snapshot before
+    /// claiming its bound journal record and releases the lock on every failure.
+    pub fn recover_handoff<F>(
+        cwd: &str,
+        id: &str,
+        unix_style_paths: bool,
+        validate: F,
+    ) -> Result<HandoffRecovery, OpenError>
+    where
+        F: FnOnce(&[u8]) -> Result<()>,
+    {
+        let path = session_file_path(cwd, id);
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let id = sanitize_name(id);
+        let lock = acquire_existing_open_lock(dir, &id)
+            .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
+        let session = match Self::load_path(&path, unix_style_paths) {
+            Ok(session) => session,
+            Err(error) => return Err(OpenError::Load(error)),
+        };
+        if session.state.cwd != cwd || session.state.id.as_deref() != Some(id.as_str()) {
+            return Err(OpenError::Load(anyhow::anyhow!(
+                "saved session does not match handoff"
+            )));
+        }
+        let journal = match crate::HandoffJournal::open_for_loaded(cwd, &id, &lock, &session) {
+            Ok(journal) => journal,
+            Err(error) => return Err(OpenError::Load(error)),
+        };
+        let record = match journal.claim(validate) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return Err(OpenError::Load(anyhow::anyhow!(
+                    "no claimable committed handoff"
+                )));
+            }
+            Err(error) => return Err(OpenError::Load(error)),
+        };
+        Ok(HandoffRecovery {
+            session,
+            lock,
+            record,
+        })
     }
 
     /// Open a **copy** of the session at `source_path` as a fresh, independently

@@ -127,6 +127,30 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
+pub async fn run_handoff_recovery(
+    config: AgentConfig,
+    mut ui: hrdr_app::UiConfig,
+    logo: &'static str,
+    id: &str,
+) -> Result<()> {
+    ui.auto_resume = false;
+    let cwd = config.cwd.to_string_lossy();
+    let recovery = hrdr_agent::Session::recover_handoff(
+        &cwd,
+        id,
+        config.unix_style_paths,
+        app::validate_handoff_payload,
+    )
+    .map_err(anyhow::Error::from)?;
+
+    let _guard = TerminalGuard::enter()?;
+    let backend = cursor_backend::CursorBackend::new(CrosstermBackend::new(stdout()));
+    let mut terminal: Tui = Terminal::new(backend)?;
+    let mut app = App::new_recovery(config, ui, logo)?;
+    app.adopt_handoff_recovery(id.to_string(), recovery.session, recovery.lock);
+    tui::run_recovery_loop(&mut app, &mut terminal).await
+}
+
 /// Launch the interactive TUI against the configured agent, with `ui` holding
 /// the display knobs (theme, icons, vim mode, …) split out of the agent config.
 ///

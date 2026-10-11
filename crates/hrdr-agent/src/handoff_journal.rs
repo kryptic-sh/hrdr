@@ -115,6 +115,38 @@ impl<'a> HandoffJournal<'a> {
         })
     }
 
+    /// Open the journal bound to an already-loaded, exclusively locked snapshot.
+    ///
+    /// Recovery uses this instead of [`Self::open`] so it parses the snapshot only
+    /// once while still hashing the exact bytes protected by its open-lock.
+    pub fn open_for_loaded(
+        cwd: &str,
+        id: &str,
+        lock: &'a SessionLock,
+        session: &Session,
+    ) -> Result<Self> {
+        let id = sanitize_name(id);
+        if !lock.is_backed() {
+            bail!("handoff journal requires a backed session lock");
+        }
+        let session_path = session_file_path(cwd, &id);
+        if !lock.guards_path(&session_path) {
+            bail!("session lock does not guard {}", session_path.display());
+        }
+        if session.state.id.as_deref() != Some(id.as_str()) || session.state.cwd != cwd {
+            bail!("loaded session does not match handoff binding");
+        }
+        let bytes = std::fs::read(&session_path)
+            .with_context(|| format!("reading {}", session_path.display()))?;
+        let path = session_path.with_file_name(format!("{id}.handoff"));
+        Ok(Self {
+            append_lock: journal_lock(&path),
+            path,
+            session_hash: Sha256::digest(bytes).into(),
+            _lock: lock,
+        })
+    }
+
     /// Append a checkpoint after checking it still belongs to the saved snapshot.
     ///
     /// The source identity is captured from this process, rather than accepted from
@@ -148,15 +180,57 @@ impl<'a> HandoffJournal<'a> {
         Ok(())
     }
 
-    /// Return the newest valid checkpoint if its source is certainly not live.
+    /// Claim the newest committed checkpoint after its source lease is certainly gone.
+    ///
+    /// The scan, liveness check, and durable `Claim` append share one process-local
+    /// append lock. A failed append leaves the committed frame in place for retry.
+    pub fn claim<F>(&self, validate: F) -> Result<Option<HandoffRecord>>
+    where
+        F: FnOnce(&[u8]) -> Result<()>,
+    {
+        let _append_guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("handoff journal append lock is poisoned"))?;
+        let Some(record) = self.claimable()? else {
+            return Ok(None);
+        };
+        validate(&record.payload)?;
+        let source = hrdr_tools::current_process_lease()
+            .context("process-instance handoff journals are unsupported on this platform")?;
+        let frame = self.frame(record.epoch, HandoffState::Claim, source, &record.payload)?;
+        self.append_frame_locked(&frame)?;
+        Ok(Some(record))
+    }
+
+    fn append_frame_locked(&self, frame: &[u8]) -> Result<()> {
+        let scan = self.scan()?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        if let Some(prefix) = scan.truncate_to {
+            file.set_len(prefix)
+                .with_context(|| format!("truncating torn {}", self.path.display()))?;
+        }
+        file.seek(SeekFrom::End(0))?;
+        debug_assert_eq!(file.stream_position()?, scan.valid_end);
+        file.write_all(frame)
+            .with_context(|| format!("appending {}", self.path.display()))?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Return the newest committed checkpoint if its source is certainly not live.
     pub fn claimable(&self) -> Result<Option<HandoffRecord>> {
         let Some(record) = self.scan()?.last else {
             return Ok(None);
         };
-        if !matches!(
-            record.state,
-            HandoffState::Commit | HandoffState::OwnedAbandon
-        ) {
+        if !claimable_state(record.state) {
             return Ok(None);
         }
         match hrdr_tools::process_lease_liveness(record.source) {
@@ -299,6 +373,10 @@ impl<'a> HandoffJournal<'a> {
     }
 }
 
+fn claimable_state(state: HandoffState) -> bool {
+    state == HandoffState::Commit
+}
+
 fn requires_recovery_state(state: Option<HandoffState>) -> bool {
     matches!(
         state,
@@ -427,6 +505,18 @@ mod tests {
         assert!(requires_recovery_state(Some(HandoffState::Commit)));
         assert!(requires_recovery_state(Some(HandoffState::OwnedAbandon)));
         assert!(!requires_recovery_state(Some(HandoffState::Claim)));
+    }
+
+    #[test]
+    fn only_commits_are_claimable() {
+        for (state, claimable) in [
+            (HandoffState::Prepare, false),
+            (HandoffState::Commit, true),
+            (HandoffState::OwnedAbandon, false),
+            (HandoffState::Claim, false),
+        ] {
+            assert_eq!(claimable_state(state), claimable, "{state:?}");
+        }
     }
 
     #[test]

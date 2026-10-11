@@ -22,6 +22,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process-instance leases without claiming Windows crash durability.
 - **Idle sessions can commit a best-effort handoff checkpoint.** Ordinary resume
   now refuses its committed journal marker until dedicated recovery is wired.
+- **Hidden handoff recovery displays checkpoints passively.** Recovery claims a
+  dead-owner idle checkpoint without starting probes, workers, hooks, queues,
+  tools, models, or shell commands.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

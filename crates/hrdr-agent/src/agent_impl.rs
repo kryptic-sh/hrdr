@@ -49,6 +49,19 @@ fn preflight_unnamed_model(resolved: &ResolvedModel) -> Result<()> {
 impl Agent {
     /// Construct an agent, seeding the system prompt for the default tool set.
     pub fn new(config: AgentConfig) -> Result<Self> {
+        Self::new_inner(config, true)
+    }
+
+    /// Construct an inert agent for checkpoint recovery rendering.
+    ///
+    /// The recovery frontend never runs this agent. Suppressing startup workers
+    /// keeps a recovered handoff from contacting endpoints or spawning language
+    /// servers before the operator explicitly starts a new session.
+    pub fn new_passive(config: AgentConfig) -> Result<Self> {
+        Self::new_inner(config, false)
+    }
+
+    fn new_inner(config: AgentConfig, start_workers: bool) -> Result<Self> {
         if let Some(cap) = config.max_cost
             && (!cap.is_finite() || cap < 0.0)
         {
@@ -111,7 +124,8 @@ impl Agent {
         // indexing-heavy servers (rust-analyzer) overlap their warm-up with
         // the first prompt instead of missing the first edit's diagnostics.
         // `try_current` keeps this a no-op outside a runtime (sync tests).
-        if let Some(lsp) = &lsp
+        if start_workers
+            && let Some(lsp) = &lsp
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
             let exts = project_lsp_extensions(&config.cwd);
@@ -134,7 +148,7 @@ impl Agent {
         // not just the one in use, since `/model` offers them all. models.dev is
         // warmed unconditionally: it needs no credential, so it is the one list
         // that must land even for a user logged in to nothing.
-        if !config.delegated && tokio::runtime::Handle::try_current().is_ok() {
+        if start_workers && !config.delegated && tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(provider_catalog::refresh_all(config.clone()));
         }
         if config.subagents {

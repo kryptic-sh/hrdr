@@ -70,7 +70,7 @@ fn sync_title<W: std::io::Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::{edited_file_message, terminal_title};
+    use super::{App, edited_file_message, handle_recovery_event, terminal_title};
 
     #[test]
     fn edited_file_path_style_preserves_raw_path() {
@@ -84,6 +84,40 @@ mod tests {
             assert_eq!(edited_file_message(&path, style), format!("edited {label}"));
             assert_eq!(path.as_os_str(), std::ffi::OsStr::new(raw));
         }
+    }
+
+    #[test]
+    fn recovery_loop_ignores_paste_and_mouse_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = hrdr_agent::AgentConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "local://test-model".parse().unwrap(),
+            cwd: tmp.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            ..Default::default()
+        };
+        let ui = hrdr_app::UiConfig {
+            auto_resume: false,
+            ..Default::default()
+        };
+        let mut app = App::new_recovery(config, ui, "logo").unwrap();
+
+        handle_recovery_event(
+            &mut app,
+            crossterm::event::Event::Paste("!echo unsafe".into()),
+        );
+        handle_recovery_event(
+            &mut app,
+            crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }),
+        );
+
+        assert!(app.composer_is_empty());
+        assert_eq!(app.steering_len_for_test(), 0);
     }
 
     #[test]
@@ -121,6 +155,41 @@ pub(crate) async fn wait_for_event(
         // An offscreen logo must not keep an idle transcript redrawing.
         _ = ticker.tick(), if app.spinner_live() => Wake::Animation,
     }
+}
+
+fn handle_recovery_event(app: &mut App, event: Event) {
+    if let Event::Key(key) = event {
+        app.on_recovery_key(key);
+    }
+}
+
+pub(crate) async fn run_recovery_loop(app: &mut App, terminal: &mut Tui) -> Result<()> {
+    let mut events = EventStream::new();
+    let mut cursor_insert = None;
+    let mut terminal_title_sent = None;
+
+    loop {
+        crate::cursor_backend::draw_frame(terminal, |f| ui::draw(f, app))?;
+        sync_title(
+            terminal.backend_mut(),
+            terminal_title(&app.state().name),
+            &mut terminal_title_sent,
+        )?;
+        sync_cursor(
+            terminal.backend_mut(),
+            app.editor.is_insert(),
+            &mut cursor_insert,
+        )?;
+        if app.should_quit {
+            break;
+        }
+
+        match events.next().await {
+            Some(Ok(event)) => handle_recovery_event(app, event),
+            Some(Err(_)) | None => break,
+        }
+    }
+    Ok(())
 }
 
 /// Drive `app` against the terminal until it quits: draw, then await terminal

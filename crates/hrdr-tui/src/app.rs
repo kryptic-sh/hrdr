@@ -86,6 +86,7 @@ mod commands;
 mod completion;
 use completion::CompletionKind;
 mod handoff;
+pub(crate) use handoff::validate_handoff_payload;
 mod selector;
 mod session;
 mod util;
@@ -519,6 +520,9 @@ pub(crate) struct App {
     /// Once a handoff commit is durable, input is frozen until its owner takes
     /// recovery action outside this frontend.
     handoff_gate: bool,
+    /// This app only renders a committed handoff checkpoint and accepts a safe
+    /// exit key. It must never start or deliver agent work.
+    passive_recovery: bool,
     /// The open-lock for the session currently loaded, if any. Held for the whole
     /// time this session is active so a second hrdr instance can't resume the same
     /// session and silently clobber our turns (last-writer-wins). Set when a
@@ -849,9 +853,26 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(
+        config: AgentConfig,
+        ui: hrdr_app::UiConfig,
+        logo: &'static str,
+    ) -> Result<Self> {
+        Self::new_inner(config, ui, logo, false)
+    }
+
+    pub(crate) fn new_recovery(
+        config: AgentConfig,
+        ui: hrdr_app::UiConfig,
+        logo: &'static str,
+    ) -> Result<Self> {
+        Self::new_inner(config, ui, logo, true)
+    }
+
+    fn new_inner(
         mut config: AgentConfig,
         ui: hrdr_app::UiConfig,
         logo: &'static str,
+        recovery: bool,
     ) -> Result<Self> {
         // A new app starts a distinct set of panes but shares this thread's render
         // caches with the prior instance (notably in in-process test/preview hosts).
@@ -899,7 +920,11 @@ impl App {
         // ageing itself is the agent's — hand the preference over.
         config.todo_ttl = todo_ttl;
         let cfg = config.clone();
-        let agent = Agent::new(config)?;
+        let agent = if recovery {
+            Agent::new_passive(config)?
+        } else {
+            Agent::new(config)?
+        };
         let todos = agent.todos();
         let goals = agent.goals();
         let crons = agent.crons();
@@ -974,7 +999,8 @@ impl App {
             pending_save: None,
             save_in_flight: false,
             save_done: Arc::new(tokio::sync::Notify::new()),
-            handoff_gate: false,
+            handoff_gate: recovery,
+            passive_recovery: recovery,
             active_lock: None,
             pending_reservation: None,
             editor,
@@ -1083,15 +1109,17 @@ impl App {
             should_quit: false,
             terminal_lost: Arc::new(AtomicBool::new(false)),
         };
-        // The session's agent joins the registry alongside every delegated one, so
-        // the frontend can build its view the same way for all of them.
-        app.publish_main_agent();
-        // Watch the working tree so a change to it (a new file, a `git pull`)
-        // invalidates the `@file` completion index instead of leaving the cached
-        // snapshot stale forever. Re-armed on every cwd change.
-        app.arm_file_watcher(&cwd_for_commands);
-        if auto_resume {
-            app.auto_resume_latest();
+        if !recovery {
+            // The session's agent joins the registry alongside every delegated one, so
+            // the frontend can build its view the same way for all of them.
+            app.publish_main_agent();
+            // Watch the working tree so a change to it (a new file, a `git pull`)
+            // invalidates the `@file` completion index instead of leaving the cached
+            // snapshot stale forever. Re-armed on every cwd change.
+            app.arm_file_watcher(&cwd_for_commands);
+            if auto_resume {
+                app.auto_resume_latest();
+            }
         }
         Ok(app)
     }
@@ -1218,6 +1246,18 @@ impl App {
             // `maybe_reload_config` re-checks on the next wake anyway.
             let _ = tx.try_send(TurnMsg::ConfigChanged);
         })
+    }
+
+    /// Handle the only recovery interaction: leave without touching the checkpoint.
+    pub(crate) fn on_recovery_key(&mut self, key: KeyEvent) {
+        if !self.passive_recovery || key.kind == KeyEventKind::Release {
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
+        {
+            self.should_quit = true;
+        }
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
@@ -1516,6 +1556,9 @@ impl App {
     /// command handed to hrdr on the command line (`hrdr /new`) is another, and it
     /// gets exactly the behaviour typing it would.
     pub(crate) fn submit_input(&mut self, input: String) -> Action {
+        if self.handoff_gate {
+            return Action::None;
+        }
         {
             if input.trim().is_empty() {
                 return Action::None;
@@ -1821,6 +1864,9 @@ impl App {
     /// spellings are already there: prefix it with `@`, or press Ctrl+]
     /// ([`Self::paste_clipboard`]), which reads the clipboard's *file* flavour.
     pub(crate) fn on_paste(&mut self, text: &str) {
+        if self.handoff_gate {
+            return;
+        }
         self.disarm();
         // A clipboard or terminal paste can be poisoned with a multi-MB blob (a
         // web page can set the text clipboard). The editor buffer is re-wrapped
@@ -3531,7 +3577,7 @@ impl App {
     /// CANCELLED entry (`task_cancel`) never wakes anyone — the turn it would
     /// spawn has nothing to deliver.
     pub(crate) fn maybe_deliver_background(&mut self) {
-        if self.running() || self.compacting() {
+        if self.handoff_gate || self.running() || self.compacting() {
             return;
         }
         let ready = self
@@ -3682,6 +3728,53 @@ mod tests {
 
     use super::{App, Entry, EntryKind};
     use hrdr_agent::{AgentConfig, AgentEntry, AgentRegistry, MAIN_KEY, PaneId};
+
+    #[test]
+    fn recovery_constructor_is_passive_and_rejects_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "local://test-model".parse().unwrap(),
+            cwd: tmp.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            ..Default::default()
+        };
+        let ui = hrdr_app::UiConfig {
+            auto_resume: false,
+            ..Default::default()
+        };
+        let mut app = App::new_recovery(config, ui, "logo").unwrap();
+
+        assert!(app.passive_recovery);
+        assert!(app.handoff_gate);
+        assert!(app.registry.is_handoff_quiescent());
+        assert!(
+            app.rx.is_some(),
+            "recovery loop must not consume agent messages"
+        );
+
+        assert!(matches!(
+            app.submit_input("!echo unsafe".to_string()),
+            super::Action::None
+        ));
+        app.on_paste("queued prompt");
+        app.maybe_deliver_background();
+        assert!(app.composer_is_empty());
+        assert!(app.user_shell.is_none());
+        assert_eq!(app.steering_len_for_test(), 0);
+        assert!(!app.should_quit);
+
+        app.on_recovery_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.should_quit);
+        app.on_recovery_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(app.should_quit);
+    }
 
     #[test]
     fn handoff_gate_ignores_input() {

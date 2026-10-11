@@ -521,6 +521,30 @@ fn run_sandbox_exec_wrapper() -> Option<Result<i32>> {
     })())
 }
 
+fn handoff_recovery_arg() -> Option<Result<String>> {
+    handoff_recovery_arg_from(std::env::args_os().skip(1))
+}
+
+fn handoff_recovery_arg_from(
+    mut argv: impl Iterator<Item = std::ffi::OsString>,
+) -> Option<Result<String>> {
+    if argv.next()?.as_os_str() != "__recover-handoff" {
+        return None;
+    }
+    Some((|| {
+        let id = argv
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("__recover-handoff requires a session id"))?;
+        anyhow::ensure!(
+            argv.next().is_none(),
+            "__recover-handoff accepts one session id"
+        );
+        Ok(id)
+    })())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Before anything else, including the tracing subscriber and clap: this
@@ -530,6 +554,16 @@ async fn main() -> Result<()> {
         // Exit here, with the child's own code: the wrapper must not fall through
         // into a session.
         std::process::exit(result?);
+    }
+
+    if let Some(id) = handoff_recovery_arg() {
+        let id = id?;
+        let (config, diagnostics) = AgentConfig::load_diagnosed();
+        if let Some(message) = diagnostics.error_message() {
+            anyhow::bail!(message);
+        }
+        let (ui, _) = hrdr_app::UiConfig::load_diagnosed();
+        return hrdr_tui::run_handoff_recovery(config, ui, LOGO_ART, &id).await;
     }
 
     tracing_subscriber::fmt()
@@ -1785,6 +1819,32 @@ mod cli_tests {
         let cli = Cli::parse_from(["hrdr"]);
         assert!(cli.command.is_none());
         assert!(cli.input.is_empty());
+    }
+    #[test]
+    fn hidden_handoff_recovery_is_parsed_before_clap() {
+        let args = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert_eq!(
+            handoff_recovery_arg_from(args(&["__recover-handoff", "saved-session"]))
+                .transpose()
+                .unwrap(),
+            Some("saved-session".to_string())
+        );
+        assert!(handoff_recovery_arg_from(args(&["/new"])).is_none());
+        assert!(
+            handoff_recovery_arg_from(args(&["__recover-handoff"]))
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            handoff_recovery_arg_from(args(&["__recover-handoff", "id", "extra"]))
+                .unwrap()
+                .is_err()
+        );
     }
 }
 

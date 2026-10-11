@@ -182,12 +182,14 @@ push each verified slice to `main` before proceeding to the next slice.
     ambiguously preserve the newest handoff; no update/restart surface may claim
     otherwise. An internal coordinator now commits only an idle saved session
     and rejects runtime queues, child tasks, watches, drafts, active turns, and
-    save errors. Next persist actual continuation queues and wire dedicated
-    recovery before exposing update or restart controls. CI eligibility is
-    approved: require the latest `push` CI run and latest attempt on `main` for
-    the exact origin-repository hash, with verification and packaging jobs
-    successful; only tag-only publishing jobs may be skipped. Manual and older
-    runs do not qualify.
+    save errors. Hidden passive recovery now claims only dead-owner committed
+    checkpoints, restoring no queues and starting no runtime work. Next persist
+    actual continuation queues and enable a deliberate continuation before
+    exposing update or restart controls. CI eligibility is approved: require the
+    latest `push` CI run and latest attempt on `main` for the exact
+    origin-repository hash, with verification and packaging jobs successful;
+    only tag-only publishing jobs may be skipped. Manual and older runs do not
+    qualify.
 12. **Windows multiline-paste transport investigation — deferred branch.**
     Pending work is preserved and pushed at `wip/windows-paste-transport` commit
     `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY

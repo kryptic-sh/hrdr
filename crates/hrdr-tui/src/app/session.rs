@@ -185,6 +185,20 @@ impl super::App {
         }
     }
 
+    /// Adopt a checkpoint claimed by the dedicated handoff-recovery path.
+    pub(crate) fn adopt_handoff_recovery(
+        &mut self,
+        id: String,
+        session: hrdr_app::Session,
+        lock: hrdr_agent::SessionLock,
+    ) {
+        self.active_lock = Some(lock);
+        let mut state = session.state.restored();
+        state.id = Some(id);
+        *self.state_mut() = state;
+        self.system("recovered committed handoff checkpoint".to_string());
+    }
+
     /// The state-swap half of [`Self::auto_resume_latest`], split out so it can
     /// be driven without a session file on disk.
     pub(super) fn auto_resume_state(&mut self, state: hrdr_app::SessionState, id: String) {

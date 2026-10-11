@@ -5,6 +5,37 @@ use super::*;
 #[allow(dead_code)]
 const HANDOFF_PAYLOAD: &[u8] = br#"{"version":1,"runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#;
 
+pub(crate) fn validate_handoff_payload(payload: &[u8]) -> anyhow::Result<()> {
+    let payload: serde_json::Value = serde_json::from_slice(payload)?;
+    let object = payload
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("handoff payload must be an object"))?;
+    const FIELDS: [&str; 7] = [
+        "version",
+        "runtime_queue",
+        "runtime_tasks",
+        "runtime_tools",
+        "runtime_turn",
+        "runtime_compaction",
+        "runtime_watch",
+    ];
+    anyhow::ensure!(
+        object.len() == FIELDS.len() && object.keys().all(|key| FIELDS.contains(&key.as_str())),
+        "handoff payload has unknown or missing fields"
+    );
+    anyhow::ensure!(
+        object.get("version").and_then(serde_json::Value::as_u64) == Some(1),
+        "unsupported handoff payload version"
+    );
+    for field in &FIELDS[1..] {
+        anyhow::ensure!(
+            object.get(*field).and_then(serde_json::Value::as_bool) == Some(false),
+            "handoff payload contains active runtime work"
+        );
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 impl App {
     /// Persist and commit a handoff checkpoint only while no runtime work remains.
@@ -72,5 +103,26 @@ impl App {
             && self.composer_is_empty()
             && self.stash.is_empty()
             && self.pending_attachments.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_handoff_payload;
+
+    #[test]
+    fn recovery_payload_requires_an_idle_known_schema() {
+        assert!(validate_handoff_payload(
+            br#"{"version":1,"runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#
+        )
+        .is_ok());
+        assert!(validate_handoff_payload(
+            br#"{"version":1,"runtime_queue":true,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#
+        )
+        .is_err());
+        assert!(validate_handoff_payload(
+            br#"{"version":1,"runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false,"extra":false}"#
+        )
+        .is_err());
     }
 }
