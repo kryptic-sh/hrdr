@@ -4,6 +4,8 @@
 //! the exact old process instance to exit, installs the validated checkout, and
 //! starts the installed binary's handoff recovery exactly once.
 
+#[cfg(windows)]
+use crate::update_check::AdmittedCheckout;
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::process::Command;
@@ -18,8 +20,6 @@ const MAX_RETRIES: u8 = 3;
 const MAX_DEADLINE_SECS: u64 = 24 * 60 * 60;
 #[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
-#[cfg(windows)]
-const STAGING_DIR: &str = ".hrdr/update-staging";
 
 #[derive(Debug)]
 struct Request {
@@ -52,15 +52,15 @@ impl PreparedWindowsUpdateCoordinator {
     fn prepare(
         session_id: &str,
         operation_id: &hrdr_agent::UpdateOperationId,
-        checkout_root: &Path,
-        expected_commit: &str,
+        checkout: &AdmittedCheckout,
     ) -> anyhow::Result<Self> {
         use anyhow::Context;
         use std::io::Write;
 
-        let checkout_root = canonical_absolute(checkout_root).map_err(|_| {
+        let checkout_root = canonical_absolute(checkout.canonical_root()).map_err(|_| {
             anyhow::anyhow!("update checkout root is not a canonical absolute path")
         })?;
+        let expected_commit = checkout.expected_commit();
         anyhow::ensure!(
             checkout_root.is_dir(),
             "update checkout root is not a directory"
@@ -82,22 +82,25 @@ impl PreparedWindowsUpdateCoordinator {
             "current executable is not a regular file"
         );
 
-        let staging_root = checkout_root.join(STAGING_DIR);
-        fs::create_dir_all(&staging_root).context("creating update staging directory")?;
-        let staging_root = canonical_absolute(&staging_root)
-            .map_err(|_| anyhow::anyhow!("update staging directory is not canonical"))?;
-        anyhow::ensure!(
-            staging_root.starts_with(&checkout_root),
-            "update staging directory escapes the checkout"
-        );
         let operation_hash = sha256_hex(operation_id.as_str().as_bytes());
+        let executable_parent = intended_cargo_bin
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("current executable has no parent directory"))?;
+        let operation_root = executable_parent.join(format!(".hrdr-update-{operation_hash}"));
+        fs::create_dir(&operation_root).context("creating update operation directory")?;
+        let operation_root = canonical_absolute(&operation_root)
+            .map_err(|_| anyhow::anyhow!("update operation directory is not canonical"))?;
+        anyhow::ensure!(
+            operation_root.parent() == Some(executable_parent),
+            "update operation directory escapes the executable directory"
+        );
         let extension = intended_cargo_bin
             .extension()
             .and_then(|value| value.to_str())
             .filter(|value| !value.is_empty())
             .unwrap_or("exe");
         let candidate_binary =
-            staging_root.join(format!("coordinator-{operation_hash}.{extension}"));
+            operation_root.join(format!("coordinator-{operation_hash}.{extension}"));
         let source_bytes =
             fs::read(&intended_cargo_bin).context("reading the current executable")?;
         let mut candidate = fs::OpenOptions::new()
@@ -115,7 +118,7 @@ impl PreparedWindowsUpdateCoordinator {
         let candidate_binary = canonical_absolute(&candidate_binary)
             .map_err(|_| anyhow::anyhow!("staged coordinator executable is not canonical"))?;
 
-        let request_path = staging_root.join(format!("request-{operation_hash}.json"));
+        let request_path = operation_root.join(format!("request-{operation_hash}.json"));
         let mut request = Request {
             session_id: session_id.to_owned(),
             checkout_root,
@@ -609,14 +612,33 @@ fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathB
     }
 
     let checkout_root = canonical_absolute(&request.checkout_root)?;
-    let staging_root = request_path.parent().ok_or(())?;
-    let candidate = canonical_absolute(&request.candidate_binary)?;
-    if !candidate.is_file() || candidate.parent() != Some(staging_root) {
+    if !checkout_root.is_dir() {
         return Err(());
     }
-    if !request.intended_cargo_bin.is_absolute()
-        || contains_control_path(&request.intended_cargo_bin)
-    {
+    let intended_cargo_bin = canonical_absolute(&request.intended_cargo_bin)?;
+    if !intended_cargo_bin.is_file() {
+        return Err(());
+    }
+    let operation_root = canonical_absolute(request_path.parent().ok_or(())?)?;
+    if operation_root.parent() != intended_cargo_bin.parent() {
+        return Err(());
+    }
+    let operation_hash = sha256_hex(request.operation_id.as_bytes());
+    let extension = intended_cargo_bin
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("exe");
+    let expected_candidate =
+        operation_root.join(format!("coordinator-{operation_hash}.{extension}"));
+    let candidate = canonical_absolute(&request.candidate_binary)?;
+    if !candidate.is_file() || candidate != expected_candidate {
+        return Err(());
+    }
+    let request_name = format!("request-{operation_hash}");
+    let expected_request = operation_root.join(format!("{request_name}.json"));
+    let expected_claimed = operation_root.join(format!("{request_name}.in-progress"));
+    if request_path != expected_request && request_path != expected_claimed {
         return Err(());
     }
     Ok(checkout_root)
@@ -757,13 +779,11 @@ mod tests {
     fn prepared_request_is_accepted_by_the_strict_parser() {
         let temp = tempfile::tempdir().unwrap();
         let operation = hrdr_agent::UpdateOperationId::new("prepared-request").unwrap();
-        let prepared = PreparedWindowsUpdateCoordinator::prepare(
-            "saved-session",
-            &operation,
-            temp.path(),
-            &"0".repeat(40),
-        )
-        .unwrap();
+        let checkout =
+            AdmittedCheckout::for_test(canonical_absolute(temp.path()).unwrap(), "0".repeat(40));
+        let prepared =
+            PreparedWindowsUpdateCoordinator::prepare("saved-session", &operation, &checkout)
+                .unwrap();
 
         let request = parse_request(&fs::read(&prepared.request_path).unwrap()).unwrap();
         let lease = hrdr_tools::current_process_lease().unwrap();
@@ -776,6 +796,7 @@ mod tests {
             request.intended_cargo_bin,
             canonical_absolute(&std::env::current_exe().unwrap()).unwrap()
         );
+        fs::remove_dir_all(prepared.candidate_binary.parent().unwrap()).unwrap();
     }
 
     #[cfg(windows)]
@@ -784,16 +805,19 @@ mod tests {
         use hrdr_tui::PreparedUpdateCoordinator;
 
         let temp = tempfile::tempdir().unwrap();
+        let checkout =
+            AdmittedCheckout::for_test(canonical_absolute(temp.path()).unwrap(), "0".repeat(40));
         let prepared = PreparedWindowsUpdateCoordinator::prepare(
             "saved-session",
             &hrdr_agent::UpdateOperationId::new("spawn-failure").unwrap(),
-            temp.path(),
-            &"0".repeat(40),
+            &checkout,
         )
         .unwrap();
+        let operation_root = prepared.candidate_binary.parent().unwrap().to_path_buf();
         fs::remove_file(&prepared.candidate_binary).unwrap();
 
         assert!(Box::new(prepared).launch().is_err());
+        fs::remove_dir_all(operation_root).unwrap();
     }
 
     #[test]
@@ -958,11 +982,6 @@ mod tests {
         .unwrap()
         .trim()
         .to_owned();
-        let staging_temp = tempfile::tempdir().unwrap();
-        let staging = staging_temp.path().join("staging");
-        fs::create_dir_all(&staging).unwrap();
-        let candidate = staging.join("candidate.exe");
-        fs::write(&candidate, b"candidate").unwrap();
         let bin = root.join("fake-bin");
         fs::create_dir_all(&bin).unwrap();
         let cargo_args = root.join("cargo-args.txt");
@@ -988,6 +1007,14 @@ mod tests {
                 marker.display(),
             ),
         ).unwrap();
+        let operation_hash = sha256_hex(b"operation");
+        let staging = installed
+            .parent()
+            .unwrap()
+            .join(format!(".hrdr-update-{operation_hash}"));
+        fs::create_dir(&staging).unwrap();
+        let candidate = staging.join(format!("coordinator-{operation_hash}.cmd"));
+        fs::write(&candidate, b"candidate").unwrap();
         let previous_test_cargo = std::env::var_os("HRDR_TEST_CARGO");
         let previous_cargo_home = std::env::var_os("CARGO_HOME");
         let previous_git_dir = std::env::var_os("GIT_DIR");
@@ -1020,7 +1047,7 @@ mod tests {
                 .trim(),
             redirected_worktree.to_string_lossy().replace('\\', "/"),
         );
-        let request_path = staging.join("request.json");
+        let request_path = staging.join(format!("request-{operation_hash}.json"));
         let mut signed = request(root, candidate);
         signed.expected_commit = commit;
         signed.intended_cargo_bin = installed;
@@ -1096,15 +1123,99 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn coordinator_staging_does_not_dirty_the_admitted_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout_root = temp.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(checkout_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(checkout_root.join("tracked"), b"tracked").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "tracked"])
+                .current_dir(checkout_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "test",
+                ])
+                .current_dir(checkout_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let checkout =
+            AdmittedCheckout::for_test(canonical_absolute(checkout_root).unwrap(), "0".repeat(40));
+        let prepared = PreparedWindowsUpdateCoordinator::prepare(
+            "saved-session",
+            &hrdr_agent::UpdateOperationId::new("clean-checkout-staging").unwrap(),
+            &checkout,
+        )
+        .unwrap();
+        let operation_root = prepared.candidate_binary.parent().unwrap().to_path_buf();
+
+        assert!(
+            Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .current_dir(checkout_root)
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
+        assert!(!checkout_root.join(".hrdr").exists());
+        assert_eq!(
+            operation_root.parent(),
+            canonical_absolute(&std::env::current_exe().unwrap())
+                .unwrap()
+                .parent()
+        );
+        let request = parse_request(&fs::read(&prepared.request_path).unwrap()).unwrap();
+        assert_eq!(
+            validate_request_path(&prepared.request_path, &request),
+            Ok(checkout.canonical_root().to_path_buf())
+        );
+
+        fs::remove_dir_all(operation_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn offroot_candidate_is_rejected_before_git() {
         let temp = tempfile::tempdir().unwrap();
-        let staging = temp.path().join(STAGING_DIR);
-        fs::create_dir_all(&staging).unwrap();
-        let outside = temp.path().join("candidate");
+        let checkout =
+            AdmittedCheckout::for_test(canonical_absolute(temp.path()).unwrap(), "0".repeat(40));
+        let prepared = PreparedWindowsUpdateCoordinator::prepare(
+            "saved-session",
+            &hrdr_agent::UpdateOperationId::new("offroot-candidate").unwrap(),
+            &checkout,
+        )
+        .unwrap();
+        let operation_root = prepared.candidate_binary.parent().unwrap().to_path_buf();
+        let outside = temp.path().join("candidate.exe");
         fs::write(&outside, b"candidate").unwrap();
-        let path = staging.join("request.json");
-        let mut signed = request(temp.path(), outside);
-        write_request(&path, &mut signed);
-        assert_eq!(run(path), Status::Invalid);
+        let mut signed = parse_request(&fs::read(&prepared.request_path).unwrap()).unwrap();
+        signed.candidate_binary = outside;
+        write_request(&prepared.request_path, &mut signed);
+
+        assert_eq!(run(prepared.request_path), Status::Invalid);
+        fs::remove_dir_all(operation_root).unwrap();
     }
 }

@@ -134,13 +134,31 @@ pub async fn run_json(cwd: &Path) -> (String, i32) {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct AdmittedCandidate {
+pub(crate) struct AdmittedCheckout {
     canonical_root: PathBuf,
     head: String,
 }
 
+impl AdmittedCheckout {
+    pub(crate) fn canonical_root(&self) -> &Path {
+        &self.canonical_root
+    }
+
+    pub(crate) fn expected_commit(&self) -> &str {
+        &self.head
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(canonical_root: PathBuf, head: String) -> Self {
+        Self {
+            canonical_root,
+            head,
+        }
+    }
+}
+
 #[derive(Debug)]
-enum AdmissionFailure {
+pub(crate) enum AdmissionFailure {
     Ineligible(&'static str),
     Unavailable(&'static str),
 }
@@ -154,6 +172,11 @@ impl AdmissionFailure {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) async fn admit(cwd: &Path) -> Result<AdmittedCheckout, AdmissionFailure> {
+    admit_with(&SystemProbe::new(), cwd).await
+}
+
 async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
     match admit_with(probe, cwd).await {
         Ok(_) => eligible(),
@@ -161,7 +184,7 @@ async fn run_with(probe: &impl Probe, cwd: &Path) -> (String, i32) {
     }
 }
 
-async fn admit_with(probe: &impl Probe, cwd: &Path) -> Result<AdmittedCandidate, AdmissionFailure> {
+async fn admit_with(probe: &impl Probe, cwd: &Path) -> Result<AdmittedCheckout, AdmissionFailure> {
     let root = probe
         .run(ProbeCommand::Git, cwd, &["rev-parse", "--show-toplevel"])
         .await;
@@ -316,7 +339,7 @@ async fn admit_with(probe: &impl Probe, cwd: &Path) -> Result<AdmittedCandidate,
     if !jobs_approved(&jobs) {
         return Err(AdmissionFailure::Ineligible("ci_jobs_not_approved"));
     }
-    Ok(AdmittedCandidate {
+    Ok(AdmittedCheckout {
         canonical_root: root,
         head,
     })
