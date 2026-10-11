@@ -1094,6 +1094,7 @@ mod tests {
         assert!(!consume_operation(temp.path(), &second));
     }
 
+    #[cfg(windows)]
     #[test]
     fn offroot_candidate_is_rejected_before_git() {
         let temp = tempfile::tempdir().unwrap();
