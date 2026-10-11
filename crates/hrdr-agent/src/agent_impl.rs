@@ -743,6 +743,35 @@ impl Agent {
         &self.messages
     }
 
+    /// Append a durable successful `update` exchange for a handoff checkpoint.
+    pub fn append_successful_update(&mut self, operation_id: UpdateOperationId) -> Result<()> {
+        let call_id = format!("update-{}", operation_id.as_str());
+        let evidence = serde_json::to_string(&SuccessfulUpdate { operation_id })?;
+        Arc::make_mut(&mut self.messages).push(hrdr_llm::ChatMessage {
+            role: hrdr_llm::Role::Assistant,
+            content: None,
+            reasoning_content: None,
+            anthropic_thinking_blocks: vec![],
+            responses_reasoning_items: vec![],
+            attachments: vec![],
+            origin: hrdr_llm::MessageOrigin::User,
+            tool_calls: Some(vec![hrdr_llm::ToolCall {
+                id: call_id.clone(),
+                kind: "function".into(),
+                function: hrdr_llm::FunctionCall {
+                    name: "update".into(),
+                    arguments: evidence.clone(),
+                    parsed_arguments: None,
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        });
+        Arc::make_mut(&mut self.messages)
+            .push(hrdr_llm::ChatMessage::tool_result(call_id, evidence));
+        Ok(())
+    }
+
     /// Reset the conversation to a fresh state — as if the agent was just
     /// constructed for the current cwd. Drops all history and **re-reads
     /// `AGENTS.md`**, so an updated or removed project-instructions file is

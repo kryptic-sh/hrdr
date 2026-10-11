@@ -2,12 +2,29 @@
 
 use super::*;
 
-const HANDOFF_PAYLOAD: &[u8] = br#"{"version":1,"intent":"idle","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#;
+const IDLE_HANDOFF_PAYLOAD: &[u8] = br#"{"version":1,"intent":"idle","operation_id":null,"runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#;
+
+fn update_handoff_payload(operation_id: &hrdr_agent::UpdateOperationId) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::json!({
+        "version": 1,
+        "intent": "update_continuation",
+        "operation_id": operation_id,
+        "runtime_queue": false,
+        "runtime_tasks": false,
+        "runtime_tools": false,
+        "runtime_turn": false,
+        "runtime_compaction": false,
+        "runtime_watch": false,
+    })
+    .to_string()
+    .into_bytes())
+}
 
 pub(crate) fn validate_handoff_payload(
     payload: &[u8],
+    session: &hrdr_agent::Session,
 ) -> anyhow::Result<hrdr_agent::HandoffIntent> {
-    hrdr_agent::HandoffPayload::parse(payload)
+    hrdr_agent::HandoffPayload::validate_snapshot(payload, &session.state.messages)
 }
 
 #[allow(dead_code)]
@@ -41,8 +58,57 @@ impl App {
 
         let journal = hrdr_agent::HandoffJournal::open(&self.current_cwd(), &id, lock)?;
         let epoch = hrdr_tools::unix_now();
-        journal.append(epoch, hrdr_agent::HandoffState::Prepare, HANDOFF_PAYLOAD)?;
-        journal.append(epoch, hrdr_agent::HandoffState::Commit, HANDOFF_PAYLOAD)?;
+        journal.append(
+            epoch,
+            hrdr_agent::HandoffState::Prepare,
+            IDLE_HANDOFF_PAYLOAD,
+        )?;
+        journal.append(
+            epoch,
+            hrdr_agent::HandoffState::Commit,
+            IDLE_HANDOFF_PAYLOAD,
+        )?;
+        self.handoff_gate = true;
+        Ok(true)
+    }
+
+    /// Record a successful update and commit its passive continuation checkpoint.
+    ///
+    /// This is internal groundwork only: it never invokes an updater or starts a
+    /// continuation. Recovery merely validates and passively displays this state.
+    pub(crate) async fn commit_update_continuation_checkpoint(
+        &mut self,
+        operation_id: hrdr_agent::UpdateOperationId,
+    ) -> anyhow::Result<bool> {
+        if !self.handoff_quiescent() {
+            return Ok(false);
+        }
+        let Some(result) =
+            self.with_agent(|agent| agent.append_successful_update(operation_id.clone()))
+        else {
+            return Ok(false);
+        };
+        result?;
+        self.autosave();
+        self.await_saves().await;
+        if !self.handoff_quiescent() {
+            return Ok(false);
+        }
+        let id = match self.state().id.clone() {
+            Some(id) => id,
+            None => return Ok(false),
+        };
+        let Some(lock) = self.active_lock.as_ref() else {
+            return Ok(false);
+        };
+        if !lock.is_backed() {
+            return Ok(false);
+        }
+        let payload = update_handoff_payload(&operation_id)?;
+        let journal = hrdr_agent::HandoffJournal::open(&self.current_cwd(), &id, lock)?;
+        let epoch = hrdr_tools::unix_now();
+        journal.append(epoch, hrdr_agent::HandoffState::Prepare, &payload)?;
+        journal.append(epoch, hrdr_agent::HandoffState::Commit, &payload)?;
         self.handoff_gate = true;
         Ok(true)
     }
@@ -82,21 +148,20 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_handoff_payload;
-    use hrdr_agent::HandoffIntent;
+    use hrdr_agent::{HandoffIntent, HandoffPayload};
 
     #[test]
     fn recovery_payload_parses_only_known_idle_and_update_intents() {
         assert_eq!(
-            validate_handoff_payload(
-                br#"{"version":1,"intent":"idle","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#
+            HandoffPayload::parse(
+                br#"{"version":1,"intent":"idle","operation_id":null,"runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#
             )
             .unwrap(),
             HandoffIntent::Idle
         );
         assert_eq!(
-            validate_handoff_payload(
-                br#"{"version":1,"intent":"update_continuation","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#
+            HandoffPayload::parse(
+                br#"{"version":1,"intent":"update_continuation","operation_id":"op-1","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#
             )
             .unwrap(),
             HandoffIntent::UpdateContinuation
@@ -111,7 +176,7 @@ mod tests {
             br#"{"version":1,"intent":"idle","runtime_queue":true,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#,
             br#"{"version":1,"intent":"unknown","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#,
         ] {
-            assert!(validate_handoff_payload(payload).is_err(), "{payload:?}");
+            assert!(HandoffPayload::parse(payload).is_err(), "{payload:?}");
         }
     }
 }

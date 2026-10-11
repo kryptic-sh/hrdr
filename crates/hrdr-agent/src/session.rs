@@ -1285,7 +1285,7 @@ impl Session {
         validate: F,
     ) -> Result<HandoffRecovery<T>, OpenError>
     where
-        F: FnOnce(&[u8]) -> Result<T>,
+        F: FnOnce(&[u8], &Session) -> Result<T>,
     {
         let path = session_file_path(cwd, id);
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1305,7 +1305,7 @@ impl Session {
             Ok(journal) => journal,
             Err(error) => return Err(OpenError::Load(error)),
         };
-        let (record, intent) = match journal.claim(validate) {
+        let (record, intent) = match journal.claim(|payload| validate(payload, &session)) {
             Ok(Some(recovery)) => recovery,
             Ok(None) => {
                 return Err(OpenError::Load(anyhow::anyhow!(

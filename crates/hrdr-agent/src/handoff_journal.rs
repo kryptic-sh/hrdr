@@ -24,6 +24,30 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 1024;
 
+/// A non-empty provider operation identifier for a successful update.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct UpdateOperationId(String);
+
+impl UpdateOperationId {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        anyhow::ensure!(!value.trim().is_empty(), "update operation id is empty");
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Durable evidence returned by a completed update tool call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuccessfulUpdate {
+    pub operation_id: UpdateOperationId,
+}
+
 /// The explicit recovery action requested by a handoff checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +62,7 @@ pub enum HandoffIntent {
 pub struct HandoffPayload {
     version: u8,
     intent: HandoffIntent,
+    operation_id: Option<UpdateOperationId>,
     runtime_queue: bool,
     runtime_tasks: bool,
     runtime_tools: bool,
@@ -49,6 +74,11 @@ pub struct HandoffPayload {
 impl HandoffPayload {
     /// Parse only the current schema and reject any active runtime state.
     pub fn parse(bytes: &[u8]) -> Result<HandoffIntent> {
+        Ok(Self::parse_typed(bytes)?.0)
+    }
+
+    /// Parse the handoff schema and retain the update operation id when required.
+    pub fn parse_typed(bytes: &[u8]) -> Result<(HandoffIntent, Option<UpdateOperationId>)> {
         let payload: Self = serde_json::from_slice(bytes)?;
         anyhow::ensure!(payload.version == 1, "unsupported handoff payload version");
         anyhow::ensure!(
@@ -60,8 +90,75 @@ impl HandoffPayload {
                 && !payload.runtime_watch,
             "handoff payload contains active runtime work"
         );
-        Ok(payload.intent)
+        match payload.intent {
+            HandoffIntent::Idle => anyhow::ensure!(
+                payload.operation_id.is_none(),
+                "idle handoff payload must not name an update operation"
+            ),
+            HandoffIntent::UpdateContinuation => anyhow::ensure!(
+                payload.operation_id.is_some(),
+                "update continuation handoff payload requires an operation id"
+            ),
+        }
+        Ok((payload.intent, payload.operation_id))
     }
+
+    /// Validate update-continuation evidence in the exact loaded snapshot.
+    pub fn validate_snapshot(bytes: &[u8], messages: &[crate::Message]) -> Result<HandoffIntent> {
+        let (intent, operation_id) = Self::parse_typed(bytes)?;
+        if let Some(operation_id) = operation_id {
+            validate_successful_update(messages, &operation_id)?;
+        }
+        Ok(intent)
+    }
+}
+
+/// Find the exact assistant `update` call and durable successful tool result.
+pub fn validate_successful_update(
+    messages: &[crate::Message],
+    operation_id: &UpdateOperationId,
+) -> Result<()> {
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != hrdr_llm::Role::Assistant {
+            continue;
+        }
+        for call in message.tool_calls.iter().flatten() {
+            if call.kind != "function"
+                || call.id.trim().is_empty()
+                || call.function.name != "update"
+            {
+                continue;
+            }
+            let Ok(evidence) = serde_json::from_str::<SuccessfulUpdate>(&call.function.arguments)
+            else {
+                continue;
+            };
+            if evidence.operation_id != *operation_id {
+                continue;
+            }
+            let Some(result) = messages.get(index + 1) else {
+                continue;
+            };
+            if result.role != hrdr_llm::Role::Tool
+                || result.tool_call_id.as_deref() != Some(call.id.as_str())
+            {
+                continue;
+            }
+            let Some(content) = result.content.as_deref() else {
+                continue;
+            };
+            let Ok(result_evidence) = serde_json::from_str::<SuccessfulUpdate>(content) else {
+                continue;
+            };
+            if result_evidence.operation_id == *operation_id {
+                return Ok(());
+            }
+        }
+    }
+    bail!(
+        "saved session lacks a paired successful update for operation {}",
+        operation_id.as_str()
+    )
 }
 
 /// The checkpoint phase recorded in a handoff journal.
@@ -536,6 +633,47 @@ mod tests {
             .open(&journal.path)
             .unwrap();
         file.write_all(&frame).unwrap();
+    }
+
+    #[test]
+    fn update_evidence_requires_a_paired_adjacent_success_result() {
+        let operation = UpdateOperationId::new("op-1").unwrap();
+        let assistant: crate::Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{"id":"call-1","type":"function","function":{"name":"update","arguments":"{\"operation_id\":\"op-1\"}"}}]
+        }))
+        .unwrap();
+        let result = crate::Message::tool_result("call-1", r#"{"operation_id":"op-1"}"#);
+        assert!(
+            validate_successful_update(&[assistant.clone(), result.clone()], &operation).is_ok()
+        );
+        for messages in [
+            vec![assistant.clone()],
+            vec![result.clone(), assistant.clone()],
+            vec![
+                assistant.clone(),
+                crate::Message::tool_result("call-1", r#"{"operation_id":"other"}"#),
+            ],
+        ] {
+            assert!(validate_successful_update(&messages, &operation).is_err());
+        }
+    }
+
+    #[test]
+    fn update_operation_ids_and_payloads_reject_empty_or_mismatched_shapes() {
+        assert!(UpdateOperationId::new(" \t").is_err());
+        assert!(HandoffPayload::parse_typed(br#"{"version":1,"intent":"idle","operation_id":"op","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#).is_err());
+        assert!(HandoffPayload::parse_typed(br#"{"version":1,"intent":"update_continuation","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#).is_err());
+    }
+    #[test]
+    fn snapshot_validation_refuses_unpaired_update_evidence() {
+        let payload = br#"{"version":1,"intent":"update_continuation","operation_id":"op-1","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#;
+        let assistant: crate::Message = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{"id":"","type":"function","function":{"name":"update","arguments":"{\"operation_id\":\"op-1\"}"}}]
+        }))
+        .unwrap();
+        assert!(HandoffPayload::validate_snapshot(payload, &[assistant]).is_err());
     }
 
     #[test]

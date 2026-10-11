@@ -28,6 +28,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Recovery records distinguish idle and future update-continuation intents.**
   Unsupported continuation intent confirmation exits safely without starting
   work.
+- **Future update continuations require durable success evidence.** A typed
+  `update` tool-call/result pair is saved and checkpoint-bound before recovery
+  can validate a continuation intent.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,
