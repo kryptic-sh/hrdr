@@ -3074,6 +3074,7 @@ mod tests {
         });
     }
 
+    #[cfg(windows)]
     #[test]
     fn discovery_blocks_a_live_committed_handoff() {
         with_test_env(|tmp| {
