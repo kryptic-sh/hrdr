@@ -15,6 +15,9 @@ use std::{
 const SCHEMA_VERSION: u32 = 2;
 const MAX_RETRIES: u8 = 3;
 const MAX_DEADLINE_SECS: u64 = 24 * 60 * 60;
+#[cfg(windows)]
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+#[cfg(test)]
 const STAGING_DIR: &str = ".hrdr/update-staging";
 
 #[derive(Debug)]
@@ -22,6 +25,7 @@ struct Request {
     session_id: String,
     checkout_root: PathBuf,
     expected_commit: String,
+    expected_version: String,
     candidate_binary: PathBuf,
     intended_cargo_bin: PathBuf,
     expected_target: String,
@@ -101,7 +105,11 @@ fn run(request_path: PathBuf) -> Status {
 
     #[cfg(windows)]
     {
-        run_windows(&request, &checkout_root)
+        run_windows(
+            &request,
+            &checkout_root,
+            in_progress.parent().expect("claimed path has parent"),
+        )
     }
     #[cfg(not(windows))]
     {
@@ -111,7 +119,7 @@ fn run(request_path: PathBuf) -> Status {
 }
 
 #[cfg(windows)]
-fn run_windows(request: &Request, checkout_root: &Path) -> Status {
+fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> Status {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(request.deadline_secs);
     let lease = hrdr_tools::ProcessLease {
@@ -134,11 +142,16 @@ fn run_windows(request: &Request, checkout_root: &Path) -> Status {
     if !clean_head(checkout_root, &request.expected_commit, deadline) {
         return Status::Stale;
     }
+    if checkout_package_version(checkout_root, deadline).as_deref()
+        != Some(request.expected_version.as_str())
+    {
+        return Status::Stale;
+    }
 
     let mut installed = false;
     for _ in 0..=request.retry_limit {
         if run_command(
-            Command::new(cargo_program())
+            sanitized_command(cargo_program())
                 .current_dir(checkout_root)
                 .args(["install", "--path", "apps/hrdr", "--locked"]),
             deadline,
@@ -157,14 +170,40 @@ fn run_windows(request: &Request, checkout_root: &Path) -> Status {
     if !clean_head(checkout_root, &request.expected_commit, deadline) {
         return Status::Stale;
     }
-    if !installed_identity(&request.intended_cargo_bin, request, deadline) {
+    let Some((launched_binary, launched_file)) =
+        stage_installed_binary(&request.intended_cargo_bin, staging_root, request)
+    else {
+        return Status::IdentityFailed;
+    };
+    if !installed_identity(&launched_binary, request, deadline) {
         return Status::IdentityFailed;
     }
-    if launch(&request.intended_cargo_bin, &request.session_id) {
+    if !consume_operation(staging_root, request) {
+        return Status::Reused;
+    }
+    if launch(&launched_binary, &launched_file, &request.session_id) {
         Status::Launched
     } else {
         Status::LaunchFailed
     }
+}
+
+#[cfg(any(windows, test))]
+fn consume_operation(staging_root: &Path, request: &Request) -> bool {
+    use std::io::Write;
+
+    let marker = staging_root.join(format!(
+        ".operation-{}.consumed",
+        sha256_hex(request.operation_id.as_bytes())
+    ));
+    let Ok(mut marker) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    else {
+        return false;
+    };
+    marker.write_all(request.checksum.as_bytes()).is_ok() && marker.sync_all().is_ok()
 }
 
 #[cfg(windows)]
@@ -177,9 +216,74 @@ fn cargo_program() -> PathBuf {
 }
 
 #[cfg(windows)]
+fn checkout_package_version(checkout_root: &Path, deadline: std::time::Instant) -> Option<String> {
+    let output = run_command(
+        sanitized_command(cargo_program())
+            .current_dir(checkout_root)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version=1",
+                "--manifest-path",
+                "apps/hrdr/Cargo.toml",
+            ]),
+        deadline,
+        true,
+    )
+    .ok()?;
+    let metadata: serde_json::Value = serde_json::from_slice(&output).ok()?;
+    metadata
+        .get("packages")?
+        .as_array()?
+        .iter()
+        .find(|package| package.get("name").and_then(serde_json::Value::as_str) == Some("hrdr"))?
+        .get("version")?
+        .as_str()
+        .filter(|version| valid_text(version, 64))
+        .map(str::to_owned)
+}
+
+#[cfg(windows)]
+fn sanitized_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if is_git_injection_variable(&key) {
+            command.env_remove(key.as_ref());
+        }
+    }
+    command
+}
+
+#[cfg(windows)]
+fn is_git_injection_variable(key: &str) -> bool {
+    let matches = |candidate: &str| key.eq_ignore_ascii_case(candidate);
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+    ]
+    .into_iter()
+    .any(matches)
+        || matches("GIT_CONFIG_KEY_")
+        || matches("GIT_CONFIG_VALUE_")
+        || key.to_ascii_uppercase().starts_with("GIT_CONFIG_KEY_")
+        || key.to_ascii_uppercase().starts_with("GIT_CONFIG_VALUE_")
+}
+
+#[cfg(windows)]
 fn clean_head(checkout_root: &Path, expected_commit: &str, deadline: std::time::Instant) -> bool {
     let Ok(head) = run_command(
-        Command::new("git")
+        sanitized_command("git")
             .current_dir(checkout_root)
             .args(["rev-parse", "--verify", "HEAD"]),
         deadline,
@@ -188,7 +292,7 @@ fn clean_head(checkout_root: &Path, expected_commit: &str, deadline: std::time::
         return false;
     };
     let Ok(status) = run_command(
-        Command::new("git").current_dir(checkout_root).args([
+        sanitized_command("git").current_dir(checkout_root).args([
             "status",
             "--porcelain=v1",
             "--untracked-files=normal",
@@ -206,6 +310,35 @@ fn clean_head(checkout_root: &Path, expected_commit: &str, deadline: std::time::
 }
 
 #[cfg(windows)]
+fn stage_installed_binary(
+    installed: &Path,
+    staging_root: &Path,
+    request: &Request,
+) -> Option<(PathBuf, fs::File)> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let extension = installed.extension()?.to_str()?;
+    let staged = staging_root.join(format!(".launch-{}.{extension}", request.checksum));
+    let bytes = fs::read(installed).ok()?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .share_mode(0x0000_0001 | 0x0000_0002)
+        .open(&staged)
+        .ok()?;
+    use std::io::Write;
+    output.write_all(&bytes).ok()?;
+    output.sync_all().ok()?;
+    drop(output);
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&staged)
+        .ok()?;
+    Some((staged, guard))
+}
+
+#[cfg(windows)]
 fn installed_identity(binary: &Path, request: &Request, deadline: std::time::Instant) -> bool {
     let Ok(output) = run_command(Command::new(binary).arg("--build-info"), deadline, true) else {
         return false;
@@ -215,15 +348,13 @@ fn installed_identity(binary: &Path, request: &Request, deadline: std::time::Ins
     };
     let expected = format!(
         "version: {}\ncommit: {}\ntarget: {}\nsource: clean\n",
-        env!("CARGO_PKG_VERSION"),
-        request.expected_commit,
-        request.expected_target,
+        request.expected_version, request.expected_commit, request.expected_target,
     );
     output.replace("\r\n", "\n") == expected
 }
 
 #[cfg(windows)]
-fn launch(binary: &Path, session_id: &str) -> bool {
+fn launch(binary: &Path, _guard: &fs::File, session_id: &str) -> bool {
     Command::new(binary)
         .args(["__recover-handoff", session_id])
         .spawn()
@@ -310,6 +441,7 @@ fn claim(path: &Path) -> Result<PathBuf, ()> {
 fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathBuf, ()> {
     if !valid_text(&request.session_id, 128)
         || !valid_text(&request.operation_id, 128)
+        || !valid_text(&request.expected_version, 64)
         || !valid_text(&request.expected_target, 256)
         || request.source_pid == 0
         || request.source_created == 0
@@ -324,12 +456,9 @@ fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathB
     }
 
     let checkout_root = canonical_absolute(&request.checkout_root)?;
-    let staging_root = fs::canonicalize(checkout_root.join(STAGING_DIR)).map_err(|_| ())?;
-    if request_path.parent() != Some(staging_root.as_path()) {
-        return Err(());
-    }
+    let staging_root = request_path.parent().ok_or(())?;
     let candidate = canonical_absolute(&request.candidate_binary)?;
-    if !candidate.is_file() || !candidate.starts_with(&staging_root) {
+    if !candidate.is_file() || candidate.parent() != Some(staging_root) {
         return Err(());
     }
     if !request.intended_cargo_bin.is_absolute()
@@ -374,6 +503,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         "session_id",
         "checkout_root",
         "expected_commit",
+        "expected_version",
         "candidate_binary",
         "intended_cargo_bin",
         "expected_target",
@@ -413,6 +543,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         session_id: string("session_id")?,
         checkout_root: PathBuf::from(string("checkout_root")?),
         expected_commit: string("expected_commit")?,
+        expected_version: string("expected_version")?,
         candidate_binary: PathBuf::from(string("candidate_binary")?),
         intended_cargo_bin: PathBuf::from(string("intended_cargo_bin")?),
         expected_target: string("expected_target")?,
@@ -430,10 +561,11 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
 fn canonical_body(request: &Request) -> String {
     let quote = |value: &str| serde_json::to_string(value).expect("strings serialize");
     format!(
-        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"expected_commit\":{},\"candidate_binary\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"source_pid\":{},\"source_created\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
+        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"expected_commit\":{},\"expected_version\":{},\"candidate_binary\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"source_pid\":{},\"source_created\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
         quote(&request.session_id),
         quote(&request.checkout_root.to_string_lossy()),
         quote(&request.expected_commit),
+        quote(&request.expected_version),
         quote(&request.candidate_binary.to_string_lossy()),
         quote(&request.intended_cargo_bin.to_string_lossy()),
         quote(&request.expected_target),
@@ -479,6 +611,7 @@ mod tests {
             session_id: "session".into(),
             checkout_root: root.to_path_buf(),
             expected_commit: "0".repeat(40),
+            expected_version: env!("CARGO_PKG_VERSION").into(),
             candidate_binary: candidate,
             intended_cargo_bin: root.join("bin/hrdr"),
             expected_target: env!("HRDR_BUILD_TARGET").into(),
@@ -531,7 +664,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(launch(&script, "saved-session"));
+        let guard = fs::File::open(&script).unwrap();
+        assert!(launch(&script, &guard, "saved-session"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !marker.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -544,7 +678,25 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn fake_cargo_installs_then_launches_once() {
+    fn staged_binary_guard_denies_concurrent_write_and_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed = temp.path().join("installed.exe");
+        let staging = temp.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(&installed, b"installed binary").unwrap();
+        let request = request(temp.path(), staging.join("candidate.exe"));
+        let (staged, guard) = stage_installed_binary(&installed, &staging, &request).unwrap();
+
+        assert!(fs::OpenOptions::new().write(true).open(&staged).is_err());
+        assert!(fs::remove_file(&staged).is_err());
+
+        drop(guard);
+        fs::remove_file(staged).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_config_parameters_worktree_redirect_is_removed_for_probes_and_cargo() {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -559,7 +711,7 @@ mod tests {
         );
         fs::write(
             root.join(".gitignore"),
-            ".hrdr/\nfake-bin/\ncargo-home/\ncargo-args.txt\nlaunches.txt\n",
+            "fake-bin/\ncargo-home/\ncargo-args.txt\nlaunches.txt\nredirected-worktree/\n",
         )
         .unwrap();
         assert!(
@@ -598,7 +750,8 @@ mod tests {
         .unwrap()
         .trim()
         .to_owned();
-        let staging = root.join(STAGING_DIR);
+        let staging_temp = tempfile::tempdir().unwrap();
+        let staging = staging_temp.path().join("staging");
         fs::create_dir_all(&staging).unwrap();
         let candidate = staging.join("candidate.exe");
         fs::write(&candidate, b"candidate").unwrap();
@@ -608,7 +761,8 @@ mod tests {
         fs::write(
             bin.join("cargo.cmd"),
             format!(
-                "@echo off\r\necho %*>>\"{}\"\r\nexit /b 0\r\n",
+                "@echo off\r\nif defined GIT_DIR exit /b 2\r\nif defined GIT_CONFIG_PARAMETERS exit /b 3\r\nif \"%1\"==\"metadata\" (\r\necho {{\"packages\":[{{\"name\":\"hrdr\",\"version\":\"{}\"}}]}}\r\nexit /b 0\r\n)\r\necho %*>>\"{}\"\r\nexit /b 0\r\n",
+                env!("CARGO_PKG_VERSION"),
                 cargo_args.display()
             ),
         )
@@ -628,10 +782,36 @@ mod tests {
         ).unwrap();
         let previous_test_cargo = std::env::var_os("HRDR_TEST_CARGO");
         let previous_cargo_home = std::env::var_os("CARGO_HOME");
+        let previous_git_dir = std::env::var_os("GIT_DIR");
+        let previous_git_config_parameters = std::env::var_os("GIT_CONFIG_PARAMETERS");
+        let redirected_worktree = root.join("redirected-worktree");
+        fs::create_dir_all(&redirected_worktree).unwrap();
+        fs::write(redirected_worktree.join("tampered"), b"tampered").unwrap();
         unsafe {
             std::env::set_var("HRDR_TEST_CARGO", bin.join("cargo.cmd"));
             std::env::set_var("CARGO_HOME", &cargo_home);
+            std::env::set_var("GIT_DIR", root.join("redirected-git-dir"));
+            std::env::set_var(
+                "GIT_CONFIG_PARAMETERS",
+                format!(
+                    "'core.worktree={}'",
+                    redirected_worktree.to_string_lossy().replace('\\', "/")
+                ),
+            );
         }
+        let configured_worktree = Command::new("git")
+            .env_remove("GIT_DIR")
+            .args(["config", "--get", "core.worktree"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(configured_worktree.status.success());
+        assert_eq!(
+            String::from_utf8(configured_worktree.stdout)
+                .unwrap()
+                .trim(),
+            redirected_worktree.to_string_lossy().replace('\\', "/"),
+        );
         let request_path = staging.join("request.json");
         let mut signed = request(root, candidate);
         signed.expected_commit = commit;
@@ -639,6 +819,18 @@ mod tests {
         signed.source_pid = u32::MAX;
         signed.source_created = 1;
         write_request(&request_path, &mut signed);
+        assert!(clean_head(
+            root,
+            &signed.expected_commit,
+            std::time::Instant::now() + std::time::Duration::from_secs(2)
+        ));
+        assert_eq!(
+            checkout_package_version(
+                root,
+                std::time::Instant::now() + std::time::Duration::from_secs(2)
+            ),
+            Some(signed.expected_version.clone())
+        );
         let result = run(request_path);
         unsafe {
             match previous_test_cargo {
@@ -649,8 +841,25 @@ mod tests {
                 Some(value) => std::env::set_var("CARGO_HOME", value),
                 None => std::env::remove_var("CARGO_HOME"),
             }
+            match previous_git_dir {
+                Some(value) => std::env::set_var("GIT_DIR", value),
+                None => std::env::remove_var("GIT_DIR"),
+            }
+            match previous_git_config_parameters {
+                Some(value) => std::env::set_var("GIT_CONFIG_PARAMETERS", value),
+                None => std::env::remove_var("GIT_CONFIG_PARAMETERS"),
+            }
         }
         assert_eq!(result, Status::Launched);
+        assert!(
+            Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
         assert_eq!(
             fs::read_to_string(cargo_args).unwrap(),
             "install --path apps/hrdr --locked\r\n"
@@ -664,6 +873,19 @@ mod tests {
             "__recover-handoff|session\r\n"
         );
     }
+    #[test]
+    fn operation_marker_consumes_byte_identical_requests_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("candidate");
+        fs::write(&candidate, b"candidate").unwrap();
+        let mut first = request(temp.path(), candidate.clone());
+        first.checksum = sha256_hex(canonical_body(&first).as_bytes());
+        let mut second = request(temp.path(), candidate);
+        second.checksum = first.checksum.clone();
+        assert!(consume_operation(temp.path(), &first));
+        assert!(!consume_operation(temp.path(), &second));
+    }
+
     #[test]
     fn offroot_candidate_is_rejected_before_git() {
         let temp = tempfile::tempdir().unwrap();
