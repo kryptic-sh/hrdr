@@ -213,7 +213,7 @@ fn update_coordinator_exits_before_reading_invalid_config() {
     assert!(out.stderr.is_empty());
     assert_eq!(
         out.stdout,
-        b"{\"schema_version\":2,\"status\":\"invalid\"}\n"
+        b"{\"schema_version\":3,\"status\":\"invalid\"}\n"
     );
 }
 

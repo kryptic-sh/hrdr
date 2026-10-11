@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_RETRIES: u8 = 3;
 const MAX_DEADLINE_SECS: u64 = 24 * 60 * 60;
 #[cfg(windows)]
@@ -28,6 +28,8 @@ struct Request {
     expected_commit: String,
     expected_version: String,
     candidate_binary: PathBuf,
+    prebuilt_binary: PathBuf,
+    prebuilt_checksum: String,
     intended_cargo_bin: PathBuf,
     expected_target: String,
     operation_id: String,
@@ -94,6 +96,20 @@ impl PreparedWindowsUpdateCoordinator {
             operation_root.parent() == Some(executable_parent),
             "update operation directory escapes the executable directory"
         );
+        let prebuilt_target = operation_root.join("target");
+        let expected_version = env!("CARGO_PKG_VERSION");
+        let expected_target = env!("HRDR_BUILD_TARGET");
+        let prebuilt_binary = build_prebuilt_candidate(
+            &checkout_root,
+            expected_commit,
+            expected_version,
+            expected_target,
+            &prebuilt_target,
+        )?;
+        let prebuilt_checksum = sha256_hex(
+            &fs::read(&prebuilt_binary).context("reading the prebuilt update candidate")?,
+        );
+
         let extension = intended_cargo_bin
             .extension()
             .and_then(|value| value.to_str())
@@ -123,10 +139,12 @@ impl PreparedWindowsUpdateCoordinator {
             session_id: session_id.to_owned(),
             checkout_root,
             expected_commit: expected_commit.to_owned(),
-            expected_version: env!("CARGO_PKG_VERSION").to_owned(),
+            expected_version: expected_version.to_owned(),
             candidate_binary: candidate_binary.clone(),
+            prebuilt_binary,
+            prebuilt_checksum,
             intended_cargo_bin,
-            expected_target: env!("HRDR_BUILD_TARGET").to_owned(),
+            expected_target: expected_target.to_owned(),
             operation_id: operation_id.as_str().to_owned(),
             source_pid: source.pid,
             source_created: source.created,
@@ -372,6 +390,62 @@ fn cargo_program() -> PathBuf {
 }
 
 #[cfg(windows)]
+fn build_prebuilt_candidate(
+    checkout_root: &Path,
+    expected_commit: &str,
+    expected_version: &str,
+    expected_target: &str,
+    target_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(MAX_DEADLINE_SECS);
+    anyhow::ensure!(
+        clean_head(checkout_root, expected_commit, deadline),
+        "admitted checkout is no longer clean at the expected commit"
+    );
+    run_command(
+        sanitized_command(cargo_program())
+            .current_dir(checkout_root)
+            .args([
+                "build",
+                "--release",
+                "--locked",
+                "-p",
+                "hrdr",
+                "--target",
+                expected_target,
+                "--target-dir",
+            ])
+            .arg(target_dir),
+        deadline,
+        false,
+    )
+    .map_err(|_| anyhow::anyhow!("building the admitted update candidate failed"))?;
+
+    anyhow::ensure!(
+        clean_head(checkout_root, expected_commit, deadline),
+        "admitted checkout changed while building the update candidate"
+    );
+    let target_dir = canonical_absolute(target_dir)
+        .map_err(|_| anyhow::anyhow!("external update target directory is not canonical"))?;
+    let prebuilt_binary =
+        canonical_absolute(&prebuilt_binary_path(&target_dir, expected_target))
+            .map_err(|_| anyhow::anyhow!("prebuilt update candidate is not a canonical file"))?;
+    anyhow::ensure!(
+        prebuilt_binary.is_file()
+            && prebuilt_binary.starts_with(&target_dir)
+            && prebuilt_identity(
+                &prebuilt_binary,
+                expected_version,
+                expected_commit,
+                expected_target,
+                deadline,
+            ),
+        "prebuilt update candidate identity does not match the admitted checkout"
+    );
+    Ok(prebuilt_binary)
+}
+
+#[cfg(windows)]
 fn checkout_package_version(checkout_root: &Path, deadline: std::time::Instant) -> Option<String> {
     let output = run_command(
         sanitized_command(cargo_program())
@@ -495,7 +569,13 @@ fn stage_installed_binary(
 }
 
 #[cfg(windows)]
-fn installed_identity(binary: &Path, request: &Request, deadline: std::time::Instant) -> bool {
+fn prebuilt_identity(
+    binary: &Path,
+    expected_version: &str,
+    expected_commit: &str,
+    expected_target: &str,
+    deadline: std::time::Instant,
+) -> bool {
     let Ok(output) = run_command(Command::new(binary).arg("--build-info"), deadline, true) else {
         return false;
     };
@@ -503,10 +583,20 @@ fn installed_identity(binary: &Path, request: &Request, deadline: std::time::Ins
         return false;
     };
     let expected = format!(
-        "version: {}\ncommit: {}\ntarget: {}\nsource: clean\n",
-        request.expected_version, request.expected_commit, request.expected_target,
+        "version: {expected_version}\ncommit: {expected_commit}\ntarget: {expected_target}\nsource: clean\n",
     );
     output.replace("\r\n", "\n") == expected
+}
+
+#[cfg(windows)]
+fn installed_identity(binary: &Path, request: &Request, deadline: std::time::Instant) -> bool {
+    prebuilt_identity(
+        binary,
+        &request.expected_version,
+        &request.expected_commit,
+        &request.expected_target,
+        deadline,
+    )
 }
 
 #[cfg(windows)]
@@ -605,6 +695,7 @@ fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathB
         || request.deadline_secs == 0
         || request.deadline_secs > MAX_DEADLINE_SECS
         || !is_full_commit(&request.expected_commit)
+        || !is_checksum(&request.prebuilt_checksum)
         || !is_checksum(&request.checksum)
         || request.expected_target != env!("HRDR_BUILD_TARGET")
     {
@@ -635,6 +726,15 @@ fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathB
     if !candidate.is_file() || candidate != expected_candidate {
         return Err(());
     }
+    let expected_prebuilt =
+        prebuilt_binary_path(&operation_root.join("target"), &request.expected_target);
+    let prebuilt = canonical_absolute(&request.prebuilt_binary)?;
+    if !prebuilt.is_file()
+        || prebuilt != expected_prebuilt
+        || sha256_hex(&fs::read(&prebuilt).map_err(|_| ())?) != request.prebuilt_checksum
+    {
+        return Err(());
+    }
     let request_name = format!("request-{operation_hash}");
     let expected_request = operation_root.join(format!("{request_name}.json"));
     let expected_claimed = operation_root.join(format!("{request_name}.in-progress"));
@@ -642,6 +742,13 @@ fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathB
         return Err(());
     }
     Ok(checkout_root)
+}
+
+fn prebuilt_binary_path(target_dir: &Path, target: &str) -> PathBuf {
+    target_dir
+        .join(target)
+        .join("release")
+        .join(if cfg!(test) { "hrdr.cmd" } else { "hrdr.exe" })
 }
 
 fn canonical_absolute(path: &Path) -> Result<PathBuf, ()> {
@@ -680,6 +787,8 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         "expected_commit",
         "expected_version",
         "candidate_binary",
+        "prebuilt_binary",
+        "prebuilt_checksum",
         "intended_cargo_bin",
         "expected_target",
         "operation_id",
@@ -720,6 +829,8 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         expected_commit: string("expected_commit")?,
         expected_version: string("expected_version")?,
         candidate_binary: PathBuf::from(string("candidate_binary")?),
+        prebuilt_binary: PathBuf::from(string("prebuilt_binary")?),
+        prebuilt_checksum: string("prebuilt_checksum")?,
         intended_cargo_bin: PathBuf::from(string("intended_cargo_bin")?),
         expected_target: string("expected_target")?,
         operation_id: string("operation_id")?,
@@ -730,18 +841,22 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         checksum: string("checksum")?,
     };
     let checksum = sha256_hex(canonical_body(&request).as_bytes());
-    (checksum == request.checksum).then_some(request).ok_or(())
+    (checksum == request.checksum && serialized_request(&request) == bytes)
+        .then_some(request)
+        .ok_or(())
 }
 
 fn canonical_body(request: &Request) -> String {
     let quote = |value: &str| serde_json::to_string(value).expect("strings serialize");
     format!(
-        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"expected_commit\":{},\"expected_version\":{},\"candidate_binary\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"source_pid\":{},\"source_created\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
+        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"expected_commit\":{},\"expected_version\":{},\"candidate_binary\":{},\"prebuilt_binary\":{},\"prebuilt_checksum\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"source_pid\":{},\"source_created\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
         quote(&request.session_id),
         quote(&request.checkout_root.to_string_lossy()),
         quote(&request.expected_commit),
         quote(&request.expected_version),
         quote(&request.candidate_binary.to_string_lossy()),
+        quote(&request.prebuilt_binary.to_string_lossy()),
+        quote(&request.prebuilt_checksum),
         quote(&request.intended_cargo_bin.to_string_lossy()),
         quote(&request.expected_target),
         quote(&request.operation_id),
@@ -752,7 +867,6 @@ fn canonical_body(request: &Request) -> String {
     )
 }
 
-#[cfg(windows)]
 fn serialized_request(request: &Request) -> Vec<u8> {
     let body = canonical_body(request);
     format!(
@@ -775,16 +889,24 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
     #[test]
     fn prepared_request_is_accepted_by_the_strict_parser() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let temp = tempfile::tempdir().unwrap();
-        let operation = hrdr_agent::UpdateOperationId::new("prepared-request").unwrap();
-        let checkout =
-            AdmittedCheckout::for_test(canonical_absolute(temp.path()).unwrap(), "0".repeat(40));
+        let (root, commit, cargo, cargo_args) = admitted_checkout(&temp);
+        let previous = set_test_cargo(&cargo);
+        let operation =
+            hrdr_agent::UpdateOperationId::new(format!("prepared-request-{}", std::process::id()))
+                .unwrap();
+        let checkout = AdmittedCheckout::for_test(canonical_absolute(&root).unwrap(), commit);
         let prepared =
             PreparedWindowsUpdateCoordinator::prepare("saved-session", &operation, &checkout)
                 .unwrap();
 
+        restore_test_cargo(previous);
         let request = parse_request(&fs::read(&prepared.request_path).unwrap()).unwrap();
         let lease = hrdr_tools::current_process_lease().unwrap();
         assert_eq!(request.session_id, "saved-session");
@@ -792,6 +914,26 @@ mod tests {
         assert_eq!(request.source_pid, lease.pid);
         assert_eq!(request.source_created, lease.created);
         assert_eq!(request.candidate_binary, prepared.candidate_binary);
+        assert_eq!(
+            request.prebuilt_checksum,
+            sha256_hex(&fs::read(&request.prebuilt_binary).unwrap())
+        );
+        assert_eq!(
+            fs::read_to_string(cargo_args).unwrap(),
+            format!(
+                "build --release --locked -p hrdr --target {} --target-dir {}\r\n",
+                env!("HRDR_BUILD_TARGET"),
+                request
+                    .prebuilt_binary
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .display(),
+            )
+        );
         assert_eq!(
             request.intended_cargo_bin,
             canonical_absolute(&std::env::current_exe().unwrap()).unwrap()
@@ -804,20 +946,99 @@ mod tests {
     fn prepared_coordinator_reports_spawn_failure() {
         use hrdr_tui::PreparedUpdateCoordinator;
 
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let temp = tempfile::tempdir().unwrap();
-        let checkout =
-            AdmittedCheckout::for_test(canonical_absolute(temp.path()).unwrap(), "0".repeat(40));
+        let (root, commit, cargo, _) = admitted_checkout(&temp);
+        let previous = set_test_cargo(&cargo);
+        let checkout = AdmittedCheckout::for_test(canonical_absolute(&root).unwrap(), commit);
         let prepared = PreparedWindowsUpdateCoordinator::prepare(
             "saved-session",
-            &hrdr_agent::UpdateOperationId::new("spawn-failure").unwrap(),
+            &hrdr_agent::UpdateOperationId::new(format!("spawn-failure-{}", std::process::id()))
+                .unwrap(),
             &checkout,
         )
         .unwrap();
+        restore_test_cargo(previous);
         let operation_root = prepared.candidate_binary.parent().unwrap().to_path_buf();
         fs::remove_file(&prepared.candidate_binary).unwrap();
 
         assert!(Box::new(prepared).launch().is_err());
         fs::remove_dir_all(operation_root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuilt_identity_rejects_mismatched_build_info() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("prebuilt.cmd");
+        fs::write(
+            &binary,
+            "@echo off\r\necho version: mismatched\r\necho commit: deadbeef\r\necho target: mismatched\r\necho source: dirty\r\n",
+        )
+        .unwrap();
+
+        assert!(!prebuilt_identity(
+            &binary,
+            env!("CARGO_PKG_VERSION"),
+            &"0".repeat(40),
+            env!("HRDR_BUILD_TARGET"),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuilt_build_rejects_dirty_admitted_checkout() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let (root, commit, _, _) = admitted_checkout(&temp);
+        fs::write(root.join("untracked"), b"dirty").unwrap();
+
+        assert!(
+            build_prebuilt_candidate(
+                &root,
+                &commit,
+                env!("CARGO_PKG_VERSION"),
+                env!("HRDR_BUILD_TARGET"),
+                &temp.path().join("target"),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuilt_checksum_tampering_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let operation_hash = sha256_hex(b"operation");
+        let root = temp.path();
+        let intended = root.join("bin/hrdr.exe");
+        fs::create_dir_all(intended.parent().unwrap()).unwrap();
+        fs::write(&intended, b"installed").unwrap();
+        let operation_root = intended
+            .parent()
+            .unwrap()
+            .join(format!(".hrdr-update-{operation_hash}"));
+        fs::create_dir(&operation_root).unwrap();
+        let candidate = operation_root.join(format!("coordinator-{operation_hash}.exe"));
+        fs::write(&candidate, b"coordinator").unwrap();
+        let prebuilt = operation_root
+            .join("target")
+            .join(env!("HRDR_BUILD_TARGET"))
+            .join("release")
+            .join(if cfg!(test) { "hrdr.cmd" } else { "hrdr.exe" });
+        fs::create_dir_all(prebuilt.parent().unwrap()).unwrap();
+        fs::write(&prebuilt, b"prebuilt").unwrap();
+        let request_path = operation_root.join(format!("request-{operation_hash}.json"));
+        let mut signed = request(root, candidate);
+        signed.intended_cargo_bin = intended;
+        signed.prebuilt_binary = prebuilt.clone();
+        signed.prebuilt_checksum = sha256_hex(b"prebuilt");
+        write_request(&request_path, &mut signed);
+        fs::write(prebuilt, b"tampered").unwrap();
+
+        assert!(parse_request(&fs::read(&request_path).unwrap()).is_ok());
+        assert!(validate_request_path(&request_path, &signed).is_err());
     }
 
     #[test]
@@ -838,6 +1059,89 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(windows)]
+    fn admitted_checkout(temp: &tempfile::TempDir) -> (PathBuf, String, PathBuf, PathBuf) {
+        let root = temp.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join("tracked"), b"tracked").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "tracked"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "test",
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let cargo_args = temp.path().join("cargo-args.txt");
+        let cargo = temp.path().join("cargo.cmd");
+        fs::write(
+            &cargo,
+            format!(
+                "@echo off\r\nif \"%1\"==\"--build-info\" (\r\necho version: {}\r\necho commit: {commit}\r\necho target: {}\r\necho source: clean\r\nexit /b 0\r\n)\r\necho %*>>\"{}\"\r\nif not \"%1\"==\"build\" exit /b 1\r\nmkdir \"%9\\{}\\release\"\r\ncopy \"%~f0\" \"%9\\{}\\release\\hrdr.cmd\" >nul\r\n",
+                env!("CARGO_PKG_VERSION"),
+                env!("HRDR_BUILD_TARGET"),
+                cargo_args.display(),
+                env!("HRDR_BUILD_TARGET"),
+                env!("HRDR_BUILD_TARGET"),
+            ),
+        )
+        .unwrap();
+        (root, commit, cargo, cargo_args)
+    }
+
+    #[cfg(windows)]
+    fn set_test_cargo(cargo: &Path) -> Option<std::ffi::OsString> {
+        let previous = std::env::var_os("HRDR_TEST_CARGO");
+        unsafe { std::env::set_var("HRDR_TEST_CARGO", cargo) };
+        previous
+    }
+
+    #[cfg(windows)]
+    fn restore_test_cargo(previous: Option<std::ffi::OsString>) {
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HRDR_TEST_CARGO", value),
+                None => std::env::remove_var("HRDR_TEST_CARGO"),
+            }
+        }
+    }
+
     fn request(root: &Path, candidate: PathBuf) -> Request {
         Request {
             session_id: "session".into(),
@@ -845,6 +1149,8 @@ mod tests {
             expected_commit: "0".repeat(40),
             expected_version: env!("CARGO_PKG_VERSION").into(),
             candidate_binary: candidate,
+            prebuilt_binary: root.join("prebuilt"),
+            prebuilt_checksum: sha256_hex(b""),
             intended_cargo_bin: root.join("bin/hrdr"),
             expected_target: env!("HRDR_BUILD_TARGET").into(),
             operation_id: "operation".into(),
@@ -867,6 +1173,9 @@ mod tests {
         let tampered = temp.path().join("tampered.json");
         let mut signed = request(temp.path(), temp.path().join("candidate"));
         write_request(&tampered, &mut signed);
+        let mut tampered_bytes = serialized_request(&signed);
+        tampered_bytes.insert(1, b' ');
+        assert!(parse_request(&tampered_bytes).is_err());
         let body = fs::read_to_string(&tampered)
             .unwrap()
             .replace("session", "other");
@@ -929,8 +1238,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn git_config_parameters_worktree_redirect_is_removed_for_probes_and_cargo() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         assert!(
@@ -1015,6 +1323,13 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         let candidate = staging.join(format!("coordinator-{operation_hash}.cmd"));
         fs::write(&candidate, b"candidate").unwrap();
+        let prebuilt = staging
+            .join("target")
+            .join(env!("HRDR_BUILD_TARGET"))
+            .join("release")
+            .join(if cfg!(test) { "hrdr.cmd" } else { "hrdr.exe" });
+        fs::create_dir_all(prebuilt.parent().unwrap()).unwrap();
+        fs::write(&prebuilt, b"prebuilt").unwrap();
         let previous_test_cargo = std::env::var_os("HRDR_TEST_CARGO");
         let previous_cargo_home = std::env::var_os("CARGO_HOME");
         let previous_git_dir = std::env::var_os("GIT_DIR");
@@ -1051,6 +1366,8 @@ mod tests {
         let mut signed = request(root, candidate);
         signed.expected_commit = commit;
         signed.intended_cargo_bin = installed;
+        signed.prebuilt_binary = prebuilt;
+        signed.prebuilt_checksum = sha256_hex(b"prebuilt");
         signed.source_pid = u32::MAX;
         signed.source_created = 1;
         write_request(&request_path, &mut signed);
@@ -1124,57 +1441,29 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn coordinator_staging_does_not_dirty_the_admitted_checkout() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let temp = tempfile::tempdir().unwrap();
-        let checkout_root = temp.path();
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(checkout_root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        fs::write(checkout_root.join("tracked"), b"tracked").unwrap();
-        assert!(
-            Command::new("git")
-                .args(["add", "tracked"])
-                .current_dir(checkout_root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test",
-                ])
-                .current_dir(checkout_root)
-                .status()
-                .unwrap()
-                .success()
-        );
-
+        let (checkout_root, commit, cargo, _) = admitted_checkout(&temp);
+        let previous = set_test_cargo(&cargo);
         let checkout =
-            AdmittedCheckout::for_test(canonical_absolute(checkout_root).unwrap(), "0".repeat(40));
+            AdmittedCheckout::for_test(canonical_absolute(&checkout_root).unwrap(), commit);
         let prepared = PreparedWindowsUpdateCoordinator::prepare(
             "saved-session",
-            &hrdr_agent::UpdateOperationId::new("clean-checkout-staging").unwrap(),
+            &hrdr_agent::UpdateOperationId::new(format!(
+                "clean-checkout-staging-{}",
+                std::process::id()
+            ))
+            .unwrap(),
             &checkout,
         )
         .unwrap();
+        restore_test_cargo(previous);
         let operation_root = prepared.candidate_binary.parent().unwrap().to_path_buf();
 
         assert!(
             Command::new("git")
                 .args(["status", "--porcelain=v1", "--untracked-files=all"])
-                .current_dir(checkout_root)
+                .current_dir(&checkout_root)
                 .output()
                 .unwrap()
                 .stdout
@@ -1199,15 +1488,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn offroot_candidate_is_rejected_before_git() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let temp = tempfile::tempdir().unwrap();
-        let checkout =
-            AdmittedCheckout::for_test(canonical_absolute(temp.path()).unwrap(), "0".repeat(40));
+        let (root, commit, cargo, _) = admitted_checkout(&temp);
+        let previous = set_test_cargo(&cargo);
+        let checkout = AdmittedCheckout::for_test(canonical_absolute(&root).unwrap(), commit);
         let prepared = PreparedWindowsUpdateCoordinator::prepare(
             "saved-session",
-            &hrdr_agent::UpdateOperationId::new("offroot-candidate").unwrap(),
+            &hrdr_agent::UpdateOperationId::new(format!(
+                "offroot-candidate-{}",
+                std::process::id()
+            ))
+            .unwrap(),
             &checkout,
         )
         .unwrap();
+        restore_test_cargo(previous);
         let operation_root = prepared.candidate_binary.parent().unwrap().to_path_buf();
         let outside = temp.path().join("candidate.exe");
         fs::write(&outside, b"candidate").unwrap();

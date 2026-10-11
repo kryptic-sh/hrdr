@@ -140,15 +140,17 @@ pub(crate) struct AdmittedCheckout {
 }
 
 impl AdmittedCheckout {
+    #[cfg(windows)]
     pub(crate) fn canonical_root(&self) -> &Path {
         &self.canonical_root
     }
 
+    #[cfg(windows)]
     pub(crate) fn expected_commit(&self) -> &str {
         &self.head
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn for_test(canonical_root: PathBuf, head: String) -> Self {
         Self {
             canonical_root,
