@@ -11,7 +11,7 @@ use crossterm::event::{
 };
 use hjkl_clipboard::Clipboard;
 use hjkl_holler::HollerBus;
-use hrdr_agent::{Agent, AgentConfig, AgentEvent, Todo};
+use hrdr_agent::{Agent, AgentConfig, AgentEvent, HandoffIntent, Todo};
 use hrdr_editor::{PlainEngine, TuiEditorEngine, VimEngine};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -520,9 +520,12 @@ pub(crate) struct App {
     /// Once a handoff commit is durable, input is frozen until its owner takes
     /// recovery action outside this frontend.
     handoff_gate: bool,
-    /// This app only renders a committed handoff checkpoint and accepts a safe
-    /// exit key. It must never start or deliver agent work.
-    passive_recovery: bool,
+    /// This app only renders a committed handoff checkpoint and accepts its
+    /// explicitly safe recovery interaction. It must never start or deliver work.
+    passive_recovery: Option<HandoffIntent>,
+    /// `UpdateContinuation` accepts exactly one confirmation, which only reports
+    /// that continuation is unavailable and exits without launching anything.
+    recovery_confirmation_used: bool,
     /// The open-lock for the session currently loaded, if any. Held for the whole
     /// time this session is active so a second hrdr instance can't resume the same
     /// session and silently clobber our turns (last-writer-wins). Set when a
@@ -857,22 +860,23 @@ impl App {
         ui: hrdr_app::UiConfig,
         logo: &'static str,
     ) -> Result<Self> {
-        Self::new_inner(config, ui, logo, false)
+        Self::new_inner(config, ui, logo, None)
     }
 
     pub(crate) fn new_recovery(
         config: AgentConfig,
         ui: hrdr_app::UiConfig,
         logo: &'static str,
+        intent: HandoffIntent,
     ) -> Result<Self> {
-        Self::new_inner(config, ui, logo, true)
+        Self::new_inner(config, ui, logo, Some(intent))
     }
 
     fn new_inner(
         mut config: AgentConfig,
         ui: hrdr_app::UiConfig,
         logo: &'static str,
-        recovery: bool,
+        recovery: Option<HandoffIntent>,
     ) -> Result<Self> {
         // A new app starts a distinct set of panes but shares this thread's render
         // caches with the prior instance (notably in in-process test/preview hosts).
@@ -920,7 +924,7 @@ impl App {
         // ageing itself is the agent's — hand the preference over.
         config.todo_ttl = todo_ttl;
         let cfg = config.clone();
-        let agent = if recovery {
+        let agent = if recovery.is_some() {
             Agent::new_passive(config)?
         } else {
             Agent::new(config)?
@@ -999,8 +1003,9 @@ impl App {
             pending_save: None,
             save_in_flight: false,
             save_done: Arc::new(tokio::sync::Notify::new()),
-            handoff_gate: recovery,
+            handoff_gate: recovery.is_some(),
             passive_recovery: recovery,
+            recovery_confirmation_used: false,
             active_lock: None,
             pending_reservation: None,
             editor,
@@ -1109,7 +1114,7 @@ impl App {
             should_quit: false,
             terminal_lost: Arc::new(AtomicBool::new(false)),
         };
-        if !recovery {
+        if recovery.is_none() {
             // The session's agent joins the registry alongside every delegated one, so
             // the frontend can build its view the same way for all of them.
             app.publish_main_agent();
@@ -1248,9 +1253,25 @@ impl App {
         })
     }
 
-    /// Handle the only recovery interaction: leave without touching the checkpoint.
+    /// Handle a passive recovery key without starting any runtime work.
     pub(crate) fn on_recovery_key(&mut self, key: KeyEvent) {
-        if !self.passive_recovery || key.kind == KeyEventKind::Release {
+        let Some(intent) = self.passive_recovery else {
+            return;
+        };
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if intent == HandoffIntent::UpdateContinuation
+            && !self.recovery_confirmation_used
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('c')
+        {
+            self.recovery_confirmation_used = true;
+            self.system(
+                "update continuation is not available in this build; no update was started"
+                    .to_string(),
+            );
+            self.should_quit = true;
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -3743,9 +3764,10 @@ mod tests {
             auto_resume: false,
             ..Default::default()
         };
-        let mut app = App::new_recovery(config, ui, "logo").unwrap();
+        let mut app =
+            App::new_recovery(config, ui, "logo", hrdr_agent::HandoffIntent::Idle).unwrap();
 
-        assert!(app.passive_recovery);
+        assert_eq!(app.passive_recovery, Some(hrdr_agent::HandoffIntent::Idle));
         assert!(app.handoff_gate);
         assert!(app.registry.is_handoff_quiescent());
         assert!(
@@ -3770,10 +3792,64 @@ mod tests {
         ));
         assert!(!app.should_quit);
         app.on_recovery_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            !app.should_quit,
+            "idle recovery cannot activate continuation"
+        );
+        app.on_recovery_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('q'),
             crossterm::event::KeyModifiers::CONTROL,
         ));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn update_continuation_confirms_once_then_exits_without_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            model: "local://test-model".parse().unwrap(),
+            cwd: tmp.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            ..Default::default()
+        };
+        let ui = hrdr_app::UiConfig {
+            auto_resume: false,
+            ..Default::default()
+        };
+        let mut app = App::new_recovery(
+            config,
+            ui,
+            "logo",
+            hrdr_agent::HandoffIntent::UpdateContinuation,
+        )
+        .unwrap();
+
+        app.on_paste("!echo unsafe");
+        app.maybe_deliver_background();
+        app.on_recovery_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert!(app.recovery_confirmation_used);
+        assert!(app.should_quit);
+        assert!(app.composer_is_empty());
+        assert!(app.user_shell.is_none());
+        assert_eq!(app.steering_len_for_test(), 0);
+        assert!(app.registry.is_handoff_quiescent());
+
+        app.on_recovery_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            app.recovery_confirmation_used,
+            "a second confirmation is inert"
+        );
     }
 
     #[test]

@@ -24,6 +24,46 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 1024;
 
+/// The explicit recovery action requested by a handoff checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffIntent {
+    Idle,
+    UpdateContinuation,
+}
+
+/// Versioned, quiescent runtime state required before a handoff can be claimed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffPayload {
+    version: u8,
+    intent: HandoffIntent,
+    runtime_queue: bool,
+    runtime_tasks: bool,
+    runtime_tools: bool,
+    runtime_turn: bool,
+    runtime_compaction: bool,
+    runtime_watch: bool,
+}
+
+impl HandoffPayload {
+    /// Parse only the current schema and reject any active runtime state.
+    pub fn parse(bytes: &[u8]) -> Result<HandoffIntent> {
+        let payload: Self = serde_json::from_slice(bytes)?;
+        anyhow::ensure!(payload.version == 1, "unsupported handoff payload version");
+        anyhow::ensure!(
+            !payload.runtime_queue
+                && !payload.runtime_tasks
+                && !payload.runtime_tools
+                && !payload.runtime_turn
+                && !payload.runtime_compaction
+                && !payload.runtime_watch,
+            "handoff payload contains active runtime work"
+        );
+        Ok(payload.intent)
+    }
+}
+
 /// The checkpoint phase recorded in a handoff journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -184,9 +224,9 @@ impl<'a> HandoffJournal<'a> {
     ///
     /// The scan, liveness check, and durable `Claim` append share one process-local
     /// append lock. A failed append leaves the committed frame in place for retry.
-    pub fn claim<F>(&self, validate: F) -> Result<Option<HandoffRecord>>
+    pub fn claim<T, F>(&self, validate: F) -> Result<Option<(HandoffRecord, T)>>
     where
-        F: FnOnce(&[u8]) -> Result<()>,
+        F: FnOnce(&[u8]) -> Result<T>,
     {
         let _append_guard = self
             .append_lock
@@ -195,12 +235,12 @@ impl<'a> HandoffJournal<'a> {
         let Some(record) = self.claimable()? else {
             return Ok(None);
         };
-        validate(&record.payload)?;
+        let intent = validate(&record.payload)?;
         let source = hrdr_tools::current_process_lease()
             .context("process-instance handoff journals are unsupported on this platform")?;
         let frame = self.frame(record.epoch, HandoffState::Claim, source, &record.payload)?;
         self.append_frame_locked(&frame)?;
-        Ok(Some(record))
+        Ok(Some((record, intent)))
     }
 
     fn append_frame_locked(&self, frame: &[u8]) -> Result<()> {
@@ -517,6 +557,35 @@ mod tests {
         ] {
             assert_eq!(claimable_state(state), claimable, "{state:?}");
         }
+    }
+
+    #[test]
+    fn invalid_payload_is_not_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(&dir);
+        let frame = journal
+            .frame(
+                1,
+                HandoffState::Commit,
+                hrdr_tools::ProcessLease {
+                    pid: u32::MAX - 1,
+                    created: 0,
+                },
+                b"invalid",
+            )
+            .unwrap();
+        std::fs::write(&journal.path, frame).unwrap();
+
+        assert!(
+            journal
+                .claim::<(), _>(|_| anyhow::bail!("invalid handoff payload"))
+                .is_err()
+        );
+        assert_eq!(
+            journal.scan().unwrap().last.unwrap().state,
+            HandoffState::Commit,
+            "validation runs before Claim is appended"
+        );
     }
 
     #[test]

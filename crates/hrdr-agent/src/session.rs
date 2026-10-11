@@ -824,10 +824,11 @@ impl std::error::Error for HandoffPending {}
 
 /// A claimed handoff snapshot held under its existing open-lock.
 #[derive(Debug)]
-pub struct HandoffRecovery {
+pub struct HandoffRecovery<T> {
     pub session: Session,
     pub lock: SessionLock,
     pub record: crate::HandoffRecord,
+    pub intent: T,
 }
 
 /// Why [`Session::open_path`] couldn't take ownership of a session.
@@ -1277,14 +1278,14 @@ impl Session {
     ///
     /// This path never falls back to an unbacked lock. It loads the snapshot before
     /// claiming its bound journal record and releases the lock on every failure.
-    pub fn recover_handoff<F>(
+    pub fn recover_handoff<T, F>(
         cwd: &str,
         id: &str,
         unix_style_paths: bool,
         validate: F,
-    ) -> Result<HandoffRecovery, OpenError>
+    ) -> Result<HandoffRecovery<T>, OpenError>
     where
-        F: FnOnce(&[u8]) -> Result<()>,
+        F: FnOnce(&[u8]) -> Result<T>,
     {
         let path = session_file_path(cwd, id);
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1304,8 +1305,8 @@ impl Session {
             Ok(journal) => journal,
             Err(error) => return Err(OpenError::Load(error)),
         };
-        let record = match journal.claim(validate) {
-            Ok(Some(record)) => record,
+        let (record, intent) = match journal.claim(validate) {
+            Ok(Some(recovery)) => recovery,
             Ok(None) => {
                 return Err(OpenError::Load(anyhow::anyhow!(
                     "no claimable committed handoff"
@@ -1317,6 +1318,7 @@ impl Session {
             session,
             lock,
             record,
+            intent,
         })
     }
 

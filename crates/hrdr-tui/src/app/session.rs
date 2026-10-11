@@ -196,7 +196,16 @@ impl super::App {
         let mut state = session.state.restored();
         state.id = Some(id);
         *self.state_mut() = state;
-        self.system("recovered committed handoff checkpoint".to_string());
+        match self.passive_recovery {
+            Some(hrdr_agent::HandoffIntent::UpdateContinuation) => self.system(
+                "recovered update-continuation checkpoint — press c to acknowledge that continuation is unavailable"
+                    .to_string(),
+            ),
+            Some(hrdr_agent::HandoffIntent::Idle) => {
+                self.system("recovered committed handoff checkpoint".to_string())
+            }
+            None => {}
+        }
     }
 
     /// The state-swap half of [`Self::auto_resume_latest`], split out so it can

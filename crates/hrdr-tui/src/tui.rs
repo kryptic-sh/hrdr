@@ -100,7 +100,8 @@ mod tests {
             auto_resume: false,
             ..Default::default()
         };
-        let mut app = App::new_recovery(config, ui, "logo").unwrap();
+        let mut app =
+            App::new_recovery(config, ui, "logo", hrdr_agent::HandoffIntent::Idle).unwrap();
 
         handle_recovery_event(
             &mut app,

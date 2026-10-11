@@ -146,7 +146,7 @@ pub async fn run_handoff_recovery(
     let _guard = TerminalGuard::enter()?;
     let backend = cursor_backend::CursorBackend::new(CrosstermBackend::new(stdout()));
     let mut terminal: Tui = Terminal::new(backend)?;
-    let mut app = App::new_recovery(config, ui, logo)?;
+    let mut app = App::new_recovery(config, ui, logo, recovery.intent)?;
     app.adopt_handoff_recovery(id.to_string(), recovery.session, recovery.lock);
     tui::run_recovery_loop(&mut app, &mut terminal).await
 }
