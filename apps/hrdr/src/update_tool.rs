@@ -27,14 +27,23 @@ struct PendingWindowsUpdate {
 }
 
 impl hrdr_tui::DeferredUpdate for PendingWindowsUpdate {
-    fn prepare(self: Box<Self>, session_id: &str) -> Result<hrdr_tui::AdmittedUpdate> {
+    fn prepare(
+        self: Box<Self>,
+        session_id: &str,
+        recovery_cwd: &std::path::Path,
+    ) -> Result<hrdr_tui::AdmittedUpdate> {
         let runtime = tokio::runtime::Handle::current();
         let checkout = runtime
             .block_on(admit(&self.cwd))
             .map_err(|failure| anyhow::anyhow!("update unavailable: {failure:?}"))?;
         Ok(hrdr_tui::AdmittedUpdate::new(
             self.operation_id.clone(),
-            PreparedWindowsUpdateCoordinator::prepare(session_id, &self.operation_id, &checkout)?,
+            PreparedWindowsUpdateCoordinator::prepare(
+                session_id,
+                &self.operation_id,
+                &checkout,
+                recovery_cwd,
+            )?,
         ))
     }
 }

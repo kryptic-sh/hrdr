@@ -3287,13 +3287,15 @@ impl App {
             return;
         };
         let request = self.pending_update.take().expect("checked above");
+        let recovery_cwd = self.dir_cwd.clone();
         self.update_preparing = true;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || request.prepare(&session_id))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result.map_err(|error| error.to_string()));
+            let result =
+                tokio::task::spawn_blocking(move || request.prepare(&session_id, &recovery_cwd))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
             let _ = tx.send(TurnMsg::UpdatePrepared(result)).await;
         });
     }

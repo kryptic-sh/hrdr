@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const MAX_RETRIES: u8 = 3;
 const MAX_DEADLINE_SECS: u64 = 24 * 60 * 60;
 #[cfg(all(windows, test))]
@@ -26,12 +26,13 @@ const FILE_SHARE_READ: u32 = 0x0000_0001;
 struct Request {
     session_id: String,
     checkout_root: PathBuf,
+    recovery_cwd: PathBuf,
     expected_commit: String,
     expected_version: String,
     candidate_binary: PathBuf,
-    #[cfg(test)]
+    #[cfg(all(windows, test))]
     prebuilt_binary: PathBuf,
-    #[cfg(test)]
+    #[cfg(all(windows, test))]
     prebuilt_checksum: String,
     intended_cargo_bin: PathBuf,
     expected_target: String,
@@ -58,6 +59,7 @@ impl PreparedWindowsUpdateCoordinator {
         session_id: &str,
         operation_id: &hrdr_agent::UpdateOperationId,
         checkout: &AdmittedCheckout,
+        recovery_cwd: &Path,
     ) -> anyhow::Result<Self> {
         use anyhow::Context;
         use std::io::Write;
@@ -69,6 +71,12 @@ impl PreparedWindowsUpdateCoordinator {
         anyhow::ensure!(
             checkout_root.is_dir(),
             "update checkout root is not a directory"
+        );
+        let recovery_cwd = canonical_absolute(recovery_cwd)
+            .map_err(|_| anyhow::anyhow!("recovery cwd is not a canonical absolute path"))?;
+        anyhow::ensure!(
+            recovery_cwd.starts_with(&checkout_root),
+            "recovery cwd escapes the admitted checkout"
         );
         anyhow::ensure!(valid_text(session_id, 128), "update session id is invalid");
         anyhow::ensure!(is_full_commit(expected_commit), "update commit is invalid");
@@ -134,12 +142,13 @@ impl PreparedWindowsUpdateCoordinator {
         let mut request = Request {
             session_id: session_id.to_owned(),
             checkout_root,
+            recovery_cwd,
             expected_commit: expected_commit.to_owned(),
             expected_version: expected_version.to_owned(),
             candidate_binary: candidate_binary.clone(),
-            #[cfg(test)]
+            #[cfg(all(windows, test))]
             prebuilt_binary: PathBuf::new(),
-            #[cfg(test)]
+            #[cfg(all(windows, test))]
             prebuilt_checksum: String::new(),
             intended_cargo_bin,
             expected_target: expected_target.to_owned(),
@@ -315,6 +324,7 @@ fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> 
         if launch(
             &request.candidate_binary,
             &request.session_id,
+            &request.recovery_cwd,
             Some(failure.as_str()),
         ) {
             failure
@@ -340,7 +350,12 @@ fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> 
     if !consume_operation(staging_root, request) {
         return Status::Reused;
     }
-    if launch(&request.intended_cargo_bin, &request.session_id, None) {
+    if launch(
+        &request.intended_cargo_bin,
+        &request.session_id,
+        &request.recovery_cwd,
+        None,
+    ) {
         Status::Launched
     } else {
         recover(Status::LaunchFailed)
@@ -570,8 +585,14 @@ fn prebuilt_identity(
 }
 
 #[cfg(windows)]
-fn launch(binary: &Path, session_id: &str, update_failure: Option<&str>) -> bool {
+fn launch(
+    binary: &Path,
+    session_id: &str,
+    recovery_cwd: &Path,
+    update_failure: Option<&str>,
+) -> bool {
     let mut command = Command::new(binary);
+    command.current_dir(recovery_cwd);
     command.args(["__recover-handoff", session_id]);
     if let Some(update_failure) = update_failure {
         command.args(["--update-failure", update_failure]);
@@ -680,6 +701,10 @@ fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathB
     if !checkout_root.is_dir() {
         return Err(());
     }
+    let recovery_cwd = canonical_absolute(&request.recovery_cwd)?;
+    if !recovery_cwd.is_dir() || !recovery_cwd.starts_with(&checkout_root) {
+        return Err(());
+    }
     let intended_cargo_bin = canonical_absolute(&request.intended_cargo_bin)?;
     if !intended_cargo_bin.is_file()
         || default_cargo_bin().ok().as_ref() != Some(&intended_cargo_bin)
@@ -744,6 +769,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         "schema_version",
         "session_id",
         "checkout_root",
+        "recovery_cwd",
         "expected_commit",
         "expected_version",
         "candidate_binary",
@@ -784,12 +810,13 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
     let request = Request {
         session_id: string("session_id")?,
         checkout_root: PathBuf::from(string("checkout_root")?),
+        recovery_cwd: PathBuf::from(string("recovery_cwd")?),
         expected_commit: string("expected_commit")?,
         expected_version: string("expected_version")?,
         candidate_binary: PathBuf::from(string("candidate_binary")?),
-        #[cfg(test)]
+        #[cfg(all(windows, test))]
         prebuilt_binary: PathBuf::new(),
-        #[cfg(test)]
+        #[cfg(all(windows, test))]
         prebuilt_checksum: String::new(),
         intended_cargo_bin: PathBuf::from(string("intended_cargo_bin")?),
         expected_target: string("expected_target")?,
@@ -809,9 +836,10 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
 fn canonical_body(request: &Request) -> String {
     let quote = |value: &str| serde_json::to_string(value).expect("strings serialize");
     format!(
-        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"expected_commit\":{},\"expected_version\":{},\"candidate_binary\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"source_pid\":{},\"source_created\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
+        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"recovery_cwd\":{},\"expected_commit\":{},\"expected_version\":{},\"candidate_binary\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"source_pid\":{},\"source_created\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
         quote(&request.session_id),
         quote(&request.checkout_root.to_string_lossy()),
+        quote(&request.recovery_cwd.to_string_lossy()),
         quote(&request.expected_commit),
         quote(&request.expected_version),
         quote(&request.candidate_binary.to_string_lossy()),
@@ -861,9 +889,13 @@ mod tests {
             hrdr_agent::UpdateOperationId::new(format!("prepared-request-{}", std::process::id()))
                 .unwrap();
         let checkout = AdmittedCheckout::for_test(canonical_absolute(&root).unwrap(), commit);
-        let prepared =
-            PreparedWindowsUpdateCoordinator::prepare("saved-session", &operation, &checkout)
-                .unwrap();
+        let prepared = PreparedWindowsUpdateCoordinator::prepare(
+            "saved-session",
+            &operation,
+            &checkout,
+            &root,
+        )
+        .unwrap();
 
         restore_test_cargo(previous);
         let request = parse_request(&fs::read(&prepared.request_path).unwrap()).unwrap();
@@ -897,6 +929,7 @@ mod tests {
             &hrdr_agent::UpdateOperationId::new(format!("spawn-failure-{}", std::process::id()))
                 .unwrap(),
             &checkout,
+            &root,
         )
         .unwrap();
         restore_test_cargo(previous);
@@ -1133,10 +1166,13 @@ mod tests {
         Request {
             session_id: "session".into(),
             checkout_root: root.to_path_buf(),
+            recovery_cwd: root.to_path_buf(),
             expected_commit: "0".repeat(40),
             expected_version: env!("CARGO_PKG_VERSION").into(),
             candidate_binary: candidate,
+            #[cfg(windows)]
             prebuilt_binary: root.join("prebuilt"),
+            #[cfg(windows)]
             prebuilt_checksum: sha256_hex(b""),
             intended_cargo_bin: root.join("bin/hrdr"),
             expected_target: env!("HRDR_BUILD_TARGET").into(),
@@ -1163,9 +1199,15 @@ mod tests {
         let mut tampered_bytes = serialized_request(&signed);
         tampered_bytes.insert(1, b' ');
         assert!(parse_request(&tampered_bytes).is_err());
-        let body = fs::read_to_string(&tampered)
-            .unwrap()
-            .replace("session", "other");
+        let tampered_cwd = temp.path().join("outside");
+        fs::create_dir(&tampered_cwd).unwrap();
+        let recovery_cwd =
+            serde_json::to_string(&signed.recovery_cwd.display().to_string()).unwrap();
+        let replacement = serde_json::to_string(&tampered_cwd.display().to_string()).unwrap();
+        let body = fs::read_to_string(&tampered).unwrap().replace(
+            &format!("\"recovery_cwd\":{recovery_cwd}"),
+            &format!("\"recovery_cwd\":{replacement}"),
+        );
         fs::write(&tampered, body).unwrap();
         assert_eq!(run(tampered), Status::Invalid);
     }
@@ -1188,18 +1230,24 @@ mod tests {
         let script = temp.path().join("installed.cmd");
         fs::write(
             &script,
-            format!("@echo off\r\necho %1^|%2>>\"{}\"\r\n", marker.display()),
+            format!(
+                "@echo off\r\necho %cd%^|%1^|%2>>\"{}\"\r\n",
+                marker.display()
+            ),
         )
         .unwrap();
 
-        assert!(launch(&script, "saved-session", None));
+        assert!(launch(&script, "saved-session", temp.path(), None));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !marker.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(
             fs::read_to_string(marker).unwrap(),
-            "__recover-handoff|saved-session\r\n"
+            format!(
+                "{}|__recover-handoff|saved-session\r\n",
+                temp.path().display()
+            )
         );
     }
 
@@ -1442,6 +1490,7 @@ mod tests {
             ))
             .unwrap(),
             &checkout,
+            &checkout_root,
         )
         .unwrap();
         restore_test_cargo(previous);
@@ -1489,6 +1538,7 @@ mod tests {
             ))
             .unwrap(),
             &checkout,
+            &root,
         )
         .unwrap();
         restore_test_cargo(previous);

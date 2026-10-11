@@ -430,9 +430,11 @@ fn update_installs_default_cargo_binary_and_recovers_once() {
     let mut session = fixture.start(&server);
     session.wait_for("mock-model");
     fixture.assert_checkout_clean("initial TUI startup");
+    session.send("/cwd apps/hrdr\r");
+    session.wait_for("apps/hrdr");
     session.send("install update\r");
     wait_until("tool-result continuation before handoff", || {
-        (server.chat_bodies().len() == 2 && session.screen().contains("turn-after-update"))
+        (server.chat_bodies().len() == 5 && session.screen().contains("turn-after-update"))
             .then_some(())
     });
     let _ = session.wait_for_exit(&fixture);
@@ -461,14 +463,42 @@ fn update_installs_default_cargo_binary_and_recovers_once() {
         "the coordinator must run Cargo install against the admitted checkout:\n{cargo_log}"
     );
 
-    wait_until("one recovered continuation", || {
-        (server.chat_bodies().len() == 3 && session.screen().contains("continued-after-update"))
-            .then_some(())
+    wait_until("recovered shell cwd", || {
+        let bodies = server.chat_bodies();
+        (bodies.len() == 7
+            && session.screen().contains("continued-after-update")
+            && bodies
+                .last()
+                .is_some_and(|body| body.to_string().contains("recovery-cwd-preserved")))
+        .then_some(())
     });
     assert_eq!(
         server.chat_bodies().len(),
-        3,
-        "the update turn, its normal tool continuation, and one recovery continuation must run"
+        7,
+        "the persisted update turn and one recovered shell continuation must run"
+    );
+    let persisted = wait_until("persisted recovered state", || {
+        let state = persisted_session_state(&fixture.home)?;
+        let messages = state["messages"].as_array()?;
+        let todos = state["todos"].as_array()?;
+        let goals = state["goals"].as_array()?;
+        (messages
+            .iter()
+            .any(|message| message.to_string().contains("install update"))
+            && todos.iter().any(|todo| {
+                todo["content"] == "preserve update state"
+                    && todo["status"] == "completed"
+                    && todo["evidence"] == "Windows update E2E"
+            })
+            && goals.iter().any(|goal| {
+                goal["content"] == "cancel after recovery" && goal["status"] == "cancelled"
+            }))
+        .then_some(state)
+    });
+    assert!(
+        persisted["messages"]
+            .as_array()
+            .is_some_and(|messages| !messages.is_empty())
     );
     fixture.assert_checkout_clean("recovered continuation");
 }
@@ -484,7 +514,7 @@ fn reused_request_does_not_install_or_recover_again() {
     let _ = session.wait_for_exit(&fixture);
     let operation = fixture.operation_root();
     wait_until("recovered continuation", || {
-        (server.chat_bodies().len() == 3).then_some(())
+        (server.chat_bodies().len() == 7).then_some(())
     });
     let destination = fs::read(&fixture.installed).expect("installed destination");
     let coordinator = single(&operation, "coordinator-");
@@ -517,7 +547,7 @@ fn reused_request_does_not_install_or_recover_again() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
         server.chat_bodies().len(),
-        3,
+        7,
         "a reused request must not recover again"
     );
 }
@@ -535,7 +565,7 @@ fn failed_cargo_install_recovers_with_the_retained_old_binary_once() {
     session.wait_for("mock-model");
     session.send("install update\r");
     wait_until("tool-result continuation before handoff", || {
-        (server.chat_bodies().len() == 2 && session.screen().contains("turn-after-update"))
+        (server.chat_bodies().len() == 5 && session.screen().contains("turn-after-update"))
             .then_some(())
     });
     let _ = session.wait_for_exit(&fixture);
@@ -543,7 +573,7 @@ fn failed_cargo_install_recovers_with_the_retained_old_binary_once() {
     let recovery_started = Instant::now();
     loop {
         let screen = session.screen();
-        if server.chat_bodies().len() == 3 && screen.contains("continued-after-update") {
+        if server.chat_bodies().len() == 7 && screen.contains("continued-after-update") {
             break;
         }
         assert!(
@@ -586,13 +616,34 @@ fn failed_cargo_install_recovers_with_the_retained_old_binary_once() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
         server.chat_bodies().len(),
-        3,
+        7,
         "the retained old binary must run exactly one continuation without a dual recovery"
     );
 }
 
 fn update_conversation() -> Vec<Chat> {
     vec![
+        Chat::Sse(vec![
+            tool_start_chunk("goal", "goal-add", "goal"),
+            tool_args_chunk("goal", r#"{"op":"add","content":"cancel after recovery"}"#),
+            tool_calls_stop_chunk("goal"),
+            "[DONE]".to_owned(),
+        ]),
+        Chat::Sse(vec![
+            tool_start_chunk("goal", "goal-cancel", "goal"),
+            tool_args_chunk("goal", r#"{"op":"cancel","id":1}"#),
+            tool_calls_stop_chunk("goal"),
+            "[DONE]".to_owned(),
+        ]),
+        Chat::Sse(vec![
+            tool_start_chunk("todo", "todo-complete", "todo"),
+            tool_args_chunk(
+                "todo",
+                r#"{"todos":[{"content":"preserve update state","status":"completed","evidence":"Windows update E2E"}]}"#,
+            ),
+            tool_calls_stop_chunk("todo"),
+            "[DONE]".to_owned(),
+        ]),
         Chat::Sse(vec![
             tool_start_chunk("update", "update-call", "update"),
             tool_args_chunk("update", "{}"),
@@ -605,11 +656,39 @@ fn update_conversation() -> Vec<Chat> {
             "[DONE]".to_owned(),
         ]),
         Chat::Sse(vec![
+            tool_start_chunk("shell", "recovery-cwd", "shell"),
+            tool_args_chunk(
+                "shell",
+                r#"{"command":"if (Test-Path src/main.rs) { 'recovery-cwd-preserved' } else { throw 'recovery cwd changed' }"}"#,
+            ),
+            tool_calls_stop_chunk("shell"),
+            "[DONE]".to_owned(),
+        ]),
+        Chat::Sse(vec![
             common::text_chunk("recovered", "continued-after-update"),
             stop_chunk("recovered"),
             "[DONE]".to_owned(),
         ]),
     ]
+}
+
+fn persisted_session_state(home: &Path) -> Option<serde_json::Value> {
+    let sessions = home.join("hrdr").join("sessions");
+    let cwd = fs::read_dir(sessions)
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_dir()))?;
+    let snapshot = fs::read_dir(cwd.path())
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        })?;
+    serde_json::from_slice(&fs::read(snapshot.path()).ok()?).ok()
 }
 
 fn compact_terminal_text(text: &str) -> String {

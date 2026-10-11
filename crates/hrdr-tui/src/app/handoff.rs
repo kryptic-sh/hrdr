@@ -14,7 +14,11 @@ pub trait PreparedUpdateCoordinator: Send {
 
 /// A one-shot update request held by the TUI until its current turn is over.
 pub trait DeferredUpdate: Send {
-    fn prepare(self: Box<Self>, session_id: &str) -> anyhow::Result<AdmittedUpdate>;
+    fn prepare(
+        self: Box<Self>,
+        session_id: &str,
+        recovery_cwd: &std::path::Path,
+    ) -> anyhow::Result<AdmittedUpdate>;
 }
 
 /// Sender exposed only to the frontend-owned update tool.

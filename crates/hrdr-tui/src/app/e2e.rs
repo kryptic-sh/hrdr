@@ -12747,12 +12747,18 @@ async fn ctrl_c_with_only_an_attachment_pending_clears_it_instead_of_arming_quit
 #[cfg(windows)]
 struct TestDeferredUpdate {
     prepared: Arc<AtomicUsize>,
+    recovery_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     launches: Arc<AtomicUsize>,
 }
 
 #[cfg(windows)]
 impl DeferredUpdate for TestDeferredUpdate {
-    fn prepare(self: Box<Self>, _: &str) -> anyhow::Result<AdmittedUpdate> {
+    fn prepare(
+        self: Box<Self>,
+        _: &str,
+        recovery_cwd: &std::path::Path,
+    ) -> anyhow::Result<AdmittedUpdate> {
+        *self.recovery_cwd.lock().unwrap() = Some(recovery_cwd.to_path_buf());
         self.prepared.fetch_add(1, Ordering::SeqCst);
         Ok(AdmittedUpdate::new(
             hrdr_agent::UpdateOperationId::new("deferred-update").unwrap(),
@@ -12771,7 +12777,7 @@ struct FailingDeferredUpdate {
 
 #[cfg(windows)]
 impl DeferredUpdate for FailingDeferredUpdate {
-    fn prepare(self: Box<Self>, _: &str) -> anyhow::Result<AdmittedUpdate> {
+    fn prepare(self: Box<Self>, _: &str, _: &std::path::Path) -> anyhow::Result<AdmittedUpdate> {
         self.prepared.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("test update preparation failure")
     }
@@ -12816,10 +12822,12 @@ async fn deferred_update_keeps_preexisting_drafts_editable_until_quiescent() {
     let (sender, receiver) = crate::update_request_bridge();
     h.app.update_requests = Some(receiver);
     let prepared = Arc::new(AtomicUsize::new(0));
+    let recovery_cwd = Arc::new(Mutex::new(None));
     let launches = Arc::new(AtomicUsize::new(0));
     sender
         .send(Box::new(TestDeferredUpdate {
             prepared: prepared.clone(),
+            recovery_cwd: recovery_cwd.clone(),
             launches: launches.clone(),
         }))
         .unwrap();
@@ -12850,6 +12858,11 @@ async fn deferred_update_keeps_preexisting_drafts_editable_until_quiescent() {
     })
     .await;
     assert_eq!(prepared.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *recovery_cwd.lock().unwrap(),
+        Some(h.app.dir_cwd.clone()),
+        "the coordinator receives the admitted TUI session cwd"
+    );
     assert_eq!(launches.load(Ordering::SeqCst), 0);
     assert!(h.app.admitted_update.is_some());
 
@@ -12896,10 +12909,12 @@ async fn failed_update_preparation_leaves_no_success_evidence_and_releases_retry
     );
 
     let prepared = Arc::new(AtomicUsize::new(0));
+    let recovery_cwd = Arc::new(Mutex::new(None));
     let launches = Arc::new(AtomicUsize::new(0));
     sender
         .send(Box::new(TestDeferredUpdate {
             prepared: prepared.clone(),
+            recovery_cwd: recovery_cwd.clone(),
             launches: launches.clone(),
         }))
         .unwrap();
@@ -12909,6 +12924,7 @@ async fn failed_update_preparation_leaves_no_success_evidence_and_releases_retry
     })
     .await;
     assert_eq!(prepared.load(Ordering::SeqCst), 1);
+    assert_eq!(*recovery_cwd.lock().unwrap(), Some(h.app.dir_cwd.clone()));
     h.app.commit_pending_update().await;
     assert_eq!(launches.load(Ordering::SeqCst), 1);
 }
