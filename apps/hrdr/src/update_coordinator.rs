@@ -1,8 +1,9 @@
 //! One-shot hidden self-update coordinator.
 //!
 //! The request is claimed by rename before it is parsed.  Windows then waits for
-//! the exact old process instance to exit, installs the validated checkout, and
-//! starts the installed binary's handoff recovery exactly once.
+//! the exact old process instance to exit, re-attests the validated prebuilt
+//! candidate, atomically promotes it, and starts the promoted binary's handoff
+//! recovery exactly once.
 
 #[cfg(windows)]
 use crate::update_check::AdmittedCheckout;
@@ -227,7 +228,7 @@ enum Status {
     #[cfg(windows)]
     SourceUnknown,
     #[cfg(windows)]
-    InstallFailed,
+    PromotionFailed,
     #[cfg(windows)]
     IdentityFailed,
     #[cfg(windows)]
@@ -250,7 +251,7 @@ impl Status {
             #[cfg(windows)]
             Self::SourceUnknown => "source_unknown",
             #[cfg(windows)]
-            Self::InstallFailed => "install_failed",
+            Self::PromotionFailed => "promotion_failed",
             #[cfg(windows)]
             Self::IdentityFailed => "identity_failed",
             #[cfg(windows)]
@@ -316,40 +317,24 @@ fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> 
     if !clean_head(checkout_root, &request.expected_commit, deadline) {
         return Status::Stale;
     }
-    if checkout_package_version(checkout_root, deadline).as_deref()
-        != Some(request.expected_version.as_str())
-    {
-        return Status::Stale;
+    if !attest_prebuilt_candidate(&request.prebuilt_binary, request, deadline) {
+        return Status::IdentityFailed;
     }
-
-    let mut installed = false;
-    for _ in 0..=request.retry_limit {
-        if run_command(
-            sanitized_command(cargo_program())
-                .current_dir(checkout_root)
-                .args(["install", "--path", "apps/hrdr", "--locked"]),
-            deadline,
-            false,
-        )
-        .is_ok()
-        {
-            installed = true;
-            break;
-        }
-    }
-    if !installed {
-        return Status::InstallFailed;
-    }
-
-    if !clean_head(checkout_root, &request.expected_commit, deadline) {
-        return Status::Stale;
+    if !promote_prebuilt_candidate(&request.prebuilt_binary, &request.intended_cargo_bin) {
+        return Status::PromotionFailed;
     }
     let Some((launched_binary, launched_file)) =
-        stage_installed_binary(&request.intended_cargo_bin, staging_root, request)
+        stage_promoted_binary(&request.intended_cargo_bin, staging_root, request)
     else {
         return Status::IdentityFailed;
     };
-    if !installed_identity(&launched_binary, request, deadline) {
+    if !prebuilt_identity(
+        &launched_binary,
+        &request.expected_version,
+        &request.expected_commit,
+        &request.expected_target,
+        deadline,
+    ) {
         return Status::IdentityFailed;
     }
     if !consume_operation(staging_root, request) {
@@ -446,31 +431,58 @@ fn build_prebuilt_candidate(
 }
 
 #[cfg(windows)]
-fn checkout_package_version(checkout_root: &Path, deadline: std::time::Instant) -> Option<String> {
-    let output = run_command(
-        sanitized_command(cargo_program())
-            .current_dir(checkout_root)
-            .args([
-                "metadata",
-                "--no-deps",
-                "--format-version=1",
-                "--manifest-path",
-                "apps/hrdr/Cargo.toml",
-            ]),
-        deadline,
-        true,
-    )
-    .ok()?;
-    let metadata: serde_json::Value = serde_json::from_slice(&output).ok()?;
-    metadata
-        .get("packages")?
-        .as_array()?
-        .iter()
-        .find(|package| package.get("name").and_then(serde_json::Value::as_str) == Some("hrdr"))?
-        .get("version")?
-        .as_str()
-        .filter(|version| valid_text(version, 64))
-        .map(str::to_owned)
+fn attest_prebuilt_candidate(
+    binary: &Path,
+    request: &Request,
+    deadline: std::time::Instant,
+) -> bool {
+    fs::read(binary)
+        .ok()
+        .is_some_and(|bytes| sha256_hex(&bytes) == request.prebuilt_checksum)
+        && prebuilt_identity(
+            binary,
+            &request.expected_version,
+            &request.expected_commit,
+            &request.expected_target,
+            deadline,
+        )
+}
+
+#[cfg(windows)]
+fn promote_prebuilt_candidate(candidate: &Path, destination: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
+        ReplaceFileW,
+    };
+
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<u16>>()
+    };
+    let destination_exists = destination.exists();
+    let candidate = wide(candidate);
+    let destination = wide(destination);
+    unsafe {
+        if destination_exists {
+            ReplaceFileW(
+                destination.as_ptr(),
+                candidate.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            ) != 0
+        } else {
+            MoveFileExW(
+                candidate.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            ) != 0
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -540,16 +552,16 @@ fn clean_head(checkout_root: &Path, expected_commit: &str, deadline: std::time::
 }
 
 #[cfg(windows)]
-fn stage_installed_binary(
-    installed: &Path,
+fn stage_promoted_binary(
+    promoted: &Path,
     staging_root: &Path,
     request: &Request,
 ) -> Option<(PathBuf, fs::File)> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    let extension = installed.extension()?.to_str()?;
+    let extension = promoted.extension()?.to_str()?;
     let staged = staging_root.join(format!(".launch-{}.{extension}", request.checksum));
-    let bytes = fs::read(installed).ok()?;
+    let bytes = fs::read(promoted).ok()?;
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -586,17 +598,6 @@ fn prebuilt_identity(
         "version: {expected_version}\ncommit: {expected_commit}\ntarget: {expected_target}\nsource: clean\n",
     );
     output.replace("\r\n", "\n") == expected
-}
-
-#[cfg(windows)]
-fn installed_identity(binary: &Path, request: &Request, deadline: std::time::Instant) -> bool {
-    prebuilt_identity(
-        binary,
-        &request.expected_version,
-        &request.expected_commit,
-        &request.expected_target,
-        deadline,
-    )
 }
 
 #[cfg(windows)]
@@ -968,6 +969,55 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn promotion_replaces_existing_destination_with_write_through() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("hrdr.exe");
+        let candidate = temp.path().join("candidate.exe");
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&candidate, b"new").unwrap();
+
+        assert!(promote_prebuilt_candidate(&candidate, &destination));
+        assert_eq!(fs::read(destination).unwrap(), b"new");
+        assert!(!candidate.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn promotion_creates_absent_destination_with_write_through() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("hrdr.exe");
+        let candidate = temp.path().join("candidate.exe");
+        fs::write(&candidate, b"new").unwrap();
+
+        assert!(promote_prebuilt_candidate(&candidate, &destination));
+        assert_eq!(fs::read(destination).unwrap(), b"new");
+        assert!(!candidate.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn promotion_sharing_violation_preserves_destination_and_candidate() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("hrdr.exe");
+        let candidate = temp.path().join("candidate.exe");
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&candidate, b"new").unwrap();
+        let guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&destination)
+            .unwrap();
+
+        assert!(!promote_prebuilt_candidate(&candidate, &destination));
+        assert_eq!(fs::read(destination).unwrap(), b"old");
+        assert_eq!(fs::read(candidate).unwrap(), b"new");
+        drop(guard);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn prebuilt_identity_rejects_mismatched_build_info() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("prebuilt.cmd");
@@ -1031,14 +1081,16 @@ mod tests {
         fs::write(&prebuilt, b"prebuilt").unwrap();
         let request_path = operation_root.join(format!("request-{operation_hash}.json"));
         let mut signed = request(root, candidate);
-        signed.intended_cargo_bin = intended;
+        signed.intended_cargo_bin = intended.clone();
         signed.prebuilt_binary = prebuilt.clone();
         signed.prebuilt_checksum = sha256_hex(b"prebuilt");
         write_request(&request_path, &mut signed);
-        fs::write(prebuilt, b"tampered").unwrap();
+        fs::write(&prebuilt, b"tampered").unwrap();
 
         assert!(parse_request(&fs::read(&request_path).unwrap()).is_ok());
         assert!(validate_request_path(&request_path, &signed).is_err());
+        assert_eq!(fs::read(&intended).unwrap(), b"installed");
+        assert_eq!(fs::read(&prebuilt).unwrap(), b"tampered");
     }
 
     #[test]
@@ -1226,7 +1278,7 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::write(&installed, b"installed binary").unwrap();
         let request = request(temp.path(), staging.join("candidate.exe"));
-        let (staged, guard) = stage_installed_binary(&installed, &staging, &request).unwrap();
+        let (staged, guard) = stage_promoted_binary(&installed, &staging, &request).unwrap();
 
         assert!(fs::OpenOptions::new().write(true).open(&staged).is_err());
         assert!(fs::remove_file(&staged).is_err());
@@ -1237,7 +1289,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn git_config_parameters_worktree_redirect_is_removed_for_probes_and_cargo() {
+    fn git_config_parameters_worktree_redirect_is_removed_and_promotion_never_runs_cargo() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -1329,7 +1381,16 @@ mod tests {
             .join("release")
             .join(if cfg!(test) { "hrdr.cmd" } else { "hrdr.exe" });
         fs::create_dir_all(prebuilt.parent().unwrap()).unwrap();
-        fs::write(&prebuilt, b"prebuilt").unwrap();
+        fs::write(
+            &prebuilt,
+            format!(
+                "@echo off\r\nif \"%1\"==\"--build-info\" (\r\necho version: {}\r\necho commit: {commit}\r\necho target: {}\r\necho source: clean\r\nexit /b 0\r\n)\r\necho %1^|%2>>\"{}\"\r\n",
+                env!("CARGO_PKG_VERSION"),
+                env!("HRDR_BUILD_TARGET"),
+                marker.display(),
+            ),
+        )
+        .unwrap();
         let previous_test_cargo = std::env::var_os("HRDR_TEST_CARGO");
         let previous_cargo_home = std::env::var_os("CARGO_HOME");
         let previous_git_dir = std::env::var_os("GIT_DIR");
@@ -1367,7 +1428,7 @@ mod tests {
         signed.expected_commit = commit;
         signed.intended_cargo_bin = installed;
         signed.prebuilt_binary = prebuilt;
-        signed.prebuilt_checksum = sha256_hex(b"prebuilt");
+        signed.prebuilt_checksum = sha256_hex(&fs::read(&signed.prebuilt_binary).unwrap());
         signed.source_pid = u32::MAX;
         signed.source_created = 1;
         write_request(&request_path, &mut signed);
@@ -1376,13 +1437,6 @@ mod tests {
             &signed.expected_commit,
             std::time::Instant::now() + std::time::Duration::from_secs(2)
         ));
-        assert_eq!(
-            checkout_package_version(
-                root,
-                std::time::Instant::now() + std::time::Duration::from_secs(2)
-            ),
-            Some(signed.expected_version.clone())
-        );
         let result = run(request_path);
         unsafe {
             match previous_test_cargo {
@@ -1412,10 +1466,7 @@ mod tests {
                 .stdout
                 .is_empty()
         );
-        assert_eq!(
-            fs::read_to_string(cargo_args).unwrap(),
-            "install --path apps/hrdr --locked\r\n"
-        );
+        assert!(!cargo_args.exists());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !marker.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
