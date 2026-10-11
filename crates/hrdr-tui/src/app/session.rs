@@ -205,9 +205,9 @@ impl super::App {
         *self.state_mut() = preview;
         self.recovery_state = Some(state);
         match self.passive_recovery {
-            Some(hrdr_agent::HandoffIntent::UpdateContinuation) => self.system(
-                "recovered update-continuation checkpoint — press c to continue".to_string(),
-            ),
+            Some(hrdr_agent::HandoffIntent::UpdateContinuation) => {
+                self.system("recovered update-continuation checkpoint".to_string())
+            }
             Some(hrdr_agent::HandoffIntent::Idle) => {
                 self.system("recovered committed handoff checkpoint".to_string())
             }
