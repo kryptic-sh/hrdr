@@ -1,6 +1,8 @@
-//! Validation-only contract for the hidden self-update coordinator.
+//! One-shot hidden self-update coordinator.
 //!
-//! This module deliberately does not build, replace, restart, or recover anything.
+//! The request is claimed by rename before it is parsed.  Windows then waits for
+//! the exact old process instance to exit, installs the validated checkout, and
+//! starts the installed binary's handoff recovery exactly once.
 
 use sha2::{Digest, Sha256};
 use std::{
@@ -10,7 +12,7 @@ use std::{
     process::Command,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_RETRIES: u8 = 3;
 const MAX_DEADLINE_SECS: u64 = 24 * 60 * 60;
 const STAGING_DIR: &str = ".hrdr/update-staging";
@@ -24,6 +26,8 @@ struct Request {
     intended_cargo_bin: PathBuf,
     expected_target: String,
     operation_id: String,
+    source_pid: u32,
+    source_created: u64,
     retry_limit: u8,
     deadline_secs: u64,
     checksum: String,
@@ -42,18 +46,23 @@ pub fn run_from_args() -> Option<anyhow::Result<()>> {
         _ => Status::Invalid,
     };
     println!(
-        "{{\"schema_version\":1,\"status\":\"{}\"}}",
+        "{{\"schema_version\":{SCHEMA_VERSION},\"status\":\"{}\"}}",
         result.as_str()
     );
     Some(Ok(()))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
     Invalid,
     Reused,
     Stale,
-    Validated,
+    WaitTimeout,
+    SourceUnknown,
+    InstallFailed,
+    IdentityFailed,
+    LaunchFailed,
+    Launched,
     #[cfg(not(windows))]
     Unsupported,
 }
@@ -64,7 +73,12 @@ impl Status {
             Self::Invalid => "invalid",
             Self::Reused => "reused",
             Self::Stale => "stale",
-            Self::Validated => "validated",
+            Self::WaitTimeout => "wait_timeout",
+            Self::SourceUnknown => "source_unknown",
+            Self::InstallFailed => "install_failed",
+            Self::IdentityFailed => "identity_failed",
+            Self::LaunchFailed => "launch_failed",
+            Self::Launched => "launched",
             #[cfg(not(windows))]
             Self::Unsupported => "unsupported",
         }
@@ -84,19 +98,193 @@ fn run(request_path: PathBuf) -> Status {
     let Ok(checkout_root) = validate_request_path(&in_progress, &request) else {
         return Status::Invalid;
     };
-    if head_commit(&checkout_root).as_deref() != Some(&request.expected_commit) {
-        return Status::Stale;
-    }
 
     #[cfg(windows)]
     {
-        let _ = request;
-        Status::Validated
+        run_windows(&request, &checkout_root)
     }
     #[cfg(not(windows))]
     {
-        let _ = request;
+        let _ = (request, checkout_root);
         Status::Unsupported
+    }
+}
+
+#[cfg(windows)]
+fn run_windows(request: &Request, checkout_root: &Path) -> Status {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(request.deadline_secs);
+    let lease = hrdr_tools::ProcessLease {
+        pid: request.source_pid,
+        created: request.source_created,
+    };
+    loop {
+        match hrdr_tools::process_lease_liveness(lease) {
+            hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced => break,
+            hrdr_tools::ProcessLiveness::Unknown => return Status::SourceUnknown,
+            hrdr_tools::ProcessLiveness::Live if std::time::Instant::now() >= deadline => {
+                return Status::WaitTimeout;
+            }
+            hrdr_tools::ProcessLiveness::Live => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+        }
+    }
+
+    if !clean_head(checkout_root, &request.expected_commit, deadline) {
+        return Status::Stale;
+    }
+
+    let mut installed = false;
+    for _ in 0..=request.retry_limit {
+        if run_command(
+            Command::new(cargo_program())
+                .current_dir(checkout_root)
+                .args(["install", "--path", "apps/hrdr", "--locked"]),
+            deadline,
+            false,
+        )
+        .is_ok()
+        {
+            installed = true;
+            break;
+        }
+    }
+    if !installed {
+        return Status::InstallFailed;
+    }
+
+    if !clean_head(checkout_root, &request.expected_commit, deadline) {
+        return Status::Stale;
+    }
+    if !installed_identity(&request.intended_cargo_bin, request, deadline) {
+        return Status::IdentityFailed;
+    }
+    if launch(&request.intended_cargo_bin, &request.session_id) {
+        Status::Launched
+    } else {
+        Status::LaunchFailed
+    }
+}
+
+#[cfg(windows)]
+fn cargo_program() -> PathBuf {
+    #[cfg(test)]
+    if let Some(program) = std::env::var_os("HRDR_TEST_CARGO") {
+        return PathBuf::from(program);
+    }
+    PathBuf::from("cargo")
+}
+
+#[cfg(windows)]
+fn clean_head(checkout_root: &Path, expected_commit: &str, deadline: std::time::Instant) -> bool {
+    let Ok(head) = run_command(
+        Command::new("git")
+            .current_dir(checkout_root)
+            .args(["rev-parse", "--verify", "HEAD"]),
+        deadline,
+        true,
+    ) else {
+        return false;
+    };
+    let Ok(status) = run_command(
+        Command::new("git").current_dir(checkout_root).args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ]),
+        deadline,
+        true,
+    ) else {
+        return false;
+    };
+    std::str::from_utf8(&head)
+        .ok()
+        .map(str::trim)
+        .is_some_and(|head| head == expected_commit)
+        && status.is_empty()
+}
+
+#[cfg(windows)]
+fn installed_identity(binary: &Path, request: &Request, deadline: std::time::Instant) -> bool {
+    let Ok(output) = run_command(Command::new(binary).arg("--build-info"), deadline, true) else {
+        return false;
+    };
+    let Ok(output) = std::str::from_utf8(&output) else {
+        return false;
+    };
+    let expected = format!(
+        "version: {}\ncommit: {}\ntarget: {}\nsource: clean\n",
+        env!("CARGO_PKG_VERSION"),
+        request.expected_commit,
+        request.expected_target,
+    );
+    output.replace("\r\n", "\n") == expected
+}
+
+#[cfg(windows)]
+fn launch(binary: &Path, session_id: &str) -> bool {
+    Command::new(binary)
+        .args(["__recover-handoff", session_id])
+        .spawn()
+        .is_ok()
+}
+
+/// Runs an argv command without a shell. Output is capped and every wait shares
+/// the request deadline; a timed-out child is killed before this returns.
+#[cfg(windows)]
+fn run_command(
+    command: &mut Command,
+    deadline: std::time::Instant,
+    capture: bool,
+) -> Result<Vec<u8>, ()> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command.stderr(Stdio::null());
+    if capture {
+        command.stdout(Stdio::piped());
+    } else {
+        command.stdout(Stdio::null());
+    }
+    let mut child = command.spawn().map_err(|_| ())?;
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let count = stdout.read(&mut chunk).unwrap_or(0);
+                if count == 0 {
+                    break;
+                }
+                if bytes.len().saturating_add(count) > 4096 {
+                    return None;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            Some(bytes)
+        })
+    });
+    loop {
+        if child.try_wait().map_err(|_| ())?.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(reader) = reader {
+                let _ = reader.join();
+            }
+            return Err(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if !child.wait().map_err(|_| ())?.success() {
+        return Err(());
+    }
+    match reader {
+        Some(reader) => reader.join().map_err(|_| ())?.ok_or(()),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -123,7 +311,10 @@ fn validate_request_path(request_path: &Path, request: &Request) -> Result<PathB
     if !valid_text(&request.session_id, 128)
         || !valid_text(&request.operation_id, 128)
         || !valid_text(&request.expected_target, 256)
+        || request.source_pid == 0
+        || request.source_created == 0
         || request.retry_limit > MAX_RETRIES
+        || request.deadline_secs == 0
         || request.deadline_secs > MAX_DEADLINE_SECS
         || !is_full_commit(&request.expected_commit)
         || !is_checksum(&request.checksum)
@@ -175,26 +366,6 @@ fn is_checksum(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn head_commit(checkout_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            checkout_root.to_str()?,
-            "rev-parse",
-            "--verify",
-            "HEAD",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() || output.stdout.len() > 41 || !output.stderr.is_empty() {
-        return None;
-    }
-    let commit = std::str::from_utf8(&output.stdout)
-        .ok()?
-        .trim_end_matches(['\r', '\n']);
-    is_full_commit(commit).then(|| commit.to_owned())
-}
-
 fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| ())?;
     let object = value.as_object().ok_or(())?;
@@ -207,6 +378,8 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         "intended_cargo_bin",
         "expected_target",
         "operation_id",
+        "source_pid",
+        "source_created",
         "retry_limit",
         "deadline_secs",
         "checksum",
@@ -214,13 +387,11 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
     .into_iter()
     .collect();
     let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
-    if keys != expected {
-        return Err(());
-    }
-    if object
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        != Some(SCHEMA_VERSION.into())
+    if keys != expected
+        || object
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(SCHEMA_VERSION.into())
     {
         return Err(());
     }
@@ -232,6 +403,12 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
             .map(str::to_owned)
             .ok_or(())
     };
+    let number = |key| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(())
+    };
     let request = Request {
         session_id: string("session_id")?,
         checkout_root: PathBuf::from(string("checkout_root")?),
@@ -240,15 +417,10 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
         intended_cargo_bin: PathBuf::from(string("intended_cargo_bin")?),
         expected_target: string("expected_target")?,
         operation_id: string("operation_id")?,
-        retry_limit: object
-            .get("retry_limit")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|v| u8::try_from(v).ok())
-            .ok_or(())?,
-        deadline_secs: object
-            .get("deadline_secs")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or(())?,
+        source_pid: u32::try_from(number("source_pid")?).map_err(|_| ())?,
+        source_created: number("source_created")?,
+        retry_limit: u8::try_from(number("retry_limit")?).map_err(|_| ())?,
+        deadline_secs: number("deadline_secs")?,
         checksum: string("checksum")?,
     };
     let checksum = sha256_hex(canonical_body(&request).as_bytes());
@@ -258,7 +430,7 @@ fn parse_request(bytes: &[u8]) -> Result<Request, ()> {
 fn canonical_body(request: &Request) -> String {
     let quote = |value: &str| serde_json::to_string(value).expect("strings serialize");
     format!(
-        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"expected_commit\":{},\"candidate_binary\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
+        "{{\"schema_version\":{SCHEMA_VERSION},\"session_id\":{},\"checkout_root\":{},\"expected_commit\":{},\"candidate_binary\":{},\"intended_cargo_bin\":{},\"expected_target\":{},\"operation_id\":{},\"source_pid\":{},\"source_created\":{},\"retry_limit\":{},\"deadline_secs\":{}}}",
         quote(&request.session_id),
         quote(&request.checkout_root.to_string_lossy()),
         quote(&request.expected_commit),
@@ -266,6 +438,8 @@ fn canonical_body(request: &Request) -> String {
         quote(&request.intended_cargo_bin.to_string_lossy()),
         quote(&request.expected_target),
         quote(&request.operation_id),
+        request.source_pid,
+        request.source_created,
         request.retry_limit,
         request.deadline_secs,
     )
@@ -292,13 +466,7 @@ mod tests {
 
     fn write_request(path: &Path, request: &mut Request) {
         request.checksum = sha256_hex(canonical_body(request).as_bytes());
-        let body = format!(
-            "{{{}}}",
-            canonical_body(request)
-                .trim_start_matches('{')
-                .trim_end_matches('}')
-        );
-        let body = body.trim_end_matches('}');
+        let body = canonical_body(request).trim_end_matches('}').to_owned();
         fs::write(
             path,
             format!("{body},\"checksum\":\"{}\"}}", request.checksum),
@@ -315,6 +483,8 @@ mod tests {
             intended_cargo_bin: root.join("bin/hrdr"),
             expected_target: env!("HRDR_BUILD_TARGET").into(),
             operation_id: "operation".into(),
+            source_pid: 1,
+            source_created: 1,
             retry_limit: 1,
             deadline_secs: 60,
             checksum: String::new(),
@@ -326,8 +496,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let malformed = temp.path().join("malformed.json");
         fs::write(&malformed, b"not json").unwrap();
-        assert!(matches!(run(malformed.clone()), Status::Invalid));
-        assert!(matches!(run(malformed), Status::Reused));
+        assert_eq!(run(malformed.clone()), Status::Invalid);
+        assert_eq!(run(malformed), Status::Reused);
 
         let tampered = temp.path().join("tampered.json");
         let mut signed = request(temp.path(), temp.path().join("candidate"));
@@ -336,9 +506,164 @@ mod tests {
             .unwrap()
             .replace("session", "other");
         fs::write(&tampered, body).unwrap();
-        assert!(matches!(run(tampered), Status::Invalid));
+        assert_eq!(run(tampered), Status::Invalid);
     }
 
+    #[test]
+    fn missing_process_instance_fields_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("request.json");
+        let mut signed = request(temp.path(), temp.path().join("candidate"));
+        signed.source_created = 0;
+        write_request(&path, &mut signed);
+        assert_eq!(run(path), Status::Invalid);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_passes_one_exact_handoff_argv() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("launches.txt");
+        let script = temp.path().join("installed.cmd");
+        fs::write(
+            &script,
+            format!("@echo off\r\necho %1^|%2>>\"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+
+        assert!(launch(&script, "saved-session"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(marker).unwrap(),
+            "__recover-handoff|saved-session\r\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fake_cargo_installs_then_launches_once() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(
+            root.join(".gitignore"),
+            ".hrdr/\nfake-bin/\ncargo-home/\ncargo-args.txt\nlaunches.txt\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", ".gitignore"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "test"
+                ])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let staging = root.join(STAGING_DIR);
+        fs::create_dir_all(&staging).unwrap();
+        let candidate = staging.join("candidate.exe");
+        fs::write(&candidate, b"candidate").unwrap();
+        let bin = root.join("fake-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let cargo_args = root.join("cargo-args.txt");
+        fs::write(
+            bin.join("cargo.cmd"),
+            format!(
+                "@echo off\r\necho %*>>\"{}\"\r\nexit /b 0\r\n",
+                cargo_args.display()
+            ),
+        )
+        .unwrap();
+        let cargo_home = root.join("cargo-home");
+        let installed = cargo_home.join("bin/hrdr.cmd");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        let marker = root.join("launches.txt");
+        fs::write(
+            &installed,
+            format!(
+                "@echo off\r\nif \"%1\"==\"--build-info\" (\r\necho version: {}\r\necho commit: {commit}\r\necho target: {}\r\necho source: clean\r\nexit /b 0\r\n)\r\necho %1^|%2>>\"{}\"\r\n",
+                env!("CARGO_PKG_VERSION"),
+                env!("HRDR_BUILD_TARGET"),
+                marker.display(),
+            ),
+        ).unwrap();
+        let previous_test_cargo = std::env::var_os("HRDR_TEST_CARGO");
+        let previous_cargo_home = std::env::var_os("CARGO_HOME");
+        unsafe {
+            std::env::set_var("HRDR_TEST_CARGO", bin.join("cargo.cmd"));
+            std::env::set_var("CARGO_HOME", &cargo_home);
+        }
+        let request_path = staging.join("request.json");
+        let mut signed = request(root, candidate);
+        signed.expected_commit = commit;
+        signed.intended_cargo_bin = installed;
+        signed.source_pid = u32::MAX;
+        signed.source_created = 1;
+        write_request(&request_path, &mut signed);
+        let result = run(request_path);
+        unsafe {
+            match previous_test_cargo {
+                Some(value) => std::env::set_var("HRDR_TEST_CARGO", value),
+                None => std::env::remove_var("HRDR_TEST_CARGO"),
+            }
+            match previous_cargo_home {
+                Some(value) => std::env::set_var("CARGO_HOME", value),
+                None => std::env::remove_var("CARGO_HOME"),
+            }
+        }
+        assert_eq!(result, Status::Launched);
+        assert_eq!(
+            fs::read_to_string(cargo_args).unwrap(),
+            "install --path apps/hrdr --locked\r\n"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(marker).unwrap(),
+            "__recover-handoff|session\r\n"
+        );
+    }
     #[test]
     fn offroot_candidate_is_rejected_before_git() {
         let temp = tempfile::tempdir().unwrap();
@@ -349,24 +674,6 @@ mod tests {
         let path = staging.join("request.json");
         let mut signed = request(temp.path(), outside);
         write_request(&path, &mut signed);
-        assert!(matches!(run(path), Status::Invalid));
-    }
-
-    #[test]
-    fn stale_commit_is_rejected_after_validation() {
-        let temp = tempfile::tempdir().unwrap();
-        let init = Command::new("git")
-            .args(["init", "--quiet", temp.path().to_str().unwrap()])
-            .status()
-            .unwrap();
-        assert!(init.success());
-        let staging = temp.path().join(STAGING_DIR);
-        fs::create_dir_all(&staging).unwrap();
-        let candidate = staging.join("candidate");
-        fs::write(&candidate, b"candidate").unwrap();
-        let path = staging.join("request.json");
-        let mut signed = request(temp.path(), candidate);
-        write_request(&path, &mut signed);
-        assert!(matches!(run(path), Status::Stale));
+        assert_eq!(run(path), Status::Invalid);
     }
 }
