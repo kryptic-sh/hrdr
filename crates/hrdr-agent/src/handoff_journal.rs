@@ -169,6 +169,7 @@ pub enum HandoffState {
     Commit = 2,
     OwnedAbandon = 3,
     Claim = 4,
+    Abort = 5,
 }
 
 impl TryFrom<u8> for HandoffState {
@@ -180,6 +181,7 @@ impl TryFrom<u8> for HandoffState {
             2 => Ok(Self::Commit),
             3 => Ok(Self::OwnedAbandon),
             4 => Ok(Self::Claim),
+            5 => Ok(Self::Abort),
             _ => bail!("unknown handoff state {value}"),
         }
     }
@@ -683,6 +685,15 @@ mod tests {
         assert!(requires_recovery_state(Some(HandoffState::Commit)));
         assert!(requires_recovery_state(Some(HandoffState::OwnedAbandon)));
         assert!(!requires_recovery_state(Some(HandoffState::Claim)));
+        assert!(!requires_recovery_state(Some(HandoffState::Abort)));
+    }
+
+    #[test]
+    fn committed_then_aborted_handoff_allows_resume_and_cannot_be_claimed() {
+        let states = [HandoffState::Commit, HandoffState::Abort];
+        assert!(requires_recovery_state(Some(states[0])));
+        assert!(!requires_recovery_state(states.last().copied()));
+        assert!(!claimable_state(*states.last().unwrap()));
     }
 
     #[test]
@@ -692,6 +703,7 @@ mod tests {
             (HandoffState::Commit, true),
             (HandoffState::OwnedAbandon, false),
             (HandoffState::Claim, false),
+            (HandoffState::Abort, false),
         ] {
             assert_eq!(claimable_state(state), claimable, "{state:?}");
         }

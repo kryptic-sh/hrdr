@@ -34,6 +34,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Attested handoff recovery can launch one continuation request.** It restores
   saved history without a synthetic user message, queue restoration, or tool
   replay; activation is consumed after one launch.
+- **Prepared update handoffs abort safely on coordinator launch failure.** A
+  successful coordinator launch exits without rewriting its bound checkpoint.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

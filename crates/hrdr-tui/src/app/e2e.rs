@@ -7,6 +7,7 @@
 //! module of `app`, so it reaches `App`'s private methods and fields directly.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,7 +20,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use super::{App, Entry, EntryKind, LoginModal, StatusBarMode, TurnMsg};
+use super::{
+    AdmittedUpdate, App, Entry, EntryKind, LoginModal, PreparedUpdateCoordinator, StatusBarMode,
+    TurnMsg,
+};
 use crate::ui;
 use hrdr_agent::AgentConfig;
 
@@ -12738,4 +12742,74 @@ async fn ctrl_c_with_only_an_attachment_pending_clears_it_instead_of_arming_quit
     assert!(h.app.pending_attachments.is_empty());
     assert!(!h.app.quit_armed, "the quit offer was not armed");
     assert!(!h.app.should_quit);
+}
+
+struct TestPreparedUpdate {
+    launches: Arc<AtomicUsize>,
+    fail: bool,
+}
+
+impl PreparedUpdateCoordinator for TestPreparedUpdate {
+    fn launch(self: Box<Self>) -> anyhow::Result<()> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            anyhow::bail!("test launch failure");
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn admitted_update_commits_before_launching_and_exits_after_success() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.reserve_session_id("prepare update handoff");
+    h.app.await_saves().await;
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let update = AdmittedUpdate::new(
+        hrdr_agent::UpdateOperationId::new("update-1").unwrap(),
+        TestPreparedUpdate {
+            launches: Arc::clone(&launches),
+            fail: false,
+        },
+    );
+    assert!(h.app.commit_admitted_update(update).await.unwrap());
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(h.app.handoff_gate);
+    assert!(h.app.handoff_exit);
+    assert!(h.app.should_quit);
+}
+
+#[tokio::test]
+async fn failed_admitted_update_launch_aborts_and_keeps_the_tui_running() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.reserve_session_id("abort update handoff");
+    h.app.await_saves().await;
+    let id = h.app.state().id.clone().unwrap();
+
+    let launches = Arc::new(AtomicUsize::new(0));
+    let update = AdmittedUpdate::new(
+        hrdr_agent::UpdateOperationId::new("update-2").unwrap(),
+        TestPreparedUpdate {
+            launches: Arc::clone(&launches),
+            fail: true,
+        },
+    );
+    assert!(h.app.commit_admitted_update(update).await.is_err());
+    assert_eq!(launches.load(Ordering::SeqCst), 1);
+    assert!(!h.app.handoff_gate);
+    assert!(!h.app.handoff_exit);
+    assert!(
+        !h.app.should_quit,
+        "the TUI must not exit before a launch succeeds"
+    );
+
+    let lock = h.app.active_lock.as_ref().unwrap();
+    assert!(
+        !hrdr_agent::HandoffJournal::requires_recovery(&h.app.current_cwd(), &id, lock).unwrap()
+    );
+    let journal = hrdr_agent::HandoffJournal::open(&h.app.current_cwd(), &id, lock).unwrap();
+    assert!(journal.claimable().unwrap().is_none());
 }

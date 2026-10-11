@@ -4,6 +4,33 @@ use super::*;
 
 const IDLE_HANDOFF_PAYLOAD: &[u8] = br#"{"version":1,"intent":"idle","operation_id":null,"runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#;
 
+/// Prepared external work that can take ownership after a handoff commits.
+///
+/// Implementations are supplied by the frontend that prepared the update; the TUI
+/// neither knows nor starts an apps coordinator itself.
+pub(crate) trait PreparedUpdateCoordinator: Send {
+    fn launch(self: Box<Self>) -> anyhow::Result<()>;
+}
+
+/// An update admitted by a frontend after it has prepared its coordinator.
+pub(crate) struct AdmittedUpdate {
+    operation_id: hrdr_agent::UpdateOperationId,
+    coordinator: Box<dyn PreparedUpdateCoordinator>,
+}
+
+#[allow(dead_code)]
+impl AdmittedUpdate {
+    pub(crate) fn new(
+        operation_id: hrdr_agent::UpdateOperationId,
+        coordinator: impl PreparedUpdateCoordinator + 'static,
+    ) -> Self {
+        Self {
+            operation_id,
+            coordinator: Box::new(coordinator),
+        }
+    }
+}
+
 fn update_handoff_payload(operation_id: &hrdr_agent::UpdateOperationId) -> anyhow::Result<Vec<u8>> {
     Ok(serde_json::json!({
         "version": 1,
@@ -72,17 +99,32 @@ impl App {
         Ok(true)
     }
 
-    /// Record a successful update and commit its passive continuation checkpoint.
+    /// Commit a prepared update handoff, then let its prepared owner take over.
     ///
-    /// This is internal groundwork only: it never invokes an updater or starts a
-    /// continuation. Recovery merely validates and passively displays this state.
-    pub(crate) async fn commit_update_continuation_checkpoint(
+    /// The coordinator is prepared before this method mutates the app, and is
+    /// consumed exactly once only after the durable commit and input gate.
+    pub(crate) async fn commit_admitted_update(
         &mut self,
-        operation_id: hrdr_agent::UpdateOperationId,
+        admitted: AdmittedUpdate,
     ) -> anyhow::Result<bool> {
         if !self.handoff_quiescent() {
             return Ok(false);
         }
+        if !self
+            .active_lock
+            .as_ref()
+            .is_some_and(hrdr_app::SessionLock::is_backed)
+        {
+            return Ok(false);
+        }
+        let Some(id) = self.state().id.clone() else {
+            return Ok(false);
+        };
+
+        let AdmittedUpdate {
+            operation_id,
+            coordinator,
+        } = admitted;
         let Some(result) =
             self.with_agent(|agent| agent.append_successful_update(operation_id.clone()))
         else {
@@ -94,22 +136,32 @@ impl App {
         if !self.handoff_quiescent() {
             return Ok(false);
         }
-        let id = match self.state().id.clone() {
-            Some(id) => id,
-            None => return Ok(false),
-        };
-        let Some(lock) = self.active_lock.as_ref() else {
-            return Ok(false);
-        };
-        if !lock.is_backed() {
-            return Ok(false);
-        }
+
         let payload = update_handoff_payload(&operation_id)?;
+        let lock = self
+            .active_lock
+            .as_ref()
+            .expect("quiescent handoff retains a backed session lock");
         let journal = hrdr_agent::HandoffJournal::open(&self.current_cwd(), &id, lock)?;
         let epoch = hrdr_tools::unix_now();
         journal.append(epoch, hrdr_agent::HandoffState::Prepare, &payload)?;
         journal.append(epoch, hrdr_agent::HandoffState::Commit, &payload)?;
         self.handoff_gate = true;
+
+        if let Err(launch_error) = coordinator.launch() {
+            if let Err(abort_error) =
+                journal.append(epoch, hrdr_agent::HandoffState::Abort, &payload)
+            {
+                return Err(launch_error.context(format!(
+                    "prepared update launch failed and recording handoff abort failed: {abort_error}"
+                )));
+            }
+            self.handoff_gate = false;
+            return Err(launch_error.context("prepared update launch failed; handoff aborted"));
+        }
+
+        self.handoff_exit = true;
+        self.should_quit = true;
         Ok(true)
     }
 

@@ -266,6 +266,9 @@ pub(crate) async fn run_loop(
             &mut cursor_insert,
         )?;
         if app.should_quit {
+            if app.handoff_exit {
+                break;
+            }
             // Reap a turn cancelled on the quit path first: awaiting the aborted
             // task drops its future and releases the agent lock, so the save
             // below can't lose the race and skip. Then the final save — a

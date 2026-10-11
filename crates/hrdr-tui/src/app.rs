@@ -86,7 +86,8 @@ mod commands;
 mod completion;
 use completion::CompletionKind;
 mod handoff;
-pub(crate) use handoff::validate_handoff_payload;
+#[allow(unused_imports)]
+pub(crate) use handoff::{AdmittedUpdate, PreparedUpdateCoordinator, validate_handoff_payload};
 mod selector;
 mod session;
 mod util;
@@ -520,6 +521,9 @@ pub(crate) struct App {
     /// Once a handoff commit is durable, input is frozen until its owner takes
     /// recovery action outside this frontend.
     handoff_gate: bool,
+    /// A launched handoff owns the saved snapshot, so normal quit cleanup must
+    /// not write or run hooks against it.
+    pub(crate) handoff_exit: bool,
     /// This app renders a committed handoff checkpoint until its explicitly safe
     /// recovery interaction activates it.
     passive_recovery: Option<HandoffIntent>,
@@ -1006,6 +1010,7 @@ impl App {
             save_in_flight: false,
             save_done: Arc::new(tokio::sync::Notify::new()),
             handoff_gate: recovery.is_some(),
+            handoff_exit: false,
             passive_recovery: recovery,
             recovery_state: None,
             recovery_confirmation_used: false,
