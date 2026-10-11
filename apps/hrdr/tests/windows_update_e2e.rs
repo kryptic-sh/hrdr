@@ -11,7 +11,6 @@ use common::{
     Chat, MockServer, stop_chunk, tool_args_chunk, tool_calls_stop_chunk, tool_start_chunk,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -64,7 +63,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new(fail_cargo_install: bool) -> Self {
         let root = tempfile::tempdir().expect("private update fixture root");
         let home = root.path().join("home");
         let cargo_home = root.path().join("cargo-home");
@@ -133,7 +132,7 @@ impl Fixture {
         fs::write(
             bin.join("cargo.cmd"),
             format!(
-                "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"log={}\"\r\nset \"stdout={}\"\r\nset \"stderr={}\"\r\nset \"PATH={};%PATH%\"\r\n>>\"%log%\" echo === cargo invocation ===\r\n>>\"%log%\" echo cwd: %CD%\r\n>>\"%log%\" echo argv: %*\r\n\"{}\" %* >\"%stdout%\" 2>\"%stderr%\"\r\nset \"code=!ERRORLEVEL!\"\r\n>>\"%log%\" echo stdout:\r\n>>\"%log%\" type \"%stdout%\"\r\n>>\"%log%\" echo stderr:\r\n>>\"%log%\" type \"%stderr%\"\r\n>>\"%log%\" echo exit: !code!\r\ntype \"%stdout%\"\r\ntype \"%stderr%\" >&2\r\nexit /b !code!\r\n",
+                "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"log={}\"\r\nset \"stdout={}\"\r\nset \"stderr={}\"\r\nset \"PATH={};%PATH%\"\r\n>>\"%log%\" echo === cargo invocation ===\r\n>>\"%log%\" echo cwd: %CD%\r\n>>\"%log%\" echo argv: %*\r\nif \"{fail_cargo_install}\"==\"true\" if \"%~1\"==\"install\" (\r\n  >>\"%log%\" echo forced install failure\r\n  exit /b 1\r\n)\r\n\"{}\" %* >\"%stdout%\" 2>\"%stderr%\"\r\nset \"code=!ERRORLEVEL!\"\r\n>>\"%log%\" echo stdout:\r\n>>\"%log%\" type \"%stdout%\"\r\n>>\"%log%\" echo stderr:\r\n>>\"%log%\" type \"%stderr%\"\r\n>>\"%log%\" echo exit: !code!\r\ntype \"%stdout%\"\r\ntype \"%stderr%\" >&2\r\nexit /b !code!\r\n",
                 cargo_log.display(),
                 cargo_stdout.display(),
                 cargo_stderr.display(),
@@ -225,41 +224,13 @@ impl Fixture {
         );
     }
 
-    fn assert_cargo_builds_candidate(&self) {
-        let target_dir = self.checkout.join("op-target");
-        let mut command = Command::new(
-            self.checkout
-                .parent()
-                .expect("fixture root")
-                .join("bin/cargo.cmd"),
-        );
-        command
-            .current_dir(&self.checkout)
-            .args([
-                "build",
-                "--release",
-                "--locked",
-                "-p",
-                "hrdr",
-                "--target",
-                "x86_64-pc-windows-msvc",
-                "--target-dir",
-            ])
-            .arg(&target_dir);
-        for (key, value) in &self.env {
-            command.env(key, value);
-        }
-        let output = command.output().expect("run fixture Cargo build");
-        assert!(
-            output.status.success(),
-            "fixture Cargo build failed\ncwd: {}\nargs: cargo build --release --locked -p hrdr --target x86_64-pc-windows-msvc --target-dir {}\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
-            self.checkout.display(),
-            target_dir.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        fs::remove_dir_all(&target_dir).expect("remove fixture Cargo target");
+    fn expected_build_info(&self) -> String {
+        format!(
+            "version: {}\ncommit: {}\ntarget: {}\nsource: clean\n",
+            env!("CARGO_PKG_VERSION"),
+            self.expected_commit,
+            env!("HRDR_BUILD_TARGET"),
+        )
     }
 
     fn operation_diagnostic(&self) -> String {
@@ -302,28 +273,19 @@ impl Fixture {
             })
             .and_then(|path| fs::read_to_string(path).ok())
             .unwrap_or_else(|| "request was consumed or unavailable".to_owned());
-        let candidate = operation.join("target/x86_64-pc-windows-msvc/release/hrdr.exe");
-        let output = Command::new(&candidate).arg("--build-info").output();
+        let operation_hash = operation
+            .file_name()
+            .expect("operation name")
+            .to_string_lossy()
+            .trim_start_matches(".hrdr-update-")
+            .to_owned();
+        let candidate = operation.join(format!("coordinator-{operation_hash}.exe"));
+        let output = Command::new(&self.installed).arg("--build-info").output();
         format!(
-            "operation: {}\nentries:\n{entries}\nrequest:\n{request}\ncandidate: {}\ncandidate exists: {}\nbuild info: {output:?}",
+            "operation: {}\nentries:\n{entries}\nrequest:\n{request}\ncoordinator: {}\ncoordinator exists: {}\ninstalled build info: {output:?}",
             operation.display(),
             candidate.display(),
             candidate.exists(),
-        )
-    }
-
-    fn recovery_diagnostic(&self, server: &MockServer, screen: &str) -> String {
-        let last_error = screen
-            .lines()
-            .rev()
-            .find(|line| line.contains("network error") || line.contains("[error]"))
-            .map(str::trim)
-            .filter(|error| !error.is_empty())
-            .unwrap_or("no recovery attempt error observed");
-        format!(
-            "fixture recovery endpoint: {}\nfixture recovery provider: mock\nfixture recovery model: mock-model\nobserved recovery chat attempts: {}\nlatest recovery attempt error: {last_error}",
-            server.base_url(),
-            server.chat_bodies().len().saturating_sub(2),
         )
     }
 
@@ -461,11 +423,10 @@ impl Session {
 
 #[test]
 #[ignore = "replaces an executable; run only in Windows release CI"]
-fn update_promotes_the_candidate_and_recovers_once() {
+fn update_installs_default_cargo_binary_and_recovers_once() {
     let server = MockServer::start(update_conversation());
-    let fixture = Fixture::new();
+    let fixture = Fixture::new(false);
     fixture.assert_checkout_clean("fixture setup");
-    fixture.assert_cargo_builds_candidate();
     let mut session = fixture.start(&server);
     session.wait_for("mock-model");
     fixture.assert_checkout_clean("initial TUI startup");
@@ -474,67 +435,36 @@ fn update_promotes_the_candidate_and_recovers_once() {
         (server.chat_bodies().len() == 2 && session.screen().contains("turn-after-update"))
             .then_some(())
     });
-    let operation = fixture.operation_root();
-    let request_path = wait_until("coordinator request", || {
-        fs::read_dir(&operation).ok()?.find_map(|entry| {
-            let path = entry.ok()?.path();
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("request-"))
-                .then_some(path)
-        })
-    });
-    let request = fs::read(request_path).expect("read coordinator request before handoff");
-    let expected_candidate_checksum = serde_json::from_slice::<serde_json::Value>(&request)
-        .expect("parse coordinator request")
-        .get("prebuilt_checksum")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .expect("coordinator prebuilt checksum");
-    let old_exit_after = session.wait_for_exit(&fixture);
+    let _ = session.wait_for_exit(&fixture);
     fixture.assert_checkout_clean("update handoff");
 
-    let candidate = operation.join("target/x86_64-pc-windows-msvc/release/hrdr.exe");
-    let promotion_started = Instant::now();
-    let promoted = loop {
-        if let Ok(bytes) = fs::read(&fixture.installed)
-            && bytes != fixture.old_binary
-        {
-            break bytes;
-        }
-        assert!(
-            promotion_started.elapsed() < WAIT,
-            "timed out waiting for promoted executable; expected candidate checksum: {expected_candidate_checksum}\nactual installed checksum: {:?}\nold process exit after: {old_exit_after:?}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{}",
-            fs::read(&fixture.installed)
-                .ok()
-                .map(|bytes| sha256_hex(&bytes)),
-            fixture.operation_diagnostic(),
-            session.screen(),
-        );
-        std::thread::sleep(POLL);
-    };
-    assert_eq!(sha256_hex(&promoted), expected_candidate_checksum);
-    assert!(
-        !candidate.exists(),
-        "successful Windows ReplaceFile promotion consumes its source candidate"
+    let installed_build_info = wait_until("default Cargo install", || {
+        let bytes = fs::read(&fixture.installed).ok()?;
+        (bytes != fixture.old_binary)
+            .then(|| {
+                Command::new(&fixture.installed)
+                    .arg("--build-info")
+                    .output()
+                    .ok()
+            })
+            .flatten()
+            .filter(|output| output.status.success())
+    });
+    assert_eq!(
+        String::from_utf8(installed_build_info.stdout).expect("UTF-8 installed build info"),
+        fixture.expected_build_info(),
+        "the default CARGO_HOME/bin/hrdr.exe must attest the admitted checkout"
     );
-    fixture.assert_checkout_clean("candidate promotion");
+    let cargo_log = fs::read_to_string(&fixture.cargo_log).expect("read fixture Cargo log");
+    assert!(
+        cargo_log.contains("argv: install --path apps/hrdr --locked --force --bin hrdr"),
+        "the coordinator must run Cargo install against the admitted checkout:\n{cargo_log}"
+    );
 
-    let recovery_started = Instant::now();
-    loop {
-        if server.chat_bodies().len() == 3 && session.screen().contains("continued-after-update") {
-            break;
-        }
-        assert!(
-            recovery_started.elapsed() < WAIT,
-            "timed out waiting for one recovered continuation; chat count: {}\nrecovery attempt diagnostic:\n{}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{}",
-            server.chat_bodies().len(),
-            fixture.recovery_diagnostic(&server, &session.screen()),
-            fixture.operation_diagnostic(),
-            session.screen(),
-        );
-        std::thread::sleep(POLL);
-    }
+    wait_until("one recovered continuation", || {
+        (server.chat_bodies().len() == 3 && session.screen().contains("continued-after-update"))
+            .then_some(())
+    });
     assert_eq!(
         server.chat_bodies().len(),
         3,
@@ -545,9 +475,9 @@ fn update_promotes_the_candidate_and_recovers_once() {
 
 #[test]
 #[ignore = "replaces an executable; run only in Windows release CI"]
-fn reused_request_does_not_replace_or_recover_again() {
+fn reused_request_does_not_install_or_recover_again() {
     let server = MockServer::start(update_conversation());
-    let fixture = Fixture::new();
+    let fixture = Fixture::new(false);
     let mut session = fixture.start(&server);
     session.wait_for("mock-model");
     session.send("install update\r");
@@ -556,7 +486,7 @@ fn reused_request_does_not_replace_or_recover_again() {
     wait_until("recovered continuation", || {
         (server.chat_bodies().len() == 3).then_some(())
     });
-    let destination = fs::read(&fixture.installed).expect("promoted destination");
+    let destination = fs::read(&fixture.installed).expect("installed destination");
     let coordinator = single(&operation, "coordinator-");
     let request = single(&operation, "request-");
     let mut command = Command::new(coordinator);
@@ -594,36 +524,71 @@ fn reused_request_does_not_replace_or_recover_again() {
 
 #[test]
 #[ignore = "replaces an executable; run only in Windows release CI"]
-fn promotion_lock_preserves_destination_without_recovery() {
+fn failed_cargo_install_recovers_with_the_retained_old_binary_once() {
+    const NOTICE_HEAD: &str = "update handoff could not install the new build";
+    const NOTICE_TAIL: &str = "(install_failed); recovered with the previous";
+    const NOTICE_END: &str = "build";
+
     let server = MockServer::start(update_conversation());
-    let fixture = Fixture::new();
-    use std::os::windows::fs::OpenOptionsExt;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0x0000_0001)
-        .open(&fixture.installed)
-        .expect("exclusive promotion lock");
+    let fixture = Fixture::new(true);
     let mut session = fixture.start(&server);
     session.wait_for("mock-model");
     session.send("install update\r");
+    wait_until("tool-result continuation before handoff", || {
+        (server.chat_bodies().len() == 2 && session.screen().contains("turn-after-update"))
+            .then_some(())
+    });
     let _ = session.wait_for_exit(&fixture);
+
+    let recovery_started = Instant::now();
+    loop {
+        let screen = session.screen();
+        if server.chat_bodies().len() == 3 && screen.contains("continued-after-update") {
+            break;
+        }
+        assert!(
+            recovery_started.elapsed() < WAIT,
+            "timed out waiting for retained-binary recovery continuation; chat count: {}\nfixture Cargo log:\n{}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{screen}",
+            server.chat_bodies().len(),
+            fs::read_to_string(&fixture.cargo_log).unwrap_or_default(),
+            fixture.operation_diagnostic(),
+        );
+        std::thread::sleep(POLL);
+    }
+    assert_eq!(
+        fs::read(&fixture.installed).expect("retained installed binary"),
+        fixture.old_binary,
+        "a failed Cargo install must retain the old default Cargo binary"
+    );
+    let cargo_log = fs::read_to_string(&fixture.cargo_log).expect("read fixture Cargo log");
+    assert!(
+        cargo_log.contains("argv: install --path apps/hrdr --locked --force --bin hrdr")
+            && cargo_log.contains("forced install failure"),
+        "the fixture must force Cargo install to fail rather than fabricate success:\n{cargo_log}"
+    );
+    let screen = session.screen();
+    let compact_screen = compact_terminal_text(&screen);
+    let compact_head = compact_terminal_text(NOTICE_HEAD);
+    let compact_tail = compact_terminal_text(NOTICE_TAIL);
+    let compact_end = compact_terminal_text(NOTICE_END);
+    assert_eq!(
+        compact_screen.matches(&compact_head).count(),
+        1,
+        "update failure notice:\n{screen}"
+    );
+    let tail = compact_screen
+        .find(&compact_tail)
+        .expect("update failure notice tail");
+    assert!(
+        compact_screen[tail + compact_tail.len()..].contains(&compact_end),
+        "update failure notice:\n{screen}"
+    );
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
-        fs::read(&fixture.installed).expect("locked destination"),
-        fixture.old_binary
-    );
-    assert_eq!(
         server.chat_bodies().len(),
-        2,
-        "promotion failure must not start recovery; fixture operation:\n{}\ncoordinator output / recovery screen:\n{}",
-        fixture.operation_diagnostic(),
-        session.screen(),
+        3,
+        "the retained old binary must run exactly one continuation without a dual recovery"
     );
-    assert!(
-        !session.screen().contains("continued-after-update"),
-        "promotion failure must not render recovery output"
-    );
-    drop(lock);
 }
 
 fn update_conversation() -> Vec<Chat> {
@@ -647,10 +612,11 @@ fn update_conversation() -> Vec<Chat> {
     ]
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
+fn compact_terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '(' | ')' | ';')
+        })
         .collect()
 }
 

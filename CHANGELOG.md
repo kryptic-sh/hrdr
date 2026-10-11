@@ -39,6 +39,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Interactive Windows sessions can request a validated self-update.** The
   `update` tool stages an admitted candidate after its turn, then preserves its
   session through a one-shot recovery continuation.
+- **Windows self-update installs through the default Cargo location.** Promotion
+  failure recovers the committed session using the retained prior binary.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

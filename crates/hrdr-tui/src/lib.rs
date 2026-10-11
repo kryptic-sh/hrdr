@@ -136,6 +136,7 @@ pub async fn run_handoff_recovery(
     mut ui: hrdr_app::UiConfig,
     logo: &'static str,
     id: &str,
+    update_failure: Option<&str>,
 ) -> Result<()> {
     ui.auto_resume = false;
     let cwd = config.cwd.to_string_lossy();
@@ -152,6 +153,9 @@ pub async fn run_handoff_recovery(
     let mut terminal: Tui = Terminal::new(backend)?;
     let mut app = App::new_recovery(config, ui, logo, recovery.intent)?;
     app.adopt_handoff_recovery(id.to_string(), recovery.session, recovery.lock);
+    if let Some(update_failure) = update_failure {
+        app.update_recovery_failure(update_failure);
+    }
     if app.activate_update_continuation() {
         tui::run_loop(&mut app, &mut terminal, None, false).await?;
     } else {

@@ -524,13 +524,42 @@ fn run_sandbox_exec_wrapper() -> Option<Result<i32>> {
     })())
 }
 
-fn handoff_recovery_arg() -> Option<Result<String>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateFailure {
+    Stale,
+    InstallFailed,
+    IdentityFailed,
+    LaunchFailed,
+}
+
+impl UpdateFailure {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "stale" => Some(Self::Stale),
+            "install_failed" => Some(Self::InstallFailed),
+            "identity_failed" => Some(Self::IdentityFailed),
+            "launch_failed" => Some(Self::LaunchFailed),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::InstallFailed => "install_failed",
+            Self::IdentityFailed => "identity_failed",
+            Self::LaunchFailed => "launch_failed",
+        }
+    }
+}
+
+fn handoff_recovery_arg() -> Option<Result<(String, Option<UpdateFailure>)>> {
     handoff_recovery_arg_from(std::env::args_os().skip(1))
 }
 
 fn handoff_recovery_arg_from(
     mut argv: impl Iterator<Item = std::ffi::OsString>,
-) -> Option<Result<String>> {
+) -> Option<Result<(String, Option<UpdateFailure>)>> {
     if argv.next()?.as_os_str() != "__recover-handoff" {
         return None;
     }
@@ -540,11 +569,23 @@ fn handoff_recovery_arg_from(
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("__recover-handoff requires a session id"))?;
+        let update_failure = match argv.next() {
+            None => None,
+            Some(flag) if flag == "--update-failure" => {
+                let value = argv
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .and_then(|value| UpdateFailure::parse(&value))
+                    .ok_or_else(|| anyhow::anyhow!("invalid __recover-handoff update failure"))?;
+                Some(value)
+            }
+            Some(_) => anyhow::bail!("__recover-handoff accepts only --update-failure STATUS"),
+        };
         anyhow::ensure!(
             argv.next().is_none(),
-            "__recover-handoff accepts one session id"
+            "__recover-handoff accepts one session id and optional --update-failure STATUS"
         );
-        Ok(id)
+        Ok((id, update_failure))
     })())
 }
 
@@ -583,15 +624,22 @@ async fn main() -> Result<()> {
         std::process::exit(result?);
     }
 
-    if let Some(id) = handoff_recovery_arg() {
-        let id = id?;
+    if let Some(recovery) = handoff_recovery_arg() {
+        let (id, update_failure) = recovery?;
         let (mut config, diagnostics) = AgentConfig::load_diagnosed();
         if let Some(message) = diagnostics.error_message() {
             anyhow::bail!(message);
         }
         hydrate_recovery_endpoint(&mut config)?;
         let (ui, _) = hrdr_app::UiConfig::load_diagnosed();
-        return hrdr_tui::run_handoff_recovery(config, ui, LOGO_ART, &id).await;
+        return hrdr_tui::run_handoff_recovery(
+            config,
+            ui,
+            LOGO_ART,
+            &id,
+            update_failure.map(UpdateFailure::as_str),
+        )
+        .await;
     }
 
     tracing_subscriber::fmt()
@@ -1905,7 +1953,21 @@ mod cli_tests {
             handoff_recovery_arg_from(args(&["__recover-handoff", "saved-session"]))
                 .transpose()
                 .unwrap(),
-            Some("saved-session".to_string())
+            Some(("saved-session".to_string(), None))
+        );
+        assert_eq!(
+            handoff_recovery_arg_from(args(&[
+                "__recover-handoff",
+                "saved-session",
+                "--update-failure",
+                "install_failed",
+            ]))
+            .transpose()
+            .unwrap(),
+            Some((
+                "saved-session".to_string(),
+                Some(UpdateFailure::InstallFailed)
+            ))
         );
         assert!(handoff_recovery_arg_from(args(&["/new"])).is_none());
         assert!(

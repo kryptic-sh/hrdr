@@ -186,8 +186,9 @@ push each verified slice to `main` before proceeding to the next slice.
     checkpoints, restoring no queues and starting no runtime work. Interactive
     Windows `update` now stages only after its tool turn ends, then uses one
     attested recovery continuation; it still refuses queues, tasks, watches,
-    drafts, and active work. Next add real default-Cargo end-to-end coverage and
-    queue persistence before broadening the handoff contract. CI eligibility is
+    drafts, and active work. Windows CI now exercises isolated default-Cargo
+    installation, retained-old fallback recovery, and request reuse. Next
+    persist queues before broadening the handoff contract. CI eligibility is
     approved: require the latest `push` CI run and latest attempt on `main` for
     the exact origin-repository hash, with verification and packaging jobs
     successful; only tag-only publishing jobs may be skipped. Manual and older

@@ -215,6 +215,12 @@ impl super::App {
         }
     }
 
+    pub(crate) fn update_recovery_failure(&mut self, failure: &str) {
+        self.system(format!(
+            "update handoff could not install the new build ({failure}); recovered with the previous build"
+        ));
+    }
+
     /// Restore only durable state that can safely resume an already-attested
     /// continuation. Crons and other startup work remain inactive.
     pub(super) fn adopt_recovery_state(&mut self, state: hrdr_app::SessionState) {
