@@ -17,7 +17,7 @@ const MAX_RETRIES: u8 = 3;
 const MAX_DEADLINE_SECS: u64 = 24 * 60 * 60;
 #[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
-#[cfg(test)]
+#[cfg(windows)]
 const STAGING_DIR: &str = ".hrdr/update-staging";
 
 #[derive(Debug)]
@@ -35,6 +35,144 @@ struct Request {
     retry_limit: u8,
     deadline_secs: u64,
     checksum: String,
+}
+
+/// A Windows coordinator request fully prepared before a TUI handoff commits.
+#[cfg(windows)]
+#[allow(dead_code)]
+struct PreparedWindowsUpdateCoordinator {
+    candidate_binary: PathBuf,
+    request_path: PathBuf,
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+impl PreparedWindowsUpdateCoordinator {
+    fn prepare(
+        session_id: &str,
+        operation_id: &hrdr_agent::UpdateOperationId,
+        checkout_root: &Path,
+        expected_commit: &str,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        use std::io::Write;
+
+        let checkout_root = canonical_absolute(checkout_root).map_err(|_| {
+            anyhow::anyhow!("update checkout root is not a canonical absolute path")
+        })?;
+        anyhow::ensure!(
+            checkout_root.is_dir(),
+            "update checkout root is not a directory"
+        );
+        anyhow::ensure!(valid_text(session_id, 128), "update session id is invalid");
+        anyhow::ensure!(is_full_commit(expected_commit), "update commit is invalid");
+        anyhow::ensure!(
+            valid_text(operation_id.as_str(), 128),
+            "update operation id is invalid"
+        );
+        let source = hrdr_tools::current_process_lease()
+            .ok_or_else(|| anyhow::anyhow!("current process lease is unavailable"))?;
+        let intended_cargo_bin = canonical_absolute(
+            &std::env::current_exe().context("locating the current executable")?,
+        )
+        .map_err(|_| anyhow::anyhow!("current executable is not a canonical absolute file"))?;
+        anyhow::ensure!(
+            intended_cargo_bin.is_file(),
+            "current executable is not a regular file"
+        );
+
+        let staging_root = checkout_root.join(STAGING_DIR);
+        fs::create_dir_all(&staging_root).context("creating update staging directory")?;
+        let staging_root = canonical_absolute(&staging_root)
+            .map_err(|_| anyhow::anyhow!("update staging directory is not canonical"))?;
+        anyhow::ensure!(
+            staging_root.starts_with(&checkout_root),
+            "update staging directory escapes the checkout"
+        );
+        let operation_hash = sha256_hex(operation_id.as_str().as_bytes());
+        let extension = intended_cargo_bin
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("exe");
+        let candidate_binary =
+            staging_root.join(format!("coordinator-{operation_hash}.{extension}"));
+        let source_bytes =
+            fs::read(&intended_cargo_bin).context("reading the current executable")?;
+        let mut candidate = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate_binary)
+            .context("staging the current executable")?;
+        candidate
+            .write_all(&source_bytes)
+            .context("writing the staged coordinator executable")?;
+        candidate
+            .sync_all()
+            .context("flushing the staged coordinator executable")?;
+        drop(candidate);
+        let candidate_binary = canonical_absolute(&candidate_binary)
+            .map_err(|_| anyhow::anyhow!("staged coordinator executable is not canonical"))?;
+
+        let request_path = staging_root.join(format!("request-{operation_hash}.json"));
+        let mut request = Request {
+            session_id: session_id.to_owned(),
+            checkout_root,
+            expected_commit: expected_commit.to_owned(),
+            expected_version: env!("CARGO_PKG_VERSION").to_owned(),
+            candidate_binary: candidate_binary.clone(),
+            intended_cargo_bin,
+            expected_target: env!("HRDR_BUILD_TARGET").to_owned(),
+            operation_id: operation_id.as_str().to_owned(),
+            source_pid: source.pid,
+            source_created: source.created,
+            retry_limit: MAX_RETRIES,
+            deadline_secs: MAX_DEADLINE_SECS,
+            checksum: String::new(),
+        };
+        request.checksum = sha256_hex(canonical_body(&request).as_bytes());
+        let bytes = serialized_request(&request);
+        let parsed = parse_request(&bytes)
+            .map_err(|_| anyhow::anyhow!("generated update coordinator request is invalid"))?;
+        validate_request_path(&request_path, &parsed).map_err(|_| {
+            anyhow::anyhow!("generated update coordinator request has invalid paths")
+        })?;
+        let mut request_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&request_path)
+            .context("creating update coordinator request")?;
+        request_file
+            .write_all(&bytes)
+            .context("writing update coordinator request")?;
+        request_file
+            .sync_all()
+            .context("flushing update coordinator request")?;
+        drop(request_file);
+        let request_path = canonical_absolute(&request_path)
+            .map_err(|_| anyhow::anyhow!("update coordinator request is not canonical"))?;
+
+        Ok(Self {
+            candidate_binary,
+            request_path,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl hrdr_tui::PreparedUpdateCoordinator for PreparedWindowsUpdateCoordinator {
+    fn launch(self: Box<Self>) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        Command::new(&self.candidate_binary)
+            .args([
+                std::ffi::OsStr::new("__update-coordinator"),
+                self.request_path.as_os_str(),
+            ])
+            .spawn()
+            .context("spawning the prepared update coordinator")?;
+        Ok(())
+    }
 }
 
 /// Dispatch the hidden argument before clap, configuration, sessions, or the TUI.
@@ -577,6 +715,17 @@ fn canonical_body(request: &Request) -> String {
     )
 }
 
+#[cfg(windows)]
+fn serialized_request(request: &Request) -> Vec<u8> {
+    let body = canonical_body(request);
+    format!(
+        "{},\"checksum\":{}}}",
+        body.trim_end_matches('}'),
+        serde_json::to_string(&request.checksum).expect("checksum serializes"),
+    )
+    .into_bytes()
+}
+
 fn sha256_hex(input: &[u8]) -> String {
     Sha256::digest(input)
         .iter()
@@ -587,6 +736,50 @@ fn sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn prepared_request_is_accepted_by_the_strict_parser() {
+        let temp = tempfile::tempdir().unwrap();
+        let operation = hrdr_agent::UpdateOperationId::new("prepared-request").unwrap();
+        let prepared = PreparedWindowsUpdateCoordinator::prepare(
+            "saved-session",
+            &operation,
+            temp.path(),
+            &"0".repeat(40),
+        )
+        .unwrap();
+
+        let request = parse_request(&fs::read(&prepared.request_path).unwrap()).unwrap();
+        let lease = hrdr_tools::current_process_lease().unwrap();
+        assert_eq!(request.session_id, "saved-session");
+        assert_eq!(request.operation_id, operation.as_str());
+        assert_eq!(request.source_pid, lease.pid);
+        assert_eq!(request.source_created, lease.created);
+        assert_eq!(request.candidate_binary, prepared.candidate_binary);
+        assert_eq!(
+            request.intended_cargo_bin,
+            canonical_absolute(&std::env::current_exe().unwrap()).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepared_coordinator_reports_spawn_failure() {
+        use hrdr_tui::PreparedUpdateCoordinator;
+
+        let temp = tempfile::tempdir().unwrap();
+        let prepared = PreparedWindowsUpdateCoordinator::prepare(
+            "saved-session",
+            &hrdr_agent::UpdateOperationId::new("spawn-failure").unwrap(),
+            temp.path(),
+            &"0".repeat(40),
+        )
+        .unwrap();
+        fs::remove_file(&prepared.candidate_binary).unwrap();
+
+        assert!(Box::new(prepared).launch().is_err());
+    }
 
     #[test]
     fn sha256_matches_known_value() {

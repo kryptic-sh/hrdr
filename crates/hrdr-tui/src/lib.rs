@@ -20,6 +20,7 @@ mod cursor_backend;
 mod theme;
 mod trust_prompt;
 mod tui;
+pub use app::{AdmittedUpdate, PreparedUpdateCoordinator};
 pub use trust_prompt::ask_trust;
 mod ui;
 

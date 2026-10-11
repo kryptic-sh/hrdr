@@ -86,8 +86,8 @@ mod commands;
 mod completion;
 use completion::CompletionKind;
 mod handoff;
-#[allow(unused_imports)]
-pub(crate) use handoff::{AdmittedUpdate, PreparedUpdateCoordinator, validate_handoff_payload};
+pub(crate) use handoff::validate_handoff_payload;
+pub use handoff::{AdmittedUpdate, PreparedUpdateCoordinator};
 mod selector;
 mod session;
 mod util;

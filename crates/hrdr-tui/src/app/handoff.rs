@@ -8,19 +8,18 @@ const IDLE_HANDOFF_PAYLOAD: &[u8] = br#"{"version":1,"intent":"idle","operation_
 ///
 /// Implementations are supplied by the frontend that prepared the update; the TUI
 /// neither knows nor starts an apps coordinator itself.
-pub(crate) trait PreparedUpdateCoordinator: Send {
+pub trait PreparedUpdateCoordinator: Send {
     fn launch(self: Box<Self>) -> anyhow::Result<()>;
 }
 
 /// An update admitted by a frontend after it has prepared its coordinator.
-pub(crate) struct AdmittedUpdate {
+pub struct AdmittedUpdate {
     operation_id: hrdr_agent::UpdateOperationId,
     coordinator: Box<dyn PreparedUpdateCoordinator>,
 }
 
-#[allow(dead_code)]
 impl AdmittedUpdate {
-    pub(crate) fn new(
+    pub fn new(
         operation_id: hrdr_agent::UpdateOperationId,
         coordinator: impl PreparedUpdateCoordinator + 'static,
     ) -> Self {
