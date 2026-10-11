@@ -146,6 +146,11 @@ impl super::App {
                      press f to open a copy, or Esc to cancel"
                 ));
             }
+            Err(hrdr_app::OpenError::Load(e)) if e.is::<hrdr_agent::HandoffPending>() => {
+                self.system(format!(
+                    "session {id} has a committed handoff pending recovery; ordinary resume is refused"
+                ));
+            }
             Err(hrdr_app::OpenError::Load(e)) => {
                 self.system(format!("can't load session {id}: {e}"));
             }

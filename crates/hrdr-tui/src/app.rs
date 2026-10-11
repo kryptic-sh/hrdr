@@ -85,6 +85,7 @@ use crate::theme::Theme;
 mod commands;
 mod completion;
 use completion::CompletionKind;
+mod handoff;
 mod selector;
 mod session;
 mod util;
@@ -515,6 +516,9 @@ pub(crate) struct App {
     /// `SaveDone`. The save writes the file BEFORE notifying, so waking is the
     /// durability signal.
     save_done: Arc<tokio::sync::Notify>,
+    /// Once a handoff commit is durable, input is frozen until its owner takes
+    /// recovery action outside this frontend.
+    handoff_gate: bool,
     /// The open-lock for the session currently loaded, if any. Held for the whole
     /// time this session is active so a second hrdr instance can't resume the same
     /// session and silently clobber our turns (last-writer-wins). Set when a
@@ -970,6 +974,7 @@ impl App {
             pending_save: None,
             save_in_flight: false,
             save_done: Arc::new(tokio::sync::Notify::new()),
+            handoff_gate: false,
             active_lock: None,
             pending_reservation: None,
             editor,
@@ -1216,6 +1221,9 @@ impl App {
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
+        if self.handoff_gate {
+            return Action::None;
+        }
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
@@ -3674,6 +3682,18 @@ mod tests {
 
     use super::{App, Entry, EntryKind};
     use hrdr_agent::{AgentConfig, AgentEntry, AgentRegistry, MAIN_KEY, PaneId};
+
+    #[test]
+    fn handoff_gate_ignores_input() {
+        let (mut app, _, _tmp) = app_viewing_a_sub_agent();
+        app.handoff_gate = true;
+        let action = app.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(matches!(action, super::Action::None));
+        assert!(app.composer_is_empty());
+    }
 
     /// An app with one delegated sub-agent registered, whose pane is the one on
     /// screen — the state a `/compact` typed into a sub-agent's pane runs in.

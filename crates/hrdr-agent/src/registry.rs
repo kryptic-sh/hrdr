@@ -599,6 +599,30 @@ impl AgentRegistry {
         });
     }
 
+    /// Whether every retained agent is idle with no queued or in-flight work.
+    ///
+    /// A handoff checkpoint cannot serialize a live turn, steering queue, tool
+    /// call, or compaction, so callers use this as the registry half of their
+    /// quiescence gate.
+    pub fn is_handoff_quiescent(&self) -> bool {
+        self.with(|entries| {
+            entries.iter().all(|entry| {
+                !entry.running
+                    && !entry.compacting
+                    && entry
+                        .steering
+                        .lock()
+                        .map(|queue| queue.is_empty())
+                        .unwrap_or(false)
+                    && entry
+                        .events
+                        .lock()
+                        .map(|events| events.open_tools().is_empty())
+                        .unwrap_or(false)
+            })
+        })
+    }
+
     /// Whether agent `key` has a turn in flight.
     pub fn is_running(&self, key: u64) -> bool {
         self.with(|v| v.iter().any(|e| e.key == key && e.running))

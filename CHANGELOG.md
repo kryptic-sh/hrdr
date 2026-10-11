@@ -20,6 +20,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Best-effort handoff journals validate saved session checkpoints.** Future
   update recovery can use bounded checksummed frames, backed session locks, and
   process-instance leases without claiming Windows crash durability.
+- **Idle sessions can commit a best-effort handoff checkpoint.** Ordinary resume
+  now refuses its committed journal marker until dedicated recovery is wired.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

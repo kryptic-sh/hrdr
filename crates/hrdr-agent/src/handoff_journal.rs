@@ -79,6 +79,18 @@ pub struct HandoffJournal<'a> {
 }
 
 impl<'a> HandoffJournal<'a> {
+    /// Return whether the latest valid frame says this snapshot must be recovered
+    /// by its handoff owner before an ordinary resume may use it.
+    ///
+    /// `Prepare` intentionally does not block a resume: it records an attempted
+    /// checkpoint, not a handoff that has taken ownership away from the session.
+    pub fn requires_recovery(cwd: &str, id: &str, lock: &'a SessionLock) -> Result<bool> {
+        let journal = Self::open(cwd, id, lock)?;
+        Ok(requires_recovery_state(
+            journal.scan()?.last.map(|record| record.state),
+        ))
+    }
+
     /// Open the journal for an existing saved session.
     ///
     /// This reads and parses `<id>.json` and hashes its actual bytes. A guard for
@@ -287,6 +299,13 @@ impl<'a> HandoffJournal<'a> {
     }
 }
 
+fn requires_recovery_state(state: Option<HandoffState>) -> bool {
+    matches!(
+        state,
+        Some(HandoffState::Commit | HandoffState::OwnedAbandon)
+    )
+}
+
 fn journal_lock(path: &Path) -> Arc<Mutex<()>> {
     static JOURNAL_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
     let mut locks = JOURNAL_LOCKS
@@ -399,6 +418,15 @@ mod tests {
             .open(&journal.path)
             .unwrap();
         file.write_all(&frame).unwrap();
+    }
+
+    #[test]
+    fn prepare_does_not_require_recovery_but_committed_handoffs_do() {
+        assert!(!requires_recovery_state(None));
+        assert!(!requires_recovery_state(Some(HandoffState::Prepare)));
+        assert!(requires_recovery_state(Some(HandoffState::Commit)));
+        assert!(requires_recovery_state(Some(HandoffState::OwnedAbandon)));
+        assert!(!requires_recovery_state(Some(HandoffState::Claim)));
     }
 
     #[test]

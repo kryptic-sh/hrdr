@@ -180,7 +180,9 @@ push each verified slice to `main` before proceeding to the next slice.
     session-lock holder to a parseable hashed saved checkpoint and recovers only
     the newest validated frame. Sudden Windows power loss may lose or
     ambiguously preserve the newest handoff; no update/restart surface may claim
-    otherwise. Next persist actual continuation queues and wire dedicated
+    otherwise. An internal coordinator now commits only an idle saved session
+    and rejects runtime queues, child tasks, watches, drafts, active turns, and
+    save errors. Next persist actual continuation queues and wire dedicated
     recovery before exposing update or restart controls. CI eligibility is
     approved: require the latest `push` CI run and latest attempt on `main` for
     the exact origin-repository hash, with verification and packaging jobs

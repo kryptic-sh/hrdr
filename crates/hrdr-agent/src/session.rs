@@ -807,6 +807,21 @@ fn session_id_from_path(path: &Path) -> Option<String> {
     Some(stem.strip_suffix(".json").unwrap_or(stem).to_string())
 }
 
+/// An ordinary resume encountered a committed handoff checkpoint.
+#[derive(Debug)]
+pub struct HandoffPending;
+
+impl std::fmt::Display for HandoffPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session has a committed handoff pending recovery; ordinary resume is refused"
+        )
+    }
+}
+
+impl std::error::Error for HandoffPending {}
+
 /// Why [`Session::open_path`] couldn't take ownership of a session.
 #[derive(Debug)]
 pub enum OpenError {
@@ -1216,7 +1231,23 @@ impl Session {
         let lock = acquire_existing_open_lock(dir, &id)
             .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
         match Self::load_path(path, unix_style_paths) {
-            Ok(session) => Ok((session, lock)),
+            Ok(session) => {
+                let cwd = session.state.cwd.clone();
+                if path != session_file_path(&cwd, &id) {
+                    return Ok((session, lock));
+                }
+                match crate::HandoffJournal::requires_recovery(&cwd, &id, &lock) {
+                    Ok(true) => {
+                        drop(lock);
+                        Err(OpenError::Load(HandoffPending.into()))
+                    }
+                    Ok(false) => Ok((session, lock)),
+                    Err(e) => {
+                        drop(lock);
+                        Err(OpenError::Load(e))
+                    }
+                }
+            }
             Err(e) => {
                 drop(lock); // release the lock we just took before surfacing the error
                 Err(OpenError::Load(e))
