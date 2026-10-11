@@ -196,6 +196,28 @@ fn update_check_exits_before_reading_invalid_config() {
 }
 
 #[test]
+fn update_coordinator_exits_before_reading_invalid_config() {
+    let config_root = tempfile::tempdir().unwrap();
+    fs::create_dir(config_root.path().join("hrdr")).unwrap();
+    fs::write(config_root.path().join("hrdr/config.toml"), "not = [valid").unwrap();
+    let request_root = tempfile::tempdir().unwrap();
+    let request = request_root.path().join("request.json");
+    fs::write(&request, "not json").unwrap();
+
+    let out = Command::new(bin())
+        .args(["__update-coordinator", request.to_str().unwrap()])
+        .env("XDG_CONFIG_HOME", config_root.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert_eq!(
+        out.stdout,
+        b"{\"schema_version\":1,\"status\":\"invalid\"}\n"
+    );
+}
+
+#[test]
 fn update_check_requires_json() {
     let out = Command::new(bin()).arg("update-check").output().unwrap();
     assert!(!out.status.success());

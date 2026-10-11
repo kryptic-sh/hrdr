@@ -20,6 +20,7 @@
 extern crate hrdr_test_support;
 
 mod update_check;
+mod update_coordinator;
 
 use std::io::Write;
 use std::time::Duration;
@@ -547,6 +548,10 @@ fn handoff_recovery_arg_from(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(result) = update_coordinator::run_from_args() {
+        return result;
+    }
+
     // Before anything else, including the tracing subscriber and clap: this
     // process may be a confinement wrapper rather than an hrdr session.
     #[cfg(windows)]
