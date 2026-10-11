@@ -1274,6 +1274,65 @@ impl Session {
         Self::open_path(&session_file_path(cwd, id), unix_style_paths)
     }
 
+    /// Discover the one recoverable committed handoff for `cwd` without claiming it.
+    ///
+    /// Every candidate is loaded under its existing open-lock and checked against the
+    /// exact snapshot before startup chooses one. A live or indeterminate source is
+    /// an error, rather than permission to start another UI beside the owner.
+    pub fn discover_handoff<F>(
+        cwd: &str,
+        unix_style_paths: bool,
+        validate: F,
+    ) -> Result<Option<String>, OpenError>
+    where
+        F: Fn(&[u8], &Session) -> Result<()>,
+    {
+        let dir = session_dir(cwd);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(OpenError::Load(error.into())),
+        };
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| OpenError::Load(error.into()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".handoff") else {
+                continue;
+            };
+            if id.is_empty() || sanitize_name(id) != id {
+                continue;
+            }
+            let path = session_file_path(cwd, id);
+            if !path.is_file() {
+                continue;
+            }
+            let lock = acquire_existing_open_lock(&dir, id)
+                .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
+            let session = Self::load_path(&path, unix_style_paths).map_err(OpenError::Load)?;
+            if session.state.cwd != cwd || session.state.id.as_deref() != Some(id) {
+                return Err(OpenError::Load(anyhow::anyhow!(
+                    "saved session does not match handoff"
+                )));
+            }
+            let journal = crate::HandoffJournal::open_for_loaded(cwd, id, &lock, &session)
+                .map_err(OpenError::Load)?;
+            if let Some(record) = journal.claimable().map_err(OpenError::Load)? {
+                validate(&record.payload, &session).map_err(OpenError::Load)?;
+                candidates.push(id.to_owned());
+            }
+        }
+        match candidates.as_slice() {
+            [] => Ok(None),
+            [id] => Ok(Some(id.clone())),
+            _ => Err(OpenError::Load(anyhow::anyhow!(
+                "multiple recoverable committed handoffs found"
+            ))),
+        }
+    }
+
     /// Recover a committed handoff under the saved session's exact existing lock.
     ///
     /// This path never falls back to an unbacked lock. It loads the snapshot before
@@ -3015,7 +3074,27 @@ mod tests {
         });
     }
 
-    // ── stale lock / reservation cleanup / concurrency ──────────────────────────
+    #[test]
+    fn discovery_blocks_a_live_committed_handoff() {
+        with_test_env(|tmp| {
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let cwd = project.to_str().unwrap().to_string();
+            Session::new(state("Handoff", &cwd))
+                .save("handoff", true)
+                .unwrap();
+            let dir = session_dir(&cwd);
+            let lock = acquire_existing_open_lock(&dir, "handoff").unwrap();
+            let journal = crate::HandoffJournal::open(&cwd, "handoff", &lock).unwrap();
+            journal
+                .append(1, crate::HandoffState::Commit, b"{}")
+                .unwrap();
+            drop(lock);
+
+            let error = Session::discover_handoff(&cwd, true, |_, _| Ok(())).unwrap_err();
+            assert!(error.to_string().contains("still live"));
+        });
+    }
 
     /// A stale lock file (old timestamp, dead PID) is reaped by
     /// `unique_session_id` so the candidate can be claimed.

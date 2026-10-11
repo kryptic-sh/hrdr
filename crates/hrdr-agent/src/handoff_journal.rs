@@ -51,11 +51,18 @@ impl UpdateOperationId {
     }
 }
 
-/// Durable evidence returned by a completed update tool call.
+/// Durable evidence returned by the actual deferred update tool call.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SuccessfulUpdate {
+pub struct DeferredUpdate {
+    pub status: DeferredUpdateStatus,
     pub operation_id: UpdateOperationId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeferredUpdateStatus {
+    Deferred,
 }
 
 /// The explicit recovery action requested by a handoff checkpoint.
@@ -100,6 +107,12 @@ impl HandoffPayload {
                 && !payload.runtime_watch,
             "handoff payload contains active runtime work"
         );
+        if let Some(operation_id) = &payload.operation_id {
+            anyhow::ensure!(
+                !operation_id.as_str().trim().is_empty(),
+                "update operation id is empty"
+            );
+        }
         match payload.intent {
             HandoffIntent::Idle => anyhow::ensure!(
                 payload.operation_id.is_none(),
@@ -117,14 +130,14 @@ impl HandoffPayload {
     pub fn validate_snapshot(bytes: &[u8], messages: &[crate::Message]) -> Result<HandoffIntent> {
         let (intent, operation_id) = Self::parse_typed(bytes)?;
         if let Some(operation_id) = operation_id {
-            validate_successful_update(messages, &operation_id)?;
+            validate_deferred_update(messages, &operation_id)?;
         }
         Ok(intent)
     }
 }
 
-/// Find the exact assistant `update` call and durable successful tool result.
-pub fn validate_successful_update(
+/// Find the exact assistant `update` call and its adjacent deferred tool result.
+pub fn validate_deferred_update(
     messages: &[crate::Message],
     operation_id: &UpdateOperationId,
 ) -> Result<()> {
@@ -139,7 +152,7 @@ pub fn validate_successful_update(
             {
                 continue;
             }
-            if call.function.arguments != "{}" {
+            if !is_empty_update_arguments(&call.function.arguments) {
                 continue;
             }
             let Some(result) = messages.get(index + 1) else {
@@ -153,18 +166,37 @@ pub fn validate_successful_update(
             let Some(content) = result.content.as_deref() else {
                 continue;
             };
-            let Ok(result_evidence) = serde_json::from_str::<SuccessfulUpdate>(content) else {
+            let Ok(result_evidence) =
+                serde_json::from_str::<DeferredUpdate>(tool_result_body(content))
+            else {
                 continue;
             };
+            if result_evidence.operation_id.as_str().trim().is_empty() {
+                continue;
+            }
             if result_evidence.operation_id == *operation_id {
                 return Ok(());
             }
         }
     }
     bail!(
-        "saved session lacks a paired successful update for operation {}",
+        "saved session lacks a paired deferred update for operation {}",
         operation_id.as_str()
     )
+}
+
+fn is_empty_update_arguments(arguments: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(arguments),
+        Ok(serde_json::Value::Object(object)) if object.is_empty()
+    )
+}
+
+fn tool_result_body(content: &str) -> &str {
+    let Some((body, timing)) = content.rsplit_once("\n\n(took ") else {
+        return content;
+    };
+    if timing.ends_with(')') { body } else { content }
 }
 
 /// The checkpoint phase recorded in a handoff journal.
@@ -644,16 +676,27 @@ mod tests {
     }
 
     #[test]
-    fn update_evidence_requires_a_paired_adjacent_success_result() {
+    fn update_evidence_requires_the_adjacent_deferred_result() {
         let operation = UpdateOperationId::new("op-1").unwrap();
         let assistant: crate::Message = serde_json::from_value(serde_json::json!({
             "role": "assistant",
-            "tool_calls": [{"id":"call-1","type":"function","function":{"name":"update","arguments":"{}"}}]
+            "tool_calls": [{"id":"call-1","type":"function","function":{"name":"update","arguments":"{ }"}}]
         }))
         .unwrap();
-        let result = crate::Message::tool_result("call-1", r#"{"operation_id":"op-1"}"#);
-        assert!(
-            validate_successful_update(&[assistant.clone(), result.clone()], &operation).is_ok()
+        let result = crate::Message::tool_result(
+            "call-1",
+            "{\"status\":\"deferred\",\"operation_id\":\"op-1\"}\n\n(took 0ms)",
+        );
+        assert!(validate_deferred_update(&[assistant.clone(), result.clone()], &operation).is_ok());
+        assert!(!is_empty_update_arguments("{\"unexpected\":true}"));
+        assert!(!is_empty_update_arguments("not json"));
+        assert_eq!(
+            tool_result_body("{\"status\":\"deferred\"}\n\n(took 0ms)"),
+            "{\"status\":\"deferred\"}"
+        );
+        assert_eq!(
+            tool_result_body("{\"status\":\"deferred\"}\n\n(took"),
+            "{\"status\":\"deferred\"}\n\n(took"
         );
         for messages in [
             vec![assistant.clone()],
@@ -663,7 +706,7 @@ mod tests {
                 crate::Message::tool_result("call-1", r#"{"operation_id":"other"}"#),
             ],
         ] {
-            assert!(validate_successful_update(&messages, &operation).is_err());
+            assert!(validate_deferred_update(&messages, &operation).is_err());
         }
     }
 
@@ -671,6 +714,7 @@ mod tests {
     fn update_operation_ids_and_payloads_reject_empty_or_mismatched_shapes() {
         assert!(UpdateOperationId::new(" \t").is_err());
         assert!(HandoffPayload::parse_typed(br#"{"version":1,"intent":"idle","operation_id":"op","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#).is_err());
+        assert!(HandoffPayload::parse_typed(br#"{"version":1,"intent":"update_continuation","operation_id":" ","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#).is_err());
         assert!(HandoffPayload::parse_typed(br#"{"version":1,"intent":"update_continuation","runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#).is_err());
     }
     #[test]

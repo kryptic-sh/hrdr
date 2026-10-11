@@ -92,8 +92,17 @@ impl Fixture {
         fs::copy(env!("CARGO_BIN_EXE_hrdr"), &installed).expect("install test binary");
         let old_binary = fs::read(&installed).expect("read installed binary");
 
-        let head = git_output(&["rev-parse", "--verify", "HEAD^{commit}"]);
         let repository = PathBuf::from(git_output(&["rev-parse", "--show-toplevel"]));
+        let working_tree_patch = Command::new("git")
+            .args(["diff", "--binary", "HEAD"])
+            .output()
+            .expect("capture working-tree patch");
+        assert!(
+            working_tree_patch.status.success(),
+            "git diff failed: {}",
+            String::from_utf8_lossy(&working_tree_patch.stderr)
+        );
+        let head = git_output(&["rev-parse", "--verify", "HEAD^{commit}"]);
         run_git(&[
             "clone",
             "--no-local",
@@ -102,6 +111,39 @@ impl Fixture {
             checkout.to_str().expect("utf-8 checkout path"),
         ]);
         run_git_in(&checkout, &["checkout", "--detach", &head]);
+        if !working_tree_patch.stdout.is_empty() {
+            let mut apply = Command::new("git")
+                .current_dir(&checkout)
+                .args(["apply", "--whitespace=nowarn", "--binary"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("start applying working-tree patch");
+            apply
+                .stdin
+                .take()
+                .expect("working-tree patch stdin")
+                .write_all(&working_tree_patch.stdout)
+                .expect("apply working-tree patch");
+            let status = apply.wait().expect("finish applying working-tree patch");
+            assert!(
+                status.success(),
+                "apply working-tree patch failed: {status:?}"
+            );
+            run_git_in(
+                &checkout,
+                &[
+                    "-c",
+                    "user.name=hrdr Windows update E2E",
+                    "-c",
+                    "user.email=windows-update-e2e@invalid",
+                    "commit",
+                    "--no-gpg-sign",
+                    "-am",
+                    "Windows update E2E working tree",
+                ],
+            );
+        }
+        let head = git_output_in(&checkout, &["rev-parse", "--verify", "HEAD^{commit}"]);
         run_git_in(&checkout, &["switch", "-C", "main", &head]);
         run_git_in(
             &checkout,
@@ -756,6 +798,24 @@ fn git_program() -> PathBuf {
 
 fn git_output(args: &[&str]) -> String {
     let output = Command::new("git").args(args).output().expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf-8 git output")
+        .trim()
+        .to_owned()
+}
+
+fn git_output_in(directory: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .expect("run git");
     assert!(
         output.status.success(),
         "git {:?}: {}",

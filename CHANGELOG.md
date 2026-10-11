@@ -28,9 +28,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Recovery records distinguish idle and future update-continuation intents.**
   Unsupported continuation intent confirmation exits safely without starting
   work.
-- **Future update continuations require durable success evidence.** A typed
-  `update` tool-call/result pair is saved and checkpoint-bound before recovery
-  can validate a continuation intent.
+- **Update continuations require durable deferred-operation evidence.** The real
+  `update` tool-call/result pair is saved and checkpoint-bound before recovery;
+  it never claims Cargo ran before the coordinator installs the build.
+- **Normal startup recovers exactly one abandoned update handoff.** It claims a
+  valid dead-owner checkpoint before opening a UI, fails closed for a live,
+  unknown, or ambiguous owner, and falls back to the retained binary if
+  operation marker I/O fails.
 - **Attested handoff recovery can launch one continuation request.** It restores
   saved history without a synthetic user message, queue restoration, or tool
   replay; activation is consumed after one launch.

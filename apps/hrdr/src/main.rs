@@ -530,6 +530,7 @@ enum UpdateFailure {
     InstallFailed,
     IdentityFailed,
     LaunchFailed,
+    OperationMarkerError,
 }
 
 impl UpdateFailure {
@@ -539,6 +540,7 @@ impl UpdateFailure {
             "install_failed" => Some(Self::InstallFailed),
             "identity_failed" => Some(Self::IdentityFailed),
             "launch_failed" => Some(Self::LaunchFailed),
+            "operation_marker_error" => Some(Self::OperationMarkerError),
             _ => None,
         }
     }
@@ -549,6 +551,7 @@ impl UpdateFailure {
             Self::InstallFailed => "install_failed",
             Self::IdentityFailed => "identity_failed",
             Self::LaunchFailed => "launch_failed",
+            Self::OperationMarkerError => "operation_marker_error",
         }
     }
 }
@@ -961,6 +964,12 @@ async fn main() -> Result<()> {
             config.read_only = true;
         }
         TrustGate::Stop => return Ok(()),
+    }
+
+    if cli.command.is_none()
+        && let Some(id) = hrdr_tui::discover_handoff_recovery(&config)?
+    {
+        return hrdr_tui::run_handoff_recovery(config, ui, LOGO_ART, &id, None).await;
     }
 
     match cli.command {

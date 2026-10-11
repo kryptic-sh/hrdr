@@ -131,6 +131,14 @@ pub(crate) fn resume_terminal(terminal: &mut Tui) -> Result<()> {
     Ok(())
 }
 
+pub fn discover_handoff_recovery(config: &AgentConfig) -> Result<Option<String>> {
+    let cwd = config.cwd.to_string_lossy();
+    hrdr_agent::Session::discover_handoff(&cwd, config.unix_style_paths, |payload, session| {
+        app::validate_handoff_payload(payload, session).map(|_| ())
+    })
+    .map_err(anyhow::Error::from)
+}
+
 pub async fn run_handoff_recovery(
     config: AgentConfig,
     mut ui: hrdr_app::UiConfig,

@@ -240,6 +240,8 @@ enum Status {
     #[cfg(windows)]
     LaunchFailed,
     #[cfg(windows)]
+    OperationMarkerError,
+    #[cfg(windows)]
     Launched,
     #[cfg(not(windows))]
     Unsupported,
@@ -262,6 +264,8 @@ impl Status {
             Self::IdentityFailed => "identity_failed",
             #[cfg(windows)]
             Self::LaunchFailed => "launch_failed",
+            #[cfg(windows)]
+            Self::OperationMarkerError => "operation_marker_error",
             #[cfg(windows)]
             Self::Launched => "launched",
             #[cfg(not(windows))]
@@ -347,8 +351,10 @@ fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> 
     ) {
         return recover(Status::IdentityFailed);
     }
-    if !consume_operation(staging_root, request) {
-        return Status::Reused;
+    match consume_operation(staging_root, request) {
+        OperationMarker::Created => {}
+        OperationMarker::Existing => return Status::Reused,
+        OperationMarker::Error => return recover(Status::OperationMarkerError),
     }
     if launch(
         &request.intended_cargo_bin,
@@ -363,21 +369,37 @@ fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> 
 }
 
 #[cfg(any(windows, test))]
-fn consume_operation(staging_root: &Path, request: &Request) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationMarker {
+    Existing,
+    Created,
+    Error,
+}
+
+#[cfg(any(windows, test))]
+fn consume_operation(staging_root: &Path, request: &Request) -> OperationMarker {
     use std::io::Write;
 
     let marker = staging_root.join(format!(
         ".operation-{}.consumed",
         sha256_hex(request.operation_id.as_bytes())
     ));
-    let Ok(mut marker) = fs::OpenOptions::new()
+    let mut marker = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(marker)
-    else {
-        return false;
+    {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return OperationMarker::Existing;
+        }
+        Err(_) => return OperationMarker::Error,
     };
-    marker.write_all(request.checksum.as_bytes()).is_ok() && marker.sync_all().is_ok()
+    if marker.write_all(request.checksum.as_bytes()).is_ok() && marker.sync_all().is_ok() {
+        OperationMarker::Created
+    } else {
+        OperationMarker::Error
+    }
 }
 
 fn default_cargo_bin() -> anyhow::Result<PathBuf> {
@@ -1468,8 +1490,27 @@ mod tests {
         first.checksum = sha256_hex(canonical_body(&first).as_bytes());
         let mut second = request(temp.path(), candidate);
         second.checksum = first.checksum.clone();
-        assert!(consume_operation(temp.path(), &first));
-        assert!(!consume_operation(temp.path(), &second));
+        assert_eq!(
+            consume_operation(temp.path(), &first),
+            OperationMarker::Created
+        );
+        assert_eq!(
+            consume_operation(temp.path(), &second),
+            OperationMarker::Existing
+        );
+    }
+
+    #[test]
+    fn operation_marker_reports_io_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("candidate");
+        fs::write(&candidate, b"candidate").unwrap();
+        let mut request = request(temp.path(), candidate.clone());
+        request.checksum = sha256_hex(canonical_body(&request).as_bytes());
+        assert_eq!(
+            consume_operation(&candidate, &request),
+            OperationMarker::Error
+        );
     }
 
     #[cfg(windows)]
