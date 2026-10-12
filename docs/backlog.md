@@ -192,7 +192,18 @@ push each verified slice to `main` before proceeding to the next slice.
     approved: require the latest `push` CI run and latest attempt on `main` for
     the exact origin-repository hash, with verification and packaging jobs
     successful; only tag-only publishing jobs may be skipped. Manual and older
-    runs do not qualify.
+    runs do not qualify. **Deferred 2026-10-12:** Windows CI runs `38207254188`
+    and `38211455090` still failed every self-update E2E recovery. The current
+    uncommitted persisted-session-cwd recovery attempt must not ship: review
+    found its TUI handoff test does not assert the exact `session_cwd`, and its
+    Windows alias E2E can pass without a distinct alias. Resume by adding those
+    conclusive assertions, rerunning the full Windows release E2E suite, then
+    pushing and confirming the exact CI job is green before declaring
+    self-update complete or cutting a release. The 2026-10-12 local gate also
+    failed independently in
+    `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`:
+    a writer timed out acquiring `auth.json.lock`; preserve and root-cause that
+    contention before treating a later self-update gate as green.
 12. **Windows multiline-paste transport investigation — deferred branch.**
     Pending work is preserved and pushed at `wip/windows-paste-transport` commit
     `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY
