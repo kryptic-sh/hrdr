@@ -167,7 +167,7 @@ jobs:
       # for failed-install recovery, so this is an ignored Windows-only release test.
       - name: Windows Cargo self-update E2E
         if: matrix.os == 'windows-latest'
-        run: cargo test --locked --release -p hrdr --test windows_update_e2e -- --ignored
+        run: cargo test --locked --release -p hrdr --test windows_update_e2e -- --ignored --test-threads=1
       - name: Completions + man page generate cleanly
         shell: bash
         run: |
