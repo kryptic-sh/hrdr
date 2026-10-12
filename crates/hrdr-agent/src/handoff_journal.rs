@@ -33,7 +33,16 @@ pub struct SnapshotIoError(anyhow::Error);
 
 impl std::fmt::Display for SnapshotIoError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
+        self.0.fmt(formatter)?;
+        if let Some(error) = snapshot_io_error_details(&self.0) {
+            write!(
+                formatter,
+                " (I/O kind: {:?}, raw OS error: {:?})",
+                error.kind(),
+                error.raw_os_error()
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -278,9 +287,15 @@ pub struct HandoffJournal<'a> {
 impl<'a> HandoffJournal<'a> {
     /// Return whether `error` came from a transient Windows failure opening or
     /// reading the snapshot while this journal was being attested.
+    ///
+    /// `ERROR_ACCESS_DENIED` is retried only for a [`SnapshotIoError`] after the
+    /// latest checksummed journal frame still names this dead or replaced source.
+    /// This covers the short delete-pending/session-lock lifecycle and does not
+    /// retry general permission failures.
     pub fn is_transient_snapshot_io_error(error: &anyhow::Error) -> bool {
         #[cfg(windows)]
         {
+            const ERROR_ACCESS_DENIED: i32 = 5;
             const ERROR_SHARING_VIOLATION: i32 = 32;
             const ERROR_LOCK_VIOLATION: i32 = 33;
             const ERROR_DELETE_PENDING: i32 = 303;
@@ -288,19 +303,17 @@ impl<'a> HandoffJournal<'a> {
             error
                 .chain()
                 .any(|cause| cause.downcast_ref::<SnapshotIoError>().is_some())
-                && error
-                    .chain()
-                    .filter_map(|cause| {
-                        cause
-                            .downcast_ref::<std::io::Error>()
-                            .and_then(std::io::Error::raw_os_error)
-                    })
-                    .any(|code| {
-                        matches!(
-                            code,
-                            ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_DELETE_PENDING
+                && snapshot_io_error_details(error).is_some_and(|error| {
+                    matches!(
+                        error.raw_os_error(),
+                        Some(
+                            ERROR_ACCESS_DENIED
+                                | ERROR_SHARING_VIOLATION
+                                | ERROR_LOCK_VIOLATION
+                                | ERROR_DELETE_PENDING
                         )
-                    })
+                    )
+                })
         }
         #[cfg(not(windows))]
         {
@@ -817,14 +830,38 @@ fn read_partial(file: &mut File, buffer: &mut [u8]) -> std::io::Result<usize> {
 fn saved_session_hash(path: &Path, id: &str) -> Result<[u8; 32]> {
     let session = Session::load_path(path, false)
         .map_err(snapshot_io_error)
-        .with_context(|| format!("loading saved session {}", path.display()))?;
+        .map_err(|error| {
+            snapshot_io_context(error, format!("loading saved session {}", path.display()))
+        })?;
     if session.state.id.as_deref() != Some(id) {
         bail!("saved session marker does not match {id}");
     }
     let bytes = std::fs::read(path)
         .map_err(|error| SnapshotIoError(error.into()))
-        .with_context(|| format!("reading {}", path.display()))?;
+        .map_err(|error| {
+            snapshot_io_context(error.into(), format!("reading {}", path.display()))
+        })?;
     Ok(Sha256::digest(bytes).into())
+}
+
+fn snapshot_io_error_details(error: &anyhow::Error) -> Option<&std::io::Error> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+}
+
+fn snapshot_io_context(error: anyhow::Error, context: String) -> anyhow::Error {
+    let details = snapshot_io_error_details(&error).map(|error| {
+        format!(
+            "I/O kind: {:?}, raw OS error: {:?}",
+            error.kind(),
+            error.raw_os_error()
+        )
+    });
+    match details {
+        Some(details) => error.context(format!("{context} ({details})")),
+        None => error.context(context),
+    }
 }
 
 pub(crate) fn snapshot_io_error(error: anyhow::Error) -> anyhow::Error {
@@ -857,6 +894,36 @@ mod tests {
             pid: 1234,
             created: 5,
         }
+    }
+
+    #[test]
+    fn snapshot_io_context_reports_io_kind_and_raw_os_code() {
+        let error = snapshot_io_context(
+            anyhow::Error::new(std::io::Error::from_raw_os_error(5)),
+            "loading saved session session.json".to_owned(),
+        );
+        let message = error.to_string();
+        assert!(message.contains("loading saved session session.json"));
+        assert!(message.contains("I/O kind:"));
+        assert!(message.contains("raw OS error: Some(5)"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn access_denied_snapshot_io_is_the_only_retried_permission_error() {
+        let access_denied =
+            snapshot_io_error(anyhow::Error::new(std::io::Error::from_raw_os_error(5)));
+        assert!(HandoffJournal::is_transient_snapshot_io_error(
+            &access_denied
+        ));
+
+        let generic_permission_denied = snapshot_io_error(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fixture permission denial",
+        )));
+        assert!(!HandoffJournal::is_transient_snapshot_io_error(
+            &generic_permission_denied
+        ));
     }
 
     fn append_frame(journal: &HandoffJournal, epoch: u64, payload: &[u8]) {
