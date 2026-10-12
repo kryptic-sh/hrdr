@@ -382,6 +382,10 @@ impl Fixture {
                 })
         })
     }
+
+    fn session_lock_diagnostic(&self) -> String {
+        session_lock_diagnostic(&self.home)
+    }
 }
 
 struct Session {
@@ -463,6 +467,25 @@ impl Session {
     }
 }
 
+fn wait_for_recovery(fixture: &Fixture, server: &MockServer, session: &Session) {
+    let recovery_started = Instant::now();
+    loop {
+        let screen = session.screen();
+        if server.chat_bodies().len() == 7 && screen.contains("continued-after-update") {
+            return;
+        }
+        assert!(
+            recovery_started.elapsed() < WAIT,
+            "timed out waiting for recovery continuation; chat count: {}\nfixture Cargo log:\n{}\nfixture operation:\n{}\nsession open-locks:\n{}\ncoordinator output / recovery screen:\n{screen}",
+            server.chat_bodies().len(),
+            fs::read_to_string(&fixture.cargo_log).unwrap_or_default(),
+            fixture.operation_diagnostic(),
+            fixture.session_lock_diagnostic(),
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
 #[test]
 #[ignore = "replaces an executable; run only in Windows release CI"]
 fn update_installs_default_cargo_binary_and_recovers_once() {
@@ -505,15 +528,14 @@ fn update_installs_default_cargo_binary_and_recovers_once() {
         "the coordinator must run Cargo install against the admitted checkout:\n{cargo_log}"
     );
 
-    wait_until("recovered shell cwd", || {
-        let bodies = server.chat_bodies();
-        (bodies.len() == 7
-            && session.screen().contains("continued-after-update")
-            && bodies
-                .last()
-                .is_some_and(|body| body.to_string().contains("recovery-cwd-preserved")))
-        .then_some(())
-    });
+    wait_for_recovery(&fixture, &server, &session);
+    assert!(
+        server
+            .chat_bodies()
+            .last()
+            .is_some_and(|body| body.to_string().contains("recovery-cwd-preserved")),
+        "the recovered shell must preserve the update request cwd"
+    );
     assert_eq!(
         server.chat_bodies().len(),
         7,
@@ -555,9 +577,7 @@ fn reused_request_does_not_install_or_recover_again() {
     session.send("install update\r");
     let _ = session.wait_for_exit(&fixture);
     let operation = fixture.operation_root();
-    wait_until("recovered continuation", || {
-        (server.chat_bodies().len() == 7).then_some(())
-    });
+    wait_for_recovery(&fixture, &server, &session);
     let destination = fs::read(&fixture.installed).expect("installed destination");
     let coordinator = single(&operation, "coordinator-");
     let request = single(&operation, "request-");
@@ -620,10 +640,11 @@ fn failed_cargo_install_recovers_with_the_retained_old_binary_once() {
         }
         assert!(
             recovery_started.elapsed() < WAIT,
-            "timed out waiting for retained-binary recovery continuation; chat count: {}\nfixture Cargo log:\n{}\nfixture operation:\n{}\ncoordinator output / recovery screen:\n{screen}",
+            "timed out waiting for retained-binary recovery continuation; chat count: {}\nfixture Cargo log:\n{}\nfixture operation:\n{}\nsession open-locks:\n{}\ncoordinator output / recovery screen:\n{screen}",
             server.chat_bodies().len(),
             fs::read_to_string(&fixture.cargo_log).unwrap_or_default(),
             fixture.operation_diagnostic(),
+            fixture.session_lock_diagnostic(),
         );
         std::thread::sleep(POLL);
     }
@@ -731,6 +752,98 @@ fn persisted_session_state(home: &Path) -> Option<serde_json::Value> {
                 == Some("json")
         })?;
     serde_json::from_slice(&fs::read(snapshot.path()).ok()?).ok()
+}
+
+fn session_lock_diagnostic(home: &Path) -> String {
+    let sessions = home.join("hrdr").join("sessions");
+    let entries = match fs::read_dir(&sessions) {
+        Ok(entries) => entries,
+        Err(error) => return format!("{}: read_dir failed: {error}", sessions.display()),
+    };
+    let mut lines = Vec::new();
+    for cwd in entries {
+        let cwd = match cwd {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                lines.push(format!(
+                    "{}: directory entry error: {error}",
+                    sessions.display()
+                ));
+                continue;
+            }
+        };
+        let cwd_path = cwd.path();
+        if !cwd.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let locks = match fs::read_dir(&cwd_path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                lines.push(format!("{}: read_dir failed: {error}", cwd_path.display()));
+                continue;
+            }
+        };
+        for lock in locks {
+            let lock = match lock {
+                Ok(lock) => lock,
+                Err(error) => {
+                    lines.push(format!(
+                        "{}: directory entry error: {error}",
+                        cwd_path.display()
+                    ));
+                    continue;
+                }
+            };
+            let path = lock.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".open.lock"))
+            {
+                continue;
+            }
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => format!(
+                    "len={} readonly={} modified={:?}",
+                    metadata.len(),
+                    metadata.permissions().readonly(),
+                    metadata.modified()
+                ),
+                Err(error) => format!("metadata error: {error}"),
+            };
+            let content = match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) => {
+                    lines.push(format!(
+                        "{}: {metadata}; read error: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            let mut fields = content.split_whitespace();
+            let pid = fields.next().and_then(|field| field.parse::<u32>().ok());
+            let started = fields.next().and_then(|field| field.parse::<u64>().ok());
+            let lease_created = fields.next().and_then(|field| field.parse::<u64>().ok());
+            let liveness = match (pid, lease_created) {
+                (Some(pid), Some(created)) => format!(
+                    "lease liveness={:?}",
+                    hrdr_tools::process_lease_liveness(hrdr_tools::ProcessLease { pid, created })
+                ),
+                (Some(pid), None) => format!("pid alive={}", hrdr_tools::process_alive(pid)),
+                _ => "owner unparseable".to_owned(),
+            };
+            lines.push(format!(
+                "{}: {metadata}; content={content:?}; parsed pid={pid:?} started={started:?} lease_created={lease_created:?}; {liveness}",
+                path.display()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        format!("{}: no .open.lock files present", sessions.display())
+    } else {
+        lines.join("\n")
+    }
 }
 
 fn compact_terminal_text(text: &str) -> String {

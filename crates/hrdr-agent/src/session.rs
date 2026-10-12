@@ -737,25 +737,23 @@ fn handoff_source_is_reclaimable(source: hrdr_tools::ProcessLease) -> bool {
     )
 }
 
-fn reclaim_handoff_source_lock(
+fn handoff_source_lock_is_reclaimable(
     path: &Path,
     source: hrdr_tools::ProcessLease,
     require_exact_format: bool,
 ) -> bool {
-    if !handoff_source_is_reclaimable(source) {
-        return false;
-    }
-    let owned_by_source = std::fs::read_to_string(path).ok().is_some_and(|content| {
-        let mut parts = content.split_whitespace();
-        let matches_source = parts.next().and_then(|value| value.parse().ok()) == Some(source.pid)
-            && parts
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some()
-            && parts.next().and_then(|value| value.parse().ok()) == Some(source.created);
-        matches_source && (!require_exact_format || parts.next().is_none())
-    });
-    owned_by_source && std::fs::remove_file(path).is_ok()
+    handoff_source_is_reclaimable(source)
+        && std::fs::read_to_string(path).ok().is_some_and(|content| {
+            let mut parts = content.split_whitespace();
+            let matches_source = parts.next().and_then(|value| value.parse().ok())
+                == Some(source.pid)
+                && parts
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some()
+                && parts.next().and_then(|value| value.parse().ok()) == Some(source.created);
+            matches_source && (!require_exact_format || parts.next().is_none())
+        })
 }
 
 /// Acquire the per-session open-lock for `id` in `dir`.
@@ -814,13 +812,26 @@ fn acquire_open_lock_mode(
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if handoff_source.is_some_and(|source| {
-                    reclaim_handoff_source_lock(&lock_path, source, require_exact_handoff_lock)
-                }) || (!require_exact_handoff_lock
-                    && crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS))
+                let source_lock_is_reclaimable = handoff_source.is_some_and(|source| {
+                    handoff_source_lock_is_reclaimable(
+                        &lock_path,
+                        source,
+                        require_exact_handoff_lock,
+                    )
+                });
+                if source_lock_is_reclaimable {
+                    // The coordinator proved this exact source has exited. Windows can
+                    // temporarily deny deletion while an external handle drains; keep
+                    // retrying the verified dead lock rather than mistaking it for a
+                    // live owner.
+                    let _ = std::fs::remove_file(&lock_path);
+                    std::thread::sleep(OPEN_LOCK_RETRY_DELAY);
+                    continue;
+                }
+                if !require_exact_handoff_lock
+                    && crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS)
                 {
-                    // A verified dead handoff source, or a dead abandoned lock:
-                    // reap it and retry the O_EXCL create.
+                    // A dead abandoned lock: reap it and retry the O_EXCL create.
                     let _ = std::fs::remove_file(&lock_path);
                     continue;
                 }
@@ -3459,6 +3470,49 @@ mod tests {
         let acquired = acquire_handoff_open_lock(dir.path(), "chat", source);
         cleanup.join().unwrap();
         let lock = acquired.expect("a delete-pending exact source lock is retried");
+        assert!(lock.is_backed());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handoff_recovery_retries_visible_exact_source_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".chat.open.lock");
+        let source = hrdr_tools::ProcessLease {
+            pid: u32::MAX - 1,
+            created: 1,
+        };
+        std::fs::write(
+            &lock_path,
+            format!(
+                "{} {} {}",
+                source.pid,
+                hrdr_tools::unix_now(),
+                source.created
+            ),
+        )
+        .unwrap();
+        let (ready, wait_for_cleanup) = std::sync::mpsc::channel();
+        let cleanup_path = lock_path.clone();
+        let cleanup = std::thread::spawn(move || {
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&cleanup_path)
+                .unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        wait_for_cleanup.recv().unwrap();
+
+        let acquired = acquire_handoff_open_lock(dir.path(), "chat", source);
+        cleanup.join().unwrap();
+        let lock = acquired.expect("a visible exact source lock is retried while deletion drains");
         assert!(lock.is_backed());
     }
 
