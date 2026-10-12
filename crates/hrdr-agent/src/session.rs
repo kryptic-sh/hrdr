@@ -24,11 +24,11 @@ use serde::{Deserialize, Serialize};
 /// deadlock while avoiding false reaping of a lock that a slow filesystem or
 /// a concurrent process legitimately holds.
 const STALE_LOCK_AGE_SECS: u64 = 60;
-/// Retry a Windows delete-pending open-lock before refusing recovery. A source
-/// process may have exited and released its guard while NTFS still holds the
-/// final deletion handle; treating that brief `PermissionDenied` as a live owner
-/// would strand a committed handoff.
-const OPEN_LOCK_ACQUIRE_ATTEMPTS: u32 = 100;
+/// Retry a coordinator-attested source lock while Windows drains a delete-pending
+/// handle. The bounded window leaves room for delayed handle cleanup (including
+/// security scanners) without turning an access failure into permission to claim
+/// an unknown lock.
+const OPEN_LOCK_ACQUIRE_ATTEMPTS: u32 = 600;
 const OPEN_LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// v2: the identity is ONE key — `model: "provider://model"` — where v1 wrote
@@ -730,15 +730,19 @@ fn read_open_lock_owner(path: &Path) -> SessionBusy {
     SessionBusy { pid, started }
 }
 
+fn handoff_source_is_reclaimable(source: hrdr_tools::ProcessLease) -> bool {
+    matches!(
+        hrdr_tools::process_lease_liveness(source),
+        hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced
+    )
+}
+
 fn reclaim_handoff_source_lock(
     path: &Path,
     source: hrdr_tools::ProcessLease,
     require_exact_format: bool,
 ) -> bool {
-    if !matches!(
-        hrdr_tools::process_lease_liveness(source),
-        hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced
-    ) {
+    if !handoff_source_is_reclaimable(source) {
         return false;
     }
     let owned_by_source = std::fs::read_to_string(path).ok().is_some_and(|content| {
@@ -822,10 +826,15 @@ fn acquire_open_lock_mode(
                 }
                 return Err(read_open_lock_owner(&lock_path));
             }
-            Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Windows reports a just-deleted lock as access denied until its
-                // last handle closes. It cannot prove a live owner, so wait for
-                // that cleanup to settle, then retry the exclusive create.
+            Err(e)
+                if cfg!(windows)
+                    && e.kind() == std::io::ErrorKind::PermissionDenied
+                    && handoff_source.is_some_and(handoff_source_is_reclaimable) =>
+            {
+                // A coordinator has proved this exact source lease is gone, but
+                // Windows can keep its deleted lock inaccessible until the final
+                // handle closes. Retry only to recheck/reclaim/acquire: a live,
+                // unknown, unmatched, or legacy lock remains unavailable.
                 std::thread::sleep(OPEN_LOCK_RETRY_DELAY);
             }
             // New-session creation may retain the documented best-effort mode.
@@ -3411,14 +3420,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn existing_open_lock_retries_delete_pending_cleanup() {
+    fn handoff_recovery_retries_delete_pending_exact_source_lock() {
         use std::os::windows::fs::OpenOptionsExt;
 
         const FILE_SHARE_ALL: u32 = 0x0000_0007;
 
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join(".chat.open.lock");
-        std::fs::write(&lock_path, b"old lock").unwrap();
+        let source = hrdr_tools::ProcessLease {
+            pid: u32::MAX - 1,
+            created: 1,
+        };
+        std::fs::write(
+            &lock_path,
+            format!(
+                "{} {} {}",
+                source.pid,
+                hrdr_tools::unix_now(),
+                source.created
+            ),
+        )
+        .unwrap();
         let (ready, wait_for_cleanup) = std::sync::mpsc::channel();
         let cleanup_path = lock_path.clone();
         let cleanup = std::thread::spawn(move || {
@@ -3434,9 +3456,9 @@ mod tests {
         });
         wait_for_cleanup.recv().unwrap();
 
-        let acquired = acquire_existing_open_lock(dir.path(), "chat");
+        let acquired = acquire_handoff_open_lock(dir.path(), "chat", source);
         cleanup.join().unwrap();
-        let lock = acquired.expect("delete-pending cleanup is retried");
+        let lock = acquired.expect("a delete-pending exact source lock is retried");
         assert!(lock.is_backed());
     }
 
