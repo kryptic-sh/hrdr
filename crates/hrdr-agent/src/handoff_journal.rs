@@ -398,7 +398,7 @@ impl<'a> HandoffJournal<'a> {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn append_for_source(
         &self,
         epoch: u64,
