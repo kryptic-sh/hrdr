@@ -24,6 +24,25 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 1024;
 
+/// A snapshot open or read failure encountered while attesting a handoff journal.
+///
+/// This marker distinguishes OS-level snapshot access failures from malformed
+/// snapshots and every other journal validation failure.
+#[derive(Debug)]
+pub struct SnapshotIoError(anyhow::Error);
+
+impl std::fmt::Display for SnapshotIoError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SnapshotIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 /// A non-empty provider operation identifier for a successful update.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
@@ -235,6 +254,7 @@ pub struct HandoffRecord {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredPayload {
     session_hash: [u8; 32],
     source: hrdr_tools::ProcessLease,
@@ -256,6 +276,39 @@ pub struct HandoffJournal<'a> {
 }
 
 impl<'a> HandoffJournal<'a> {
+    /// Return whether `error` came from a transient Windows failure opening or
+    /// reading the snapshot while this journal was being attested.
+    pub fn is_transient_snapshot_io_error(error: &anyhow::Error) -> bool {
+        #[cfg(windows)]
+        {
+            const ERROR_SHARING_VIOLATION: i32 = 32;
+            const ERROR_LOCK_VIOLATION: i32 = 33;
+            const ERROR_DELETE_PENDING: i32 = 303;
+
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<SnapshotIoError>().is_some())
+                && error
+                    .chain()
+                    .filter_map(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .and_then(std::io::Error::raw_os_error)
+                    })
+                    .any(|code| {
+                        matches!(
+                            code,
+                            ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_DELETE_PENDING
+                        )
+                    })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = error;
+            false
+        }
+    }
+
     /// Return whether the latest valid frame says this snapshot must be recovered
     /// by its handoff owner before an ordinary resume may use it.
     ///
@@ -297,6 +350,26 @@ impl<'a> HandoffJournal<'a> {
                 bail!("handoff source owner liveness could not be determined")
             }
         }
+    }
+
+    /// Inspect the journal without opening the snapshot.
+    ///
+    /// This is limited to a transient snapshot I/O retry: it verifies every
+    /// complete frame's checksum and the latest frame's state and source, but does
+    /// not use a frame's snapshot hash or payload as snapshot validation. The next
+    /// recovery attempt performs the normal snapshot-bound validation before claim.
+    pub fn has_claimable_source_without_snapshot(
+        cwd: &str,
+        id: &str,
+        source: hrdr_tools::ProcessLease,
+    ) -> Result<bool> {
+        let id = sanitize_name(id);
+        let path = session_file_path(cwd, &id).with_file_name(format!("{id}.handoff"));
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let Some(record) = latest_checksummed_source(&bytes)? else {
+            return Ok(false);
+        };
+        Ok(claimable_state(record.0) && record.1 == source)
     }
 
     /// Open the journal for an existing saved session.
@@ -345,6 +418,7 @@ impl<'a> HandoffJournal<'a> {
             bail!("loaded session does not match handoff binding");
         }
         let bytes = std::fs::read(&session_path)
+            .map_err(|error| SnapshotIoError(error.into()))
             .with_context(|| format!("reading {}", session_path.display()))?;
         let path = session_path.with_file_name(format!("{id}.handoff"));
         Ok(Self {
@@ -628,6 +702,62 @@ fn journal_lock(path: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
+/// Return the state and source from the final complete checksummed frame.
+///
+/// This deliberately does not bind the journal to a snapshot. It is solely the
+/// narrow, lockless predicate needed to retry a snapshot I/O failure; recovery
+/// performs that binding before it can claim a handoff.
+fn latest_checksummed_source(
+    bytes: &[u8],
+) -> Result<Option<(HandoffState, hrdr_tools::ProcessLease)>> {
+    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+        bail!("handoff journal exceeds {MAX_JOURNAL_BYTES} bytes");
+    }
+    let mut offset = 0;
+    let mut records = 0;
+    let mut last = None;
+    while offset < bytes.len() {
+        if bytes.len() - offset < HEADER_BYTES {
+            bail!("incomplete handoff frame at byte {offset}");
+        }
+        let header = &bytes[offset..offset + HEADER_BYTES];
+        if header[..4] != MAGIC || header[4] != VERSION {
+            bail!("invalid handoff frame at byte {offset}");
+        }
+        let length = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        if length > MAX_PAYLOAD_BYTES {
+            bail!("handoff frame at byte {offset} exceeds {MAX_PAYLOAD_BYTES} bytes");
+        }
+        let frame_len = HEADER_BYTES + length + CHECKSUM_BYTES;
+        if bytes.len() - offset < frame_len {
+            bail!("incomplete handoff frame at byte {offset}");
+        }
+        let frame = &bytes[offset..offset + frame_len];
+        let state = HandoffState::try_from(header[17])
+            .map_err(|_| anyhow::anyhow!("invalid handoff state at byte {offset}"))?;
+        if Sha256::digest(&frame[..HEADER_BYTES + length]).as_slice()
+            != &frame[HEADER_BYTES + length..]
+        {
+            bail!("invalid handoff checksum at byte {offset}");
+        }
+        let stored: StoredPayload =
+            serde_json::from_slice(&frame[HEADER_BYTES..HEADER_BYTES + length])
+                .with_context(|| format!("parsing handoff frame at byte {offset}"))?;
+        if stored.source.pid == 0 {
+            bail!("handoff frame at byte {offset} has a PID zero source");
+        }
+        HandoffPayload::parse(&stored.payload)
+            .with_context(|| format!("validating handoff frame payload at byte {offset}"))?;
+        records += 1;
+        if records > MAX_RECORDS {
+            bail!("handoff journal exceeds {MAX_RECORDS} records");
+        }
+        last = Some((state, stored.source));
+        offset += frame_len;
+    }
+    Ok(last)
+}
+
 /// Determine whether damaged bytes precede a complete valid frame.
 ///
 /// A later frame is recognized only by the full bounded framing contract: magic,
@@ -686,12 +816,26 @@ fn read_partial(file: &mut File, buffer: &mut [u8]) -> std::io::Result<usize> {
 
 fn saved_session_hash(path: &Path, id: &str) -> Result<[u8; 32]> {
     let session = Session::load_path(path, false)
+        .map_err(snapshot_io_error)
         .with_context(|| format!("loading saved session {}", path.display()))?;
     if session.state.id.as_deref() != Some(id) {
         bail!("saved session marker does not match {id}");
     }
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| SnapshotIoError(error.into()))
+        .with_context(|| format!("reading {}", path.display()))?;
     Ok(Sha256::digest(bytes).into())
+}
+
+pub(crate) fn snapshot_io_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+    {
+        SnapshotIoError(error).into()
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]
@@ -811,6 +955,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lockless_retry_inspection_requires_an_exact_committed_checksummed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = journal(&dir);
+        let source = lease();
+        let payload = br#"{"version":1,"intent":"idle","operation_id":null,"runtime_queue":false,"runtime_tasks":false,"runtime_tools":false,"runtime_turn":false,"runtime_compaction":false,"runtime_watch":false}"#;
+        let commit = journal
+            .frame(1, HandoffState::Commit, source, payload)
+            .unwrap();
+        assert_eq!(
+            latest_checksummed_source(&commit).unwrap(),
+            Some((HandoffState::Commit, source))
+        );
+
+        let replaced = journal
+            .frame(
+                2,
+                HandoffState::Claim,
+                hrdr_tools::ProcessLease {
+                    pid: source.pid + 1,
+                    created: source.created,
+                },
+                payload,
+            )
+            .unwrap();
+        let mut nonclaimable = commit.clone();
+        nonclaimable.extend_from_slice(&replaced);
+        assert_eq!(
+            latest_checksummed_source(&nonclaimable).unwrap(),
+            Some((
+                HandoffState::Claim,
+                hrdr_tools::ProcessLease {
+                    pid: source.pid + 1,
+                    created: source.created,
+                }
+            ))
+        );
+
+        let malformed_payload = journal
+            .frame(3, HandoffState::Commit, source, b"malformed payload")
+            .unwrap();
+        assert!(latest_checksummed_source(&malformed_payload).is_err());
+
+        let mut corrupt = commit;
+        corrupt[HEADER_BYTES] ^= 1;
+        assert!(latest_checksummed_source(&corrupt).is_err());
+    }
     #[test]
     fn invalid_payload_is_not_claimed() {
         let dir = tempfile::tempdir().unwrap();

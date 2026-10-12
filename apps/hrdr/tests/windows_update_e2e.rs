@@ -174,7 +174,7 @@ impl Fixture {
         fs::write(
             bin.join("cargo.cmd"),
             format!(
-                "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"log={}\"\r\nset \"stdout={}\"\r\nset \"stderr={}\"\r\nset \"PATH={};%PATH%\"\r\n>>\"%log%\" echo === cargo invocation ===\r\n>>\"%log%\" echo cwd: %CD%\r\n>>\"%log%\" echo argv: %*\r\nif \"{fail_cargo_install}\"==\"true\" if \"%~1\"==\"install\" (\r\n  >>\"%log%\" echo forced install failure\r\n  exit /b 1\r\n)\r\n\"{}\" %* >\"%stdout%\" 2>\"%stderr%\"\r\nset \"code=!ERRORLEVEL!\"\r\n>>\"%log%\" echo stdout:\r\n>>\"%log%\" type \"%stdout%\"\r\n>>\"%log%\" echo stderr:\r\n>>\"%log%\" type \"%stderr%\"\r\n>>\"%log%\" echo exit: !code!\r\ntype \"%stdout%\"\r\ntype \"%stderr%\" >&2\r\nexit /b !code!\r\n",
+                "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"log={}\"\r\nset \"stdout={}\"\r\nset \"stderr={}\"\r\nset \"PATH={};%PATH%\"\r\n>>\"%log%\" echo === cargo invocation ===\r\n>>\"%log%\" echo cwd: %CD%\r\n>>\"%log%\" echo argv: %*\r\nif \"{fail_cargo_install}\"==\"true\" if \"%~1\"==\"install\" (\r\n  >>\"%log%\" echo forced install failure\r\n  exit /b 1\r\n)\r\nif \"%~1\"==\"install\" if not \"%HRDR_TEST_CARGO_INSTALL_READY%\"==\"\" set \"HRDR_TEST_CARGO_FEATURE=--features test-support\"\r\n\"{}\" %* %HRDR_TEST_CARGO_FEATURE% >\"%stdout%\" 2>\"%stderr%\"\r\nset \"code=!ERRORLEVEL!\"\r\nif \"%~1\"==\"install\" if not \"%HRDR_TEST_CARGO_INSTALL_READY%\"==\"\" (\r\n  >\"%HRDR_TEST_CARGO_INSTALL_READY%\" echo ready\r\n  powershell.exe -NoProfile -NonInteractive -Command \"while (-not (Test-Path -LiteralPath $env:HRDR_TEST_CARGO_INSTALL_RELEASE)) {{ Start-Sleep -Milliseconds 10 }}\"\r\n)\r\n>>\"%log%\" echo stdout:\r\n>>\"%log%\" type \"%stdout%\"\r\n>>\"%log%\" echo stderr:\r\n>>\"%log%\" type \"%stderr%\"\r\n>>\"%log%\" echo exit: !code!\r\ntype \"%stdout%\"\r\ntype \"%stderr%\" >&2\r\nexit /b !code!\r\n",
                 cargo_log.display(),
                 cargo_stdout.display(),
                 cargo_stderr.display(),
@@ -389,6 +389,10 @@ impl Fixture {
 
     fn source_open_lock(&self) -> PathBuf {
         wait_until("source session open-lock", || session_open_lock(&self.home))
+    }
+
+    fn source_snapshot(&self) -> PathBuf {
+        wait_until("source session snapshot", || session_snapshot(&self.home))
     }
 }
 
@@ -609,6 +613,82 @@ fn recovery_retries_a_dead_source_lock_past_initial_acquisition_window() {
 
 #[test]
 #[ignore = "replaces an executable; run only in Windows release CI"]
+fn recovery_continues_once_after_snapshot_sharing_violation_clears() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let server = MockServer::start(update_conversation());
+    let mut fixture = Fixture::new(false);
+    let cargo_ready = fixture.home.join("cargo-install-ready");
+    let cargo_release = fixture.home.join("cargo-install-release");
+    let retry_marker = fixture.home.join("handoff-retry-marker");
+    let retry_release = fixture.home.join("handoff-retry-release");
+    fixture.env.extend([
+        (
+            OsString::from("HRDR_TEST_CARGO_INSTALL_READY"),
+            cargo_ready.clone().into_os_string(),
+        ),
+        (
+            OsString::from("HRDR_TEST_CARGO_INSTALL_RELEASE"),
+            cargo_release.clone().into_os_string(),
+        ),
+        (
+            OsString::from("HRDR_TEST_HANDOFF_RETRY_MARKER"),
+            retry_marker.clone().into_os_string(),
+        ),
+        (
+            OsString::from("HRDR_TEST_HANDOFF_RETRY_RELEASE"),
+            retry_release.clone().into_os_string(),
+        ),
+    ]);
+    let mut session = fixture.start(&server);
+    session.wait_for("mock-model");
+    session.send("install update\r");
+    wait_until("tool-result continuation before handoff", || {
+        (server.chat_bodies().len() == 5 && session.screen().contains("turn-after-update"))
+            .then_some(())
+    });
+    let _ = session.wait_for_exit(&fixture);
+
+    wait_until("completed Cargo install before coordinator launch", || {
+        cargo_ready.exists().then_some(())
+    });
+    let snapshot = fixture.source_snapshot();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&snapshot)
+        .expect("make the source snapshot temporarily unavailable");
+    fs::write(&cargo_release, []).expect("release completed Cargo install");
+
+    wait_until("snapshot retry while exclusively held", || {
+        retry_marker
+            .exists()
+            .then_some(fs::read_to_string(&retry_marker).ok())
+            .flatten()
+            .filter(|marker| marker == "snapshot retry reached")
+    });
+    assert_eq!(
+        server.chat_bodies().len(),
+        5,
+        "the retry marker must be reached before releasing the exclusive snapshot handle"
+    );
+    assert!(
+        !session.screen().contains("continued-after-update"),
+        "recovery must remain blocked at the retry barrier while the snapshot is held"
+    );
+    drop(held);
+    fs::write(&retry_release, []).expect("release snapshot retry barrier");
+
+    wait_for_recovery(&fixture, &server, &session);
+    assert_eq!(
+        server.chat_bodies().len(),
+        7,
+        "the blocked snapshot must release before one recovery continuation runs"
+    );
+}
+
+#[test]
+#[ignore = "replaces an executable; run only in Windows release CI"]
 fn reused_request_does_not_install_or_recover_again() {
     let server = MockServer::start(update_conversation());
     let fixture = Fixture::new(false);
@@ -792,6 +872,23 @@ fn persisted_session_state(home: &Path) -> Option<serde_json::Value> {
                 == Some("json")
         })?;
     serde_json::from_slice(&fs::read(snapshot.path()).ok()?).ok()
+}
+
+fn session_snapshot(home: &Path) -> Option<PathBuf> {
+    let sessions = home.join("hrdr").join("sessions");
+    for cwd in fs::read_dir(sessions).ok()? {
+        let cwd = cwd.ok()?;
+        if !cwd.file_type().ok()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(cwd.path()).ok()? {
+            let path = entry.ok()?.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn session_open_lock(home: &Path) -> Option<PathBuf> {

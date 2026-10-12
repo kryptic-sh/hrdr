@@ -143,6 +143,61 @@ const HANDOFF_RECOVERY_RETRY_DELAY: std::time::Duration = std::time::Duration::f
 const HANDOFF_RECOVERY_RETRY_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
+#[cfg(feature = "test-support")]
+async fn handoff_recovery_retry_test_barrier() {
+    let (Some(marker), Some(release)) = (
+        std::env::var_os("HRDR_TEST_HANDOFF_RETRY_MARKER"),
+        std::env::var_os("HRDR_TEST_HANDOFF_RETRY_RELEASE"),
+    ) else {
+        return;
+    };
+    let marker = std::path::PathBuf::from(marker);
+    let release = std::path::PathBuf::from(release);
+    assert!(
+        !marker.exists(),
+        "handoff retry test marker already exists: {}",
+        marker.display()
+    );
+    std::fs::write(&marker, b"snapshot retry reached").expect("write handoff retry test marker");
+    while !release.exists() {
+        tokio::time::sleep(HANDOFF_RECOVERY_RETRY_DELAY).await;
+    }
+}
+
+fn can_retry_handoff_recovery(
+    cwd: &str,
+    id: &str,
+    source: Option<hrdr_tools::ProcessLease>,
+    deadline: std::time::Instant,
+) -> bool {
+    source.is_some_and(|source| {
+        std::time::Instant::now() < deadline
+            && matches!(
+                hrdr_tools::process_lease_liveness(source),
+                hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced
+            )
+            && hrdr_agent::HandoffJournal::claimable_source(cwd, id)
+                .is_ok_and(|claimable| claimable == Some(source))
+    })
+}
+
+fn can_retry_snapshot_io_handoff_recovery(
+    cwd: &str,
+    id: &str,
+    source: Option<hrdr_tools::ProcessLease>,
+    deadline: std::time::Instant,
+) -> bool {
+    source.is_some_and(|source| {
+        std::time::Instant::now() < deadline
+            && matches!(
+                hrdr_tools::process_lease_liveness(source),
+                hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced
+            )
+            && hrdr_agent::HandoffJournal::has_claimable_source_without_snapshot(cwd, id, source)
+                .unwrap_or(false)
+    })
+}
+
 pub async fn run_handoff_recovery(
     config: AgentConfig,
     mut ui: hrdr_app::UiConfig,
@@ -164,17 +219,16 @@ pub async fn run_handoff_recovery(
         ) {
             Ok(recovery) => break recovery,
             Err(hrdr_agent::OpenError::Busy { .. })
-                if source.is_some_and(|source| {
-                    std::time::Instant::now() < deadline
-                        && matches!(
-                            hrdr_tools::process_lease_liveness(source),
-                            hrdr_tools::ProcessLiveness::Dead
-                                | hrdr_tools::ProcessLiveness::Replaced
-                        )
-                        && hrdr_agent::HandoffJournal::claimable_source(&cwd, id)
-                            .is_ok_and(|claimable| claimable == Some(source))
-                }) =>
+                if can_retry_handoff_recovery(&cwd, id, source, deadline) =>
             {
+                tokio::time::sleep(HANDOFF_RECOVERY_RETRY_DELAY).await;
+            }
+            Err(hrdr_agent::OpenError::Load(error))
+                if hrdr_agent::HandoffJournal::is_transient_snapshot_io_error(&error)
+                    && can_retry_snapshot_io_handoff_recovery(&cwd, id, source, deadline) =>
+            {
+                #[cfg(feature = "test-support")]
+                handoff_recovery_retry_test_barrier().await;
                 tokio::time::sleep(HANDOFF_RECOVERY_RETRY_DELAY).await;
             }
             Err(error) => return Err(error.into()),

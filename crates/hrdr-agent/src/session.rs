@@ -1482,7 +1482,11 @@ impl Session {
         .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
         let session = match Self::load_path(&path, unix_style_paths) {
             Ok(session) => session,
-            Err(error) => return Err(OpenError::Load(error)),
+            Err(error) => {
+                return Err(OpenError::Load(crate::handoff_journal::snapshot_io_error(
+                    error,
+                )));
+            }
         };
         if session.state.cwd != cwd || session.state.id.as_deref() != Some(id.as_str()) {
             return Err(OpenError::Load(anyhow::anyhow!(
