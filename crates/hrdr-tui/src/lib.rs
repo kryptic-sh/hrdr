@@ -139,6 +139,10 @@ pub fn discover_handoff_recovery(config: &AgentConfig) -> Result<Option<String>>
     .map_err(anyhow::Error::from)
 }
 
+const HANDOFF_RECOVERY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const HANDOFF_RECOVERY_RETRY_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
 pub async fn run_handoff_recovery(
     config: AgentConfig,
     mut ui: hrdr_app::UiConfig,
@@ -149,14 +153,33 @@ pub async fn run_handoff_recovery(
 ) -> Result<()> {
     ui.auto_resume = false;
     let cwd = config.cwd.to_string_lossy();
-    let recovery = hrdr_agent::Session::recover_handoff(
-        &cwd,
-        id,
-        config.unix_style_paths,
-        source,
-        app::validate_handoff_payload,
-    )
-    .map_err(anyhow::Error::from)?;
+    let deadline = std::time::Instant::now() + HANDOFF_RECOVERY_RETRY_WINDOW;
+    let recovery = loop {
+        match hrdr_agent::Session::recover_handoff(
+            &cwd,
+            id,
+            config.unix_style_paths,
+            source,
+            app::validate_handoff_payload,
+        ) {
+            Ok(recovery) => break recovery,
+            Err(hrdr_agent::OpenError::Busy { .. })
+                if source.is_some_and(|source| {
+                    std::time::Instant::now() < deadline
+                        && matches!(
+                            hrdr_tools::process_lease_liveness(source),
+                            hrdr_tools::ProcessLiveness::Dead
+                                | hrdr_tools::ProcessLiveness::Replaced
+                        )
+                        && hrdr_agent::HandoffJournal::claimable_source(&cwd, id)
+                            .is_ok_and(|claimable| claimable == Some(source))
+                }) =>
+            {
+                tokio::time::sleep(HANDOFF_RECOVERY_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
 
     let _guard = TerminalGuard::enter()?;
     let backend = cursor_backend::CursorBackend::new(CrosstermBackend::new(stdout()));

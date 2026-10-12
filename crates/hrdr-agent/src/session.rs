@@ -1460,7 +1460,16 @@ impl Session {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let id = sanitize_name(id);
         let lock = match source {
-            Some(source) => acquire_handoff_open_lock(dir, &id, source),
+            Some(source) => {
+                let claimable_source =
+                    crate::HandoffJournal::claimable_source(cwd, &id).map_err(OpenError::Load)?;
+                if claimable_source != Some(source) {
+                    return Err(OpenError::Load(anyhow::anyhow!(
+                        "no matching claimable committed handoff"
+                    )));
+                }
+                acquire_handoff_open_lock(dir, &id, source)
+            }
             None => {
                 let source = crate::HandoffJournal::claimable_source(cwd, &id)
                     .map_err(OpenError::Load)?
@@ -3230,6 +3239,50 @@ mod tests {
             assert_eq!(
                 Session::discover_handoff(&cwd, true, |_, _| Ok(())).unwrap(),
                 Some("handoff".to_string())
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_refuses_a_different_dead_checkpoint_source() {
+        with_test_env(|tmp| {
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let cwd = project.to_str().unwrap().to_string();
+            Session::new(state("Handoff", &cwd))
+                .save("handoff", true)
+                .unwrap();
+            let checkpoint_source = hrdr_tools::ProcessLease {
+                pid: u32::MAX - 1,
+                created: 1,
+            };
+            let coordinator_source = hrdr_tools::ProcessLease {
+                pid: u32::MAX - 2,
+                created: 2,
+            };
+            let dir = session_dir(&cwd);
+            let lock = acquire_existing_open_lock(&dir, "handoff").unwrap();
+            let journal = crate::HandoffJournal::open(&cwd, "handoff", &lock).unwrap();
+            journal
+                .append_for_source(1, crate::HandoffState::Commit, checkpoint_source, b"{}")
+                .unwrap();
+            drop(lock);
+
+            let error = Session::recover_handoff(
+                &cwd,
+                "handoff",
+                true,
+                Some(coordinator_source),
+                |_, _| Ok::<_, anyhow::Error>(()),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("matching claimable"));
+            assert!(
+                crate::HandoffJournal::claimable_source(&cwd, "handoff")
+                    .unwrap()
+                    .is_some(),
+                "a mismatched coordinator must not claim the checkpoint"
             );
         });
     }

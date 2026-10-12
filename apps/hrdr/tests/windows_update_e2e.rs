@@ -386,6 +386,10 @@ impl Fixture {
     fn session_lock_diagnostic(&self) -> String {
         session_lock_diagnostic(&self.home)
     }
+
+    fn source_open_lock(&self) -> PathBuf {
+        wait_until("source session open-lock", || session_open_lock(&self.home))
+    }
 }
 
 struct Session {
@@ -565,6 +569,42 @@ fn update_installs_default_cargo_binary_and_recovers_once() {
             .is_some_and(|messages| !messages.is_empty())
     );
     fixture.assert_checkout_clean("recovered continuation");
+}
+
+#[test]
+#[ignore = "replaces an executable; run only in Windows release CI"]
+fn recovery_retries_a_dead_source_lock_past_initial_acquisition_window() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const HOLD_PAST_INITIAL_WINDOW: Duration = Duration::from_secs(35);
+
+    let server = MockServer::start(update_conversation());
+    let fixture = Fixture::new(false);
+    let mut session = fixture.start(&server);
+    session.wait_for("mock-model");
+    session.send("install update\r");
+    wait_until("tool-result continuation before handoff", || {
+        (server.chat_bodies().len() == 5 && session.screen().contains("turn-after-update"))
+            .then_some(())
+    });
+    let source_lock = fixture.source_open_lock();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&source_lock)
+        .expect("hold source lock until the original retry window expires");
+    let _ = session.wait_for_exit(&fixture);
+
+    std::thread::sleep(HOLD_PAST_INITIAL_WINDOW);
+    drop(held);
+
+    wait_for_recovery(&fixture, &server, &session);
+    assert_eq!(
+        server.chat_bodies().len(),
+        7,
+        "the coordinator-attested checkpoint must recover once after the source lock clears"
+    );
 }
 
 #[test]
@@ -752,6 +792,27 @@ fn persisted_session_state(home: &Path) -> Option<serde_json::Value> {
                 == Some("json")
         })?;
     serde_json::from_slice(&fs::read(snapshot.path()).ok()?).ok()
+}
+
+fn session_open_lock(home: &Path) -> Option<PathBuf> {
+    let sessions = home.join("hrdr").join("sessions");
+    for cwd in fs::read_dir(sessions).ok()? {
+        let cwd = cwd.ok()?;
+        if !cwd.file_type().ok()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(cwd.path()).ok()? {
+            let path = entry.ok()?.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".open.lock"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn session_lock_diagnostic(home: &Path) -> String {
