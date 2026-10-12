@@ -145,6 +145,7 @@ pub async fn run_handoff_recovery(
     logo: &'static str,
     id: &str,
     update_failure: Option<&str>,
+    source: Option<hrdr_tools::ProcessLease>,
 ) -> Result<()> {
     ui.auto_resume = false;
     let cwd = config.cwd.to_string_lossy();
@@ -152,6 +153,7 @@ pub async fn run_handoff_recovery(
         &cwd,
         id,
         config.unix_style_paths,
+        source,
         app::validate_handoff_payload,
     )
     .map_err(anyhow::Error::from)?;

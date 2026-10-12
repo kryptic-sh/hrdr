@@ -556,13 +556,19 @@ impl UpdateFailure {
     }
 }
 
-fn handoff_recovery_arg() -> Option<Result<(String, Option<UpdateFailure>)>> {
+type HandoffRecoveryArgs = (
+    String,
+    Option<UpdateFailure>,
+    Option<hrdr_tools::ProcessLease>,
+);
+
+fn handoff_recovery_arg() -> Option<Result<HandoffRecoveryArgs>> {
     handoff_recovery_arg_from(std::env::args_os().skip(1))
 }
 
 fn handoff_recovery_arg_from(
     mut argv: impl Iterator<Item = std::ffi::OsString>,
-) -> Option<Result<(String, Option<UpdateFailure>)>> {
+) -> Option<Result<HandoffRecoveryArgs>> {
     if argv.next()?.as_os_str() != "__recover-handoff" {
         return None;
     }
@@ -572,23 +578,43 @@ fn handoff_recovery_arg_from(
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("__recover-handoff requires a session id"))?;
-        let update_failure = match argv.next() {
-            None => None,
-            Some(flag) if flag == "--update-failure" => {
-                let value = argv
-                    .next()
-                    .and_then(|value| value.into_string().ok())
-                    .and_then(|value| UpdateFailure::parse(&value))
-                    .ok_or_else(|| anyhow::anyhow!("invalid __recover-handoff update failure"))?;
-                Some(value)
+        let mut update_failure = None;
+        let mut source = None;
+        while let Some(flag) = argv.next() {
+            match flag.to_str() {
+                Some("--update-failure") if update_failure.is_none() => {
+                    update_failure = Some(
+                        argv.next()
+                            .and_then(|value| value.into_string().ok())
+                            .and_then(|value| UpdateFailure::parse(&value))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("invalid __recover-handoff update failure")
+                            })?,
+                    );
+                }
+                Some("--source-lease") if source.is_none() => {
+                    let pid = argv
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .and_then(|value| value.parse().ok())
+                        .filter(|pid| *pid != 0)
+                        .ok_or_else(|| anyhow::anyhow!("invalid __recover-handoff source pid"))?;
+                    let created = argv
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .and_then(|value| value.parse().ok())
+                        .filter(|created| *created != 0)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("invalid __recover-handoff source creation")
+                        })?;
+                    source = Some(hrdr_tools::ProcessLease { pid, created });
+                }
+                _ => anyhow::bail!(
+                    "__recover-handoff accepts --update-failure STATUS and --source-lease PID CREATED"
+                ),
             }
-            Some(_) => anyhow::bail!("__recover-handoff accepts only --update-failure STATUS"),
-        };
-        anyhow::ensure!(
-            argv.next().is_none(),
-            "__recover-handoff accepts one session id and optional --update-failure STATUS"
-        );
-        Ok((id, update_failure))
+        }
+        Ok((id, update_failure, source))
     })())
 }
 
@@ -628,7 +654,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(recovery) = handoff_recovery_arg() {
-        let (id, update_failure) = recovery?;
+        let (id, update_failure, source) = recovery?;
         let (mut config, diagnostics) = AgentConfig::load_diagnosed();
         if let Some(message) = diagnostics.error_message() {
             anyhow::bail!(message);
@@ -641,6 +667,7 @@ async fn main() -> Result<()> {
             LOGO_ART,
             &id,
             update_failure.map(UpdateFailure::as_str),
+            source,
         )
         .await;
     }
@@ -969,7 +996,7 @@ async fn main() -> Result<()> {
     if cli.command.is_none()
         && let Some(id) = hrdr_tui::discover_handoff_recovery(&config)?
     {
-        return hrdr_tui::run_handoff_recovery(config, ui, LOGO_ART, &id, None).await;
+        return hrdr_tui::run_handoff_recovery(config, ui, LOGO_ART, &id, None, None).await;
     }
 
     match cli.command {
@@ -1962,7 +1989,7 @@ mod cli_tests {
             handoff_recovery_arg_from(args(&["__recover-handoff", "saved-session"]))
                 .transpose()
                 .unwrap(),
-            Some(("saved-session".to_string(), None))
+            Some(("saved-session".to_string(), None, None))
         );
         assert_eq!(
             handoff_recovery_arg_from(args(&[
@@ -1970,12 +1997,19 @@ mod cli_tests {
                 "saved-session",
                 "--update-failure",
                 "install_failed",
+                "--source-lease",
+                "123",
+                "456",
             ]))
             .transpose()
             .unwrap(),
             Some((
                 "saved-session".to_string(),
-                Some(UpdateFailure::InstallFailed)
+                Some(UpdateFailure::InstallFailed),
+                Some(hrdr_tools::ProcessLease {
+                    pid: 123,
+                    created: 456,
+                }),
             ))
         );
         assert!(handoff_recovery_arg_from(args(&["/new"])).is_none());

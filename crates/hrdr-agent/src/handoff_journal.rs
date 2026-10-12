@@ -251,7 +251,7 @@ struct JournalScan {
 pub struct HandoffJournal<'a> {
     path: PathBuf,
     session_hash: [u8; 32],
-    _lock: &'a SessionLock,
+    _lock: Option<&'a SessionLock>,
     append_lock: Arc<Mutex<()>>,
 }
 
@@ -266,6 +266,37 @@ impl<'a> HandoffJournal<'a> {
         Ok(requires_recovery_state(
             journal.scan()?.last.map(|record| record.state),
         ))
+    }
+
+    /// Inspect the current saved snapshot's newest committed checkpoint before its
+    /// open-lock is acquired. Only a checksum- and snapshot-bound record from a
+    /// certainly dead or replaced source yields a lease.
+    pub fn claimable_source(cwd: &str, id: &str) -> Result<Option<hrdr_tools::ProcessLease>> {
+        let id = sanitize_name(id);
+        let session_path = session_file_path(cwd, &id);
+        let session_hash = saved_session_hash(&session_path, &id)?;
+        let path = session_path.with_file_name(format!("{id}.handoff"));
+        let journal = Self {
+            append_lock: journal_lock(&path),
+            path,
+            session_hash,
+            _lock: None,
+        };
+        let Some(record) = journal.scan()?.last else {
+            return Ok(None);
+        };
+        if !claimable_state(record.state) {
+            return Ok(None);
+        }
+        match hrdr_tools::process_lease_liveness(record.source) {
+            hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced => {
+                Ok(Some(record.source))
+            }
+            hrdr_tools::ProcessLiveness::Live => bail!("handoff source owner is still live"),
+            hrdr_tools::ProcessLiveness::Unknown => {
+                bail!("handoff source owner liveness could not be determined")
+            }
+        }
     }
 
     /// Open the journal for an existing saved session.
@@ -288,7 +319,7 @@ impl<'a> HandoffJournal<'a> {
             append_lock: journal_lock(&path),
             path,
             session_hash: hash,
-            _lock: lock,
+            _lock: Some(lock),
         })
     }
 
@@ -320,7 +351,7 @@ impl<'a> HandoffJournal<'a> {
             append_lock: journal_lock(&path),
             path,
             session_hash: Sha256::digest(bytes).into(),
-            _lock: lock,
+            _lock: Some(lock),
         })
     }
 
@@ -329,12 +360,22 @@ impl<'a> HandoffJournal<'a> {
     /// The source identity is captured from this process, rather than accepted from
     /// the caller. This prevents one process from writing a claim on another's behalf.
     pub fn append(&self, epoch: u64, state: HandoffState, payload: &[u8]) -> Result<()> {
+        let source = hrdr_tools::current_process_lease()
+            .context("process-instance handoff journals are unsupported on this platform")?;
+        self.append_from_source(epoch, state, source, payload)
+    }
+
+    fn append_from_source(
+        &self,
+        epoch: u64,
+        state: HandoffState,
+        source: hrdr_tools::ProcessLease,
+        payload: &[u8],
+    ) -> Result<()> {
         let _append_guard = self
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("handoff journal append lock is poisoned"))?;
-        let source = hrdr_tools::current_process_lease()
-            .context("process-instance handoff journals are unsupported on this platform")?;
         let frame = self.frame(epoch, state, source, payload)?;
         let scan = self.scan()?;
         let mut file = OpenOptions::new()
@@ -355,6 +396,17 @@ impl<'a> HandoffJournal<'a> {
         file.flush()?;
         file.sync_all()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_for_source(
+        &self,
+        epoch: u64,
+        state: HandoffState,
+        source: hrdr_tools::ProcessLease,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.append_from_source(epoch, state, source, payload)
     }
 
     /// Claim the newest committed checkpoint after its source lease is certainly gone.
@@ -652,7 +704,7 @@ mod tests {
             append_lock: journal_lock(&path),
             path,
             session_hash: [7; 32],
-            _lock: Box::leak(Box::new(SessionLock::test_unbacked())),
+            _lock: Some(Box::leak(Box::new(SessionLock::test_unbacked()))),
         }
     }
 

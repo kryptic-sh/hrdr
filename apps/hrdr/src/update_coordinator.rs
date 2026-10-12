@@ -330,6 +330,7 @@ fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> 
             &request.session_id,
             &request.recovery_cwd,
             Some(failure.as_str()),
+            lease,
         ) {
             failure
         } else {
@@ -361,6 +362,7 @@ fn run_windows(request: &Request, checkout_root: &Path, staging_root: &Path) -> 
         &request.session_id,
         &request.recovery_cwd,
         None,
+        lease,
     ) {
         Status::Launched
     } else {
@@ -612,10 +614,16 @@ fn launch(
     session_id: &str,
     recovery_cwd: &Path,
     update_failure: Option<&str>,
+    source: hrdr_tools::ProcessLease,
 ) -> bool {
     let mut command = Command::new(binary);
     command.current_dir(recovery_cwd);
     command.args(["__recover-handoff", session_id]);
+    command.args([
+        "--source-lease",
+        &source.pid.to_string(),
+        &source.created.to_string(),
+    ]);
     if let Some(update_failure) = update_failure {
         command.args(["--update-failure", update_failure]);
     }
@@ -1253,15 +1261,19 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "@echo off\r\necho %cd%^|%1^|%2>>\"{}\"\r\n",
+                "@echo off\r\necho %cd%^|%1^|%2^|%3^|%4^|%5>>\"{}\"\r\n",
                 marker.display()
             ),
         )
         .unwrap();
 
-        assert!(launch(&script, "saved-session", temp.path(), None));
+        let source = hrdr_tools::ProcessLease {
+            pid: 123,
+            created: 456,
+        };
+        assert!(launch(&script, "saved-session", temp.path(), None, source));
         let expected = format!(
-            "{}|__recover-handoff|saved-session\r\n",
+            "{}|__recover-handoff|saved-session|--source-lease|123|456\r\n",
             temp.path().display()
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

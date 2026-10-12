@@ -647,6 +647,9 @@ pub struct SessionLock {
     /// PID written into the lock file at acquire — the only identity that may
     /// release this lock.
     pid: u32,
+    /// Windows process creation time, when available. Together with `pid` this
+    /// prevents a recycled PID from authorizing removal of a later holder's lock.
+    created: Option<u64>,
 }
 
 impl SessionLock {
@@ -674,16 +677,30 @@ impl SessionLock {
             session_id: String::new(),
             backed: false,
             pid: 0,
+            created: None,
         }
     }
 }
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        // Remove the lock only if we still own it: a lock this process was
-        // reaped from and another reclaimed must survive its original holder's
-        // Drop (see `store_lock::remove_lock_file_if_owned` for the race).
-        crate::store_lock::remove_lock_file_if_owned(&self.lock_path, self.pid);
+        remove_open_lock_file_if_owned(&self.lock_path, self.pid, self.created);
+    }
+}
+
+fn remove_open_lock_file_if_owned(lock_path: &Path, pid: u32, created: Option<u64>) {
+    let owned = std::fs::read_to_string(lock_path)
+        .ok()
+        .and_then(|content| {
+            let mut parts = content.split_whitespace();
+            let lock_pid: u32 = parts.next()?.parse().ok()?;
+            let _started: u64 = parts.next()?.parse().ok()?;
+            let lock_created = parts.next().and_then(|value| value.parse().ok());
+            Some(lock_pid == pid && lock_created == created)
+        })
+        .unwrap_or(false);
+    if owned {
+        let _ = std::fs::remove_file(lock_path);
     }
 }
 
@@ -713,6 +730,30 @@ fn read_open_lock_owner(path: &Path) -> SessionBusy {
     SessionBusy { pid, started }
 }
 
+fn reclaim_handoff_source_lock(
+    path: &Path,
+    source: hrdr_tools::ProcessLease,
+    require_exact_format: bool,
+) -> bool {
+    if !matches!(
+        hrdr_tools::process_lease_liveness(source),
+        hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced
+    ) {
+        return false;
+    }
+    let owned_by_source = std::fs::read_to_string(path).ok().is_some_and(|content| {
+        let mut parts = content.split_whitespace();
+        let matches_source = parts.next().and_then(|value| value.parse().ok()) == Some(source.pid)
+            && parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some()
+            && parts.next().and_then(|value| value.parse().ok()) == Some(source.created);
+        matches_source && (!require_exact_format || parts.next().is_none())
+    });
+    owned_by_source && std::fs::remove_file(path).is_ok()
+}
+
 /// Acquire the per-session open-lock for `id` in `dir`.
 ///
 /// `O_EXCL`-creates `.{id}.open.lock` and writes `PID TIMESTAMP` (the exact
@@ -740,6 +781,8 @@ fn acquire_open_lock_mode(
     dir: &Path,
     id: &str,
     allow_degraded: bool,
+    handoff_source: Option<hrdr_tools::ProcessLease>,
+    require_exact_handoff_lock: bool,
 ) -> Result<SessionLock, SessionBusy> {
     let lock_path = open_lock_path(dir, id);
     for _ in 0..OPEN_LOCK_ACQUIRE_ATTEMPTS {
@@ -749,7 +792,12 @@ fn acquire_open_lock_mode(
             .open(&lock_path)
         {
             Ok(mut f) => {
-                let content = format!("{} {}", std::process::id(), hrdr_tools::unix_now());
+                let lease = hrdr_tools::current_process_lease();
+                let pid = std::process::id();
+                let content = match lease {
+                    Some(lease) => format!("{pid} {} {}", hrdr_tools::unix_now(), lease.created),
+                    None => format!("{pid} {}", hrdr_tools::unix_now()),
+                };
                 let _ = f.write_all(content.as_bytes());
                 let _ = f.flush();
                 drop(f);
@@ -757,12 +805,18 @@ fn acquire_open_lock_mode(
                     lock_path,
                     session_id: sanitize_name(id),
                     backed: true,
-                    pid: std::process::id(),
+                    pid,
+                    created: lease.map(|lease| lease.created),
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS) {
-                    // Dead-PID / abandoned lock: reap and retry the O_EXCL create.
+                if handoff_source.is_some_and(|source| {
+                    reclaim_handoff_source_lock(&lock_path, source, require_exact_handoff_lock)
+                }) || (!require_exact_handoff_lock
+                    && crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS))
+                {
+                    // A verified dead handoff source, or a dead abandoned lock:
+                    // reap it and retry the O_EXCL create.
                     let _ = std::fs::remove_file(&lock_path);
                     continue;
                 }
@@ -783,6 +837,7 @@ fn acquire_open_lock_mode(
                     session_id: sanitize_name(id),
                     backed: false,
                     pid: std::process::id(),
+                    created: hrdr_tools::current_process_lease().map(|lease| lease.created),
                 });
             }
             Err(_) => return Err(SessionBusy { pid: 0, started: 0 }),
@@ -794,12 +849,28 @@ fn acquire_open_lock_mode(
 /// Acquire the open-lock for an already-saved session. Lock creation failures are
 /// refusals because returning an unbacked guard would permit concurrent writers.
 fn acquire_existing_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBusy> {
-    acquire_open_lock_mode(dir, id, false)
+    acquire_open_lock_mode(dir, id, false, None, false)
+}
+
+fn acquire_handoff_open_lock(
+    dir: &Path,
+    id: &str,
+    source: hrdr_tools::ProcessLease,
+) -> Result<SessionLock, SessionBusy> {
+    acquire_open_lock_mode(dir, id, false, Some(source), false)
+}
+
+fn acquire_discovered_handoff_open_lock(
+    dir: &Path,
+    id: &str,
+    source: hrdr_tools::ProcessLease,
+) -> Result<SessionLock, SessionBusy> {
+    acquire_open_lock_mode(dir, id, false, Some(source), true)
 }
 
 /// Acquire the per-session lock while creating a new snapshot.
 pub fn acquire_open_lock(dir: &Path, id: &str) -> Result<SessionLock, SessionBusy> {
-    acquire_open_lock_mode(dir, id, true)
+    acquire_open_lock_mode(dir, id, true, None, false)
 }
 
 /// Acquire the open-lock for session `id` living under `cwd`'s directory.
@@ -1322,7 +1393,12 @@ impl Session {
             if !path.is_file() {
                 continue;
             }
-            let lock = acquire_existing_open_lock(&dir, id)
+            let Some(source) =
+                crate::HandoffJournal::claimable_source(cwd, id).map_err(OpenError::Load)?
+            else {
+                continue;
+            };
+            let lock = acquire_discovered_handoff_open_lock(&dir, id, source)
                 .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
             let session = Self::load_path(&path, unix_style_paths).map_err(OpenError::Load)?;
             if session.state.cwd != cwd || session.state.id.as_deref() != Some(id) {
@@ -1354,6 +1430,7 @@ impl Session {
         cwd: &str,
         id: &str,
         unix_style_paths: bool,
+        source: Option<hrdr_tools::ProcessLease>,
         validate: F,
     ) -> Result<HandoffRecovery<T>, OpenError>
     where
@@ -1362,8 +1439,18 @@ impl Session {
         let path = session_file_path(cwd, id);
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let id = sanitize_name(id);
-        let lock = acquire_existing_open_lock(dir, &id)
-            .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
+        let lock = match source {
+            Some(source) => acquire_handoff_open_lock(dir, &id, source),
+            None => {
+                let source = crate::HandoffJournal::claimable_source(cwd, &id)
+                    .map_err(OpenError::Load)?
+                    .ok_or_else(|| {
+                        OpenError::Load(anyhow::anyhow!("no claimable committed handoff"))
+                    })?;
+                acquire_discovered_handoff_open_lock(dir, &id, source)
+            }
+        }
+        .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
         let session = match Self::load_path(&path, unix_style_paths) {
             Ok(session) => session,
             Err(error) => return Err(OpenError::Load(error)),
@@ -2289,6 +2376,7 @@ mod tests {
                 session_id: "handoff".to_string(),
                 backed: false,
                 pid: std::process::id(),
+                created: hrdr_tools::current_process_lease().map(|lease| lease.created),
             };
             assert!(crate::HandoffJournal::open(&cwd, "handoff", &unbacked).is_err());
         });
@@ -3089,6 +3177,45 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn discovery_reclaims_a_fresh_dead_committed_source_lock() {
+        with_test_env(|tmp| {
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let cwd = project.to_str().unwrap().to_string();
+            Session::new(state("Handoff", &cwd))
+                .save("handoff", true)
+                .unwrap();
+            let source = hrdr_tools::ProcessLease {
+                pid: u32::MAX - 1,
+                created: 1,
+            };
+            let dir = session_dir(&cwd);
+            let lock = acquire_existing_open_lock(&dir, "handoff").unwrap();
+            let journal = crate::HandoffJournal::open(&cwd, "handoff", &lock).unwrap();
+            journal
+                .append_for_source(1, crate::HandoffState::Commit, source, b"{}")
+                .unwrap();
+            drop(lock);
+            std::fs::write(
+                dir.join(".handoff.open.lock"),
+                format!(
+                    "{} {} {}",
+                    source.pid,
+                    hrdr_tools::unix_now(),
+                    source.created
+                ),
+            )
+            .unwrap();
+
+            assert_eq!(
+                Session::discover_handoff(&cwd, true, |_, _| Ok(())).unwrap(),
+                Some("handoff".to_string())
+            );
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn discovery_blocks_a_live_committed_handoff() {
         with_test_env(|tmp| {
             let project = tmp.path().join("project");
@@ -3273,6 +3400,7 @@ mod tests {
             session_id: "never-created".to_string(),
             backed: false,
             pid: std::process::id(),
+            created: hrdr_tools::current_process_lease().map(|lease| lease.created),
         };
         drop(guard);
         assert!(
@@ -3309,6 +3437,31 @@ mod tests {
         let acquired = acquire_existing_open_lock(dir.path(), "chat");
         cleanup.join().unwrap();
         let lock = acquired.expect("delete-pending cleanup is retried");
+        assert!(lock.is_backed());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handoff_recovery_reclaims_a_verified_dead_source_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".chat.open.lock");
+        let source = hrdr_tools::ProcessLease {
+            pid: u32::MAX - 1,
+            created: 1,
+        };
+        std::fs::write(
+            &lock_path,
+            format!(
+                "{} {} {}",
+                source.pid,
+                hrdr_tools::unix_now(),
+                source.created
+            ),
+        )
+        .unwrap();
+
+        let lock = acquire_handoff_open_lock(dir.path(), "chat", source)
+            .expect("a dead coordinator source lock is reclaimed without aging");
         assert!(lock.is_backed());
     }
 
