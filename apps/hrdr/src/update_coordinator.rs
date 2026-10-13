@@ -72,12 +72,17 @@ impl PreparedWindowsUpdateCoordinator {
             checkout_root.is_dir(),
             "update checkout root is not a directory"
         );
-        let recovery_cwd = canonical_absolute(recovery_cwd)
+        // The saved session is keyed by the exact cwd string it was saved under,
+        // so recovery must start in that same spelling: canonicalizing would turn
+        // an 8.3 short name or a junction into a different session directory.
+        // The canonical form is only used to check containment.
+        let canonical_recovery_cwd = canonical_absolute(recovery_cwd)
             .map_err(|_| anyhow::anyhow!("recovery cwd is not a canonical absolute path"))?;
         anyhow::ensure!(
-            recovery_cwd.starts_with(&checkout_root),
+            canonical_recovery_cwd.starts_with(&checkout_root),
             "recovery cwd escapes the admitted checkout"
         );
+        let recovery_cwd = recovery_cwd.to_path_buf();
         anyhow::ensure!(valid_text(session_id, 128), "update session id is invalid");
         anyhow::ensure!(is_full_commit(expected_commit), "update commit is invalid");
         anyhow::ensure!(
@@ -919,11 +924,30 @@ mod tests {
             hrdr_agent::UpdateOperationId::new(format!("prepared-request-{}", std::process::id()))
                 .unwrap();
         let checkout = AdmittedCheckout::for_test(canonical_absolute(&root).unwrap(), commit);
+        // A junction spells the checkout differently from its canonical path, as
+        // an 8.3 short name does on CI runners. The session was saved under that
+        // spelling, so the request must carry it unchanged.
+        let alias = temp.path().join("checkout-alias");
+        let junction = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&alias)
+            .arg(&root)
+            .output()
+            .unwrap();
+        assert!(junction.status.success(), "mklink /J failed: {junction:?}");
+        assert_eq!(canonical_absolute(&alias), canonical_absolute(&root));
+        assert_ne!(
+            canonical_absolute(&alias).unwrap(),
+            alias,
+            "the alias must not already be the canonical spelling"
+        );
         let prepared = PreparedWindowsUpdateCoordinator::prepare(
             "saved-session",
             &operation,
             &checkout,
-            &root,
+            &alias,
         )
         .unwrap();
 
@@ -931,6 +955,11 @@ mod tests {
         let request = parse_request(&fs::read(&prepared.request_path).unwrap()).unwrap();
         let lease = hrdr_tools::current_process_lease().unwrap();
         assert_eq!(request.session_id, "saved-session");
+        assert_eq!(request.recovery_cwd, alias);
+        assert_eq!(
+            validate_request_path(&prepared.request_path, &request),
+            Ok(checkout.canonical_root().to_path_buf())
+        );
         assert_eq!(request.operation_id, operation.as_str());
         assert_eq!(request.source_pid, lease.pid);
         assert_eq!(request.source_created, lease.created);

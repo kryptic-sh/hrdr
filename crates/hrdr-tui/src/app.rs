@@ -3287,7 +3287,8 @@ impl App {
             return;
         };
         let request = self.pending_update.take().expect("checked above");
-        let recovery_cwd = self.dir_cwd.clone();
+        // Recovery reloads the session by the exact cwd string it is saved under.
+        let recovery_cwd = std::path::PathBuf::from(&self.state().cwd);
         self.update_preparing = true;
         let tx = self.tx.clone();
         tokio::spawn(async move {

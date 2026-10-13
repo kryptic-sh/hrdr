@@ -187,18 +187,21 @@ push each verified slice to `main` before proceeding to the next slice.
     approved: require the latest `push` CI run and latest attempt on `main` for
     the exact origin-repository hash, with verification and packaging jobs
     successful; only tag-only publishing jobs may be skipped. Manual and older
-    runs do not qualify. **Deferred 2026-10-12:** Windows CI runs `38207254188`
-    and `38211455090` still failed every self-update E2E recovery. The current
-    uncommitted persisted-session-cwd recovery attempt must not ship: review
-    found its TUI handoff test does not assert the exact `session_cwd`, and its
-    Windows alias E2E can pass without a distinct alias. Resume by adding those
-    conclusive assertions, rerunning the full Windows release E2E suite, then
-    pushing and confirming the exact CI job is green before declaring
-    self-update complete or cutting a release. The 2026-10-12 local gate also
-    failed independently in
-    `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`:
-    a writer timed out acquiring `auth.json.lock`; preserve and root-cause that
-    contention before treating a later self-update gate as green.
+    runs do not qualify. **Windows recovery cwd, fixed 2026-10-14:** CI runs
+    `38207254188` and `38211455090` failed every self-update E2E recovery
+    because the coordinator canonicalized the recovery cwd, so a session saved
+    under an 8.3 short name (`RUNNER~1`) was looked up under a different session
+    directory. The E2E fixture now launches through a junction so the alias case
+    runs on every machine. Without the fix it fails locally with the CI error;
+    with it, all five E2E tests pass locally. Confirm the exact CI job is green
+    before declaring self-update complete or cutting a release. Still open: the
+    2026-10-12 local gate failed independently in
+    `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`
+    (a writer timed out acquiring `auth.json.lock`); root-cause that contention
+    before treating a later gate as green. The ignored coordinator unit tests
+    (`prepared_request_is_accepted_by_the_strict_parser` and its siblings) need
+    an executable launched from `CARGO_HOME/bin` and are run by neither CI nor
+    the local gate, so the junction assertion added to that test is unexecuted.
 11. **Windows multiline-paste transport investigation — deferred branch.**
     Pending work is preserved and pushed at `wip/windows-paste-transport` commit
     `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY

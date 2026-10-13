@@ -12858,10 +12858,12 @@ async fn deferred_update_keeps_preexisting_drafts_editable_until_quiescent() {
     })
     .await;
     assert_eq!(prepared.load(Ordering::SeqCst), 1);
+    let session_cwd = h.app.state().cwd.clone();
+    assert!(!session_cwd.is_empty(), "the reserved session has a cwd");
     assert_eq!(
         *recovery_cwd.lock().unwrap(),
-        Some(h.app.dir_cwd.clone()),
-        "the coordinator receives the admitted TUI session cwd"
+        Some(std::path::PathBuf::from(&session_cwd)),
+        "the coordinator receives the exact saved-session cwd"
     );
     assert_eq!(launches.load(Ordering::SeqCst), 0);
     assert!(h.app.admitted_update.is_some());
@@ -12924,9 +12926,66 @@ async fn failed_update_preparation_leaves_no_success_evidence_and_releases_retry
     })
     .await;
     assert_eq!(prepared.load(Ordering::SeqCst), 1);
-    assert_eq!(*recovery_cwd.lock().unwrap(), Some(h.app.dir_cwd.clone()));
+    assert_eq!(
+        *recovery_cwd.lock().unwrap(),
+        Some(std::path::PathBuf::from(&h.app.state().cwd))
+    );
     h.app.commit_pending_update().await;
     assert_eq!(launches.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn update_prepared_for_one_cwd_does_not_commit_after_the_session_moves() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.reserve_session_id("moved update handoff");
+    h.app.await_saves().await;
+    let (sender, receiver) = crate::update_request_bridge();
+    h.app.update_requests = Some(receiver);
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let launches = Arc::new(AtomicUsize::new(0));
+    sender
+        .send(Box::new(TestDeferredUpdate {
+            prepared: prepared.clone(),
+            recovery_cwd: Arc::new(Mutex::new(None)),
+            launches: launches.clone(),
+        }))
+        .unwrap();
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.turn_handle = Some(tokio::spawn(std::future::pending()));
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    // A draft keeps the session nonquiescent, so the prepared update waits.
+    h.type_str("hold");
+    h.wait_for("update preparation", |msg| {
+        matches!(msg, TurnMsg::UpdatePrepared(Ok(_)))
+    })
+    .await;
+    assert_eq!(prepared.load(Ordering::SeqCst), 1);
+    assert!(h.app.admitted_update.is_some());
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    h.app.apply_cwd(elsewhere.path().to_path_buf());
+    h.app.autosave();
+    h.app.await_saves().await;
+    h.app.editor.set_content("");
+    h.app.commit_pending_update().await;
+
+    assert_eq!(
+        launches.load(Ordering::SeqCst),
+        0,
+        "no coordinator launched"
+    );
+    assert!(h.app.admitted_update.is_none());
+    assert!(!h.app.should_quit);
+    assert!(!h.app.handoff_gate);
+    assert!(
+        h.app
+            .toasts
+            .last_body()
+            .is_some_and(|body| body.starts_with("update handoff failed")),
+        "the refused handoff is reported"
+    );
 }
 
 #[cfg(windows)]

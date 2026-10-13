@@ -54,6 +54,10 @@ struct Fixture {
     home: PathBuf,
     cargo_home: PathBuf,
     checkout: PathBuf,
+    /// The checkout reached through a junction. hrdr is launched here, so the
+    /// saved session's cwd is spelled differently from its canonical path, as
+    /// an 8.3 short name does on CI runners.
+    launch_dir: PathBuf,
     expected_commit: String,
     git_log: PathBuf,
     cargo_log: PathBuf,
@@ -188,6 +192,28 @@ impl Fixture {
         let inherited_path = std::env::var_os("PATH").expect("PATH");
         let path = std::env::join_paths([bin.as_os_str(), inherited_path.as_os_str()])
             .expect("fixture PATH");
+        let launch_dir = root.path().join("checkout-alias");
+        let junction = Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&launch_dir)
+            .arg(&checkout)
+            .output()
+            .expect("create checkout junction");
+        assert!(junction.status.success(), "mklink /J failed: {junction:?}");
+        let canonical = fs::canonicalize(&launch_dir).expect("canonical checkout alias");
+        assert_eq!(
+            canonical,
+            fs::canonicalize(&checkout).expect("canonical checkout")
+        );
+        let unprefixed = canonical.to_string_lossy();
+        let unprefixed = unprefixed.strip_prefix(r"\\?\").unwrap_or(&unprefixed);
+        assert!(
+            !unprefixed.eq_ignore_ascii_case(&launch_dir.to_string_lossy()),
+            "the launch directory must be a distinct spelling of the checkout"
+        );
+
         let runtime = root.path().join("runtime");
         fs::create_dir_all(&runtime).expect("private runtime");
         let env = [
@@ -213,6 +239,7 @@ impl Fixture {
             home,
             cargo_home,
             checkout,
+            launch_dir,
             expected_commit: head,
             git_log,
             cargo_log,
@@ -344,7 +371,7 @@ impl Fixture {
             .expect("open ConPTY");
         let mut command = CommandBuilder::new(&self.installed);
         command.args(["--no-auto-resume", "--no-bell"]);
-        command.cwd(&self.checkout);
+        command.cwd(&self.launch_dir);
         command.env("TERM", "xterm-256color");
         command.env_remove("HRDR_MODEL");
         command.env_remove("HRDR_API_KEY");

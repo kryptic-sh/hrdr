@@ -45,6 +45,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session through a one-shot recovery continuation.
 - **Windows self-update installs through the default Cargo location.** Promotion
   failure recovers the committed session using the retained prior binary.
+  Recovery reopens the session under the exact working-directory spelling it was
+  saved with, so a checkout reached through an 8.3 short name or a junction
+  resumes instead of failing to find its session.
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,
