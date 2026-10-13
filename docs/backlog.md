@@ -122,19 +122,7 @@ push each verified slice to `main` before proceeding to the next slice.
    guardrails, quoting, timeouts, and process cleanup for each selected shell.
    Test discovery, priority, explicit selection, missing-shell errors, and
    prompt accuracy across the supported CI matrix.
-8. **Headless-first GUI testing guidelines.** Add guidance to hrdr's system
-   prompt for unit and end-to-end tests requiring graphical facilities: prefer
-   headless execution or an isolated graphical environment so tests do not open
-   windows, steal focus, or send input to the user's active desktop. Cover Linux
-   headless Sway/Wayland and Xvfb/X11, framework-native headless browser testing
-   across platforms, and verified Windows/macOS isolation techniques.
-   Distinguish genuinely headless tests from GUI tests requiring a dedicated
-   desktop/session or VM/CI runner; do not claim every native GUI framework can
-   run headlessly. Prefer non-windowed unit tests where they exercise the real
-   behavior. When interactive UI is unavoidable, require explicit permission
-   before running on the user's desktop and report the limitation. Validate
-   platform-specific instructions and add regression coverage for the guidance.
-9. **Watch-aware TODO nudges.** Let a TODO item explicitly reference the watch
+8. **Watch-aware TODO nudges.** Let a TODO item explicitly reference the watch
    job it is waiting for, so the harness can track the dependency. Suppress
    end-of-turn completion nudges for items blocked on a running watch and let
    the agent wait for its result. Continue nudging unrelated actionable TODOs.
@@ -145,78 +133,78 @@ push each verified slice to `main` before proceeding to the next slice.
    wording as a TODO-to-watch link; clarify whether TODO-to-TODO dependencies
    are additionally wanted before expanding the scope.
 
-10. **Self-update, restart, and turn continuation — requested 2026-10-09.**
-    Highest priority after finishing the current path-rendering slice, per the
-    user's clarification; take this before the other Windows backlog items. Add
-    a model tool for working on the hrdr codebase that installs hrdr through
-    Cargo, restarts the running application into the newly installed version,
-    and automatically resumes the same session and continues the interrupted
-    turn. Support the agent working on hrdr itself: install the exact
-    version/source revision it has tested, rather than silently fetching an
-    unrelated newer revision. Preserve session history, goals, TODOs, working
-    directory, and the continuation point durably before handing control to the
-    replacement process. Avoid replaying completed side-effecting tool calls or
-    recursively repeating the update on resume. Define handling for active child
-    tasks, watches, queued messages, and session locks; do not claim they
-    survive without a tested handoff/recovery mechanism. Handle Windows
-    executable-in-use replacement and terminal handoff as well as Unix restart
-    behavior. A failed build/install must leave the current instance usable; a
-    failed restart must leave a recoverable session and actionable diagnostics.
-    Approved on 2026-10-09: build the current clean working copy on `main`,
-    requiring its commit to match live `origin/main` and successful GitHub CI
-    for that exact hash in the origin repository (forks supported). Install into
-    the default user Cargo location. No permanent launcher: if Windows refuses
-    safe executable promotion, abort and keep the current instance usable. After
-    committed handoff, recover from durable state rather than letting both
-    processes continue. Resolve the detailed recovery protocol before
-    implementation. Test actual process replacement, version identity, automatic
-    turn continuation, exact goal/TODO preservation, and failure recovery on the
-    supported platform matrix. Completed first slice: `hrdr --build-info`
-    exposes compile-time version, full commit (or `unknown`), target, and
-    clean/dirty/unknown source state before startup config, trust, model, or
-    session initialization. It is diagnostic only, not installation
-    authorization. `hrdr update-check --json` now validates local cleanliness,
-    `main`, live origin-main equality, direct-fork lineage, and the exact
-    origin-repository CI run/job matrix before configuration/session startup. It
-    emits only sanitized fixed-status diagnostics and still does not install or
-    restart. Durable continuation is blocked on new, reviewed primitives:
-    session checkpoint validation while holding the ordinary session lock;
-    process-instance (not PID-only) ownership; anti-symlink journal storage; and
-    a cross-platform crash-durable record replacement API whose parent-directory
-    durability failures are surfaced. Do not add an update/restart surface until
-    those invariants have focused recovery tests. A best-effort foundation now
-    exists: an append-only checksummed, flushed journal binds a backed
-    session-lock holder to a parseable hashed saved checkpoint and recovers only
-    the newest validated frame. Sudden Windows power loss may lose or
-    ambiguously preserve the newest handoff; no update/restart surface may claim
-    otherwise. An internal coordinator now commits only an idle saved session
-    and rejects runtime queues, child tasks, watches, drafts, active turns, and
-    save errors. Hidden passive recovery now claims only dead-owner committed
-    checkpoints, restoring no queues and starting no runtime work. Interactive
-    Windows `update` now stages only after its tool turn ends, then uses one
-    attested recovery continuation; it still refuses queues, tasks, watches,
-    drafts, and active work. Windows CI now exercises isolated default-Cargo
-    installation, retained-old fallback recovery, and request reuse. Next
-    persist queues before broadening the handoff contract. CI eligibility is
-    approved: require the latest `push` CI run and latest attempt on `main` for
-    the exact origin-repository hash, with verification and packaging jobs
-    successful; only tag-only publishing jobs may be skipped. Manual and older
-    runs do not qualify. **Windows recovery cwd, fixed 2026-10-14:** CI runs
-    `38207254188` and `38211455090` failed every self-update E2E recovery
-    because the coordinator canonicalized the recovery cwd, so a session saved
-    under an 8.3 short name (`RUNNER~1`) was looked up under a different session
-    directory. The E2E fixture now launches through a junction so the alias case
-    runs on every machine. Without the fix it fails locally with the CI error;
-    with it, all five E2E tests pass locally. Confirm the exact CI job is green
-    before declaring self-update complete or cutting a release. Still open: the
-    2026-10-12 local gate failed independently in
-    `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`
-    (a writer timed out acquiring `auth.json.lock`); root-cause that contention
-    before treating a later gate as green. The ignored coordinator unit tests
-    (`prepared_request_is_accepted_by_the_strict_parser` and its siblings) need
-    an executable launched from `CARGO_HOME/bin` and are run by neither CI nor
-    the local gate, so the junction assertion added to that test is unexecuted.
-11. **Windows multiline-paste transport investigation — deferred branch.**
+9. **Self-update, restart, and turn continuation — requested 2026-10-09.**
+   Highest priority after finishing the current path-rendering slice, per the
+   user's clarification; take this before the other Windows backlog items. Add a
+   model tool for working on the hrdr codebase that installs hrdr through Cargo,
+   restarts the running application into the newly installed version, and
+   automatically resumes the same session and continues the interrupted turn.
+   Support the agent working on hrdr itself: install the exact version/source
+   revision it has tested, rather than silently fetching an unrelated newer
+   revision. Preserve session history, goals, TODOs, working directory, and the
+   continuation point durably before handing control to the replacement process.
+   Avoid replaying completed side-effecting tool calls or recursively repeating
+   the update on resume. Define handling for active child tasks, watches, queued
+   messages, and session locks; do not claim they survive without a tested
+   handoff/recovery mechanism. Handle Windows executable-in-use replacement and
+   terminal handoff as well as Unix restart behavior. A failed build/install
+   must leave the current instance usable; a failed restart must leave a
+   recoverable session and actionable diagnostics. Approved on 2026-10-09: build
+   the current clean working copy on `main`, requiring its commit to match live
+   `origin/main` and successful GitHub CI for that exact hash in the origin
+   repository (forks supported). Install into the default user Cargo location.
+   No permanent launcher: if Windows refuses safe executable promotion, abort
+   and keep the current instance usable. After committed handoff, recover from
+   durable state rather than letting both processes continue. Resolve the
+   detailed recovery protocol before implementation. Test actual process
+   replacement, version identity, automatic turn continuation, exact goal/TODO
+   preservation, and failure recovery on the supported platform matrix.
+   Completed first slice: `hrdr --build-info` exposes compile-time version, full
+   commit (or `unknown`), target, and clean/dirty/unknown source state before
+   startup config, trust, model, or session initialization. It is diagnostic
+   only, not installation authorization. `hrdr update-check --json` now
+   validates local cleanliness, `main`, live origin-main equality, direct-fork
+   lineage, and the exact origin-repository CI run/job matrix before
+   configuration/session startup. It emits only sanitized fixed-status
+   diagnostics and still does not install or restart. Durable continuation is
+   blocked on new, reviewed primitives: session checkpoint validation while
+   holding the ordinary session lock; process-instance (not PID-only) ownership;
+   anti-symlink journal storage; and a cross-platform crash-durable record
+   replacement API whose parent-directory durability failures are surfaced. Do
+   not add an update/restart surface until those invariants have focused
+   recovery tests. A best-effort foundation now exists: an append-only
+   checksummed, flushed journal binds a backed session-lock holder to a
+   parseable hashed saved checkpoint and recovers only the newest validated
+   frame. Sudden Windows power loss may lose or ambiguously preserve the newest
+   handoff; no update/restart surface may claim otherwise. An internal
+   coordinator now commits only an idle saved session and rejects runtime
+   queues, child tasks, watches, drafts, active turns, and save errors. Hidden
+   passive recovery now claims only dead-owner committed checkpoints, restoring
+   no queues and starting no runtime work. Interactive Windows `update` now
+   stages only after its tool turn ends, then uses one attested recovery
+   continuation; it still refuses queues, tasks, watches, drafts, and active
+   work. Windows CI now exercises isolated default-Cargo installation,
+   retained-old fallback recovery, and request reuse. Next persist queues before
+   broadening the handoff contract. CI eligibility is approved: require the
+   latest `push` CI run and latest attempt on `main` for the exact
+   origin-repository hash, with verification and packaging jobs successful; only
+   tag-only publishing jobs may be skipped. Manual and older runs do not
+   qualify. **Windows recovery cwd, fixed 2026-10-14:** CI runs `38207254188`
+   and `38211455090` failed every self-update E2E recovery because the
+   coordinator canonicalized the recovery cwd, so a session saved under an 8.3
+   short name (`RUNNER~1`) was looked up under a different session directory.
+   The E2E fixture now launches through a junction so the alias case runs on
+   every machine. Without the fix it fails locally with the CI error; with it,
+   all five E2E tests pass locally. Confirm the exact CI job is green before
+   declaring self-update complete or cutting a release. Still open: the
+   2026-10-12 local gate failed independently in
+   `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`
+   (a writer timed out acquiring `auth.json.lock`); root-cause that contention
+   before treating a later gate as green. The ignored coordinator unit tests
+   (`prepared_request_is_accepted_by_the_strict_parser` and its siblings) need
+   an executable launched from `CARGO_HOME/bin` and are run by neither CI nor
+   the local gate, so the junction assertion added to that test is unexecuted.
+10. **Windows multiline-paste transport investigation — deferred branch.**
     Pending work is preserved and pushed at `wip/windows-paste-transport` commit
     `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY
     LF/CRLF regressions, approved `crossterm_winapi` test-only probes, and the
@@ -227,7 +215,7 @@ push each verified slice to `main` before proceeding to the next slice.
     Crossterm parser path; verify loaded DLL and host paths so fallback cannot
     masquerade as a result. Do not merge this branch or release from it until
     the regressions pass across the required matrix.
-12. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
+11. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
     implementation: usage accounting, request categorization, and credit usage
@@ -243,6 +231,12 @@ push each verified slice to `main` before proceeding to the next slice.
     cloned at `a06545b311fe01e51ce855c7aa5d8da21e9e7aaf`; pin the reference
     revision used for the comparison. No comparison or implementation has been
     performed yet.
+
+**GUI-testing prompt guidance — not executed here (2026-10-14):** the `Tests`
+rule in `templates/write.md` names `xvfb-run -a` and a Sway compositor started
+with `WLR_BACKENDS=headless`. Neither was run: this machine's WSL has neither
+installed, and installing them needs the owner's sudo. The Windows and macOS
+statements say only that no general headless display exists there.
 
 **Resume/verification gaps — 2026-10-09:** Work after the current messaging
 runtime slice was deferred at the user's wrap-up request. The queue above stays

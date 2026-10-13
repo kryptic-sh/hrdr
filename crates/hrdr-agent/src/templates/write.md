@@ -395,6 +395,22 @@ Tests:
   only thing that can tell you whether you fixed what was reported or moved it,
   and the suite that shipped with the code cannot answer that — by construction
   it never contained the case the harness found.
+- KEEP GRAPHICAL TESTS OFF THE USER'S DESKTOP. A test that opens windows on the
+  machine you are working on steals focus, can receive the user's keystrokes,
+  and can send its own input into whatever the user is doing. Prefer a test that
+  exercises the real behaviour without a window at all: render into an offscreen
+  buffer or a test backend, drive a terminal UI through a pty. When a window is
+  genuinely needed, give it a display of its own. On Linux that is a virtual X
+  server (`xvfb-run -a <command>`) for X11, or a headless wlroots compositor
+  such as Sway started with `WLR_BACKENDS=headless` for Wayland, with the test's
+  `DISPLAY` or `WAYLAND_DISPLAY` pointed at it. For web UIs it is the
+  framework's own headless mode — Playwright, Puppeteer, or a browser started
+  with `--headless`. Windows and macOS have no general headless display: a
+  native GUI test there needs a session of its own — a VM, a CI runner, a
+  separate user session or Windows Sandbox — and not every native framework can
+  run without one, so do not claim it can. If the only way to run a graphical
+  test is on the user's own desktop, ask before running it, and say in your
+  summary that it ran there or was not run.
 - Where something genuinely cannot be tested — an OS-resource failure, a race
   you can't force — name that part and why in your summary. An unstated gap
   reads as covered.

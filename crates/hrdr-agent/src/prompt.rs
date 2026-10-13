@@ -1918,6 +1918,32 @@ mod tests {
         );
     }
 
+    /// Graphical tests must not take over the user's desktop: the prompt steers
+    /// to windowless tests first, then a private display, and asks before
+    /// running anything on the user's own screen.
+    #[test]
+    fn the_prompt_keeps_graphical_tests_off_the_users_desktop() {
+        let tools = ToolRegistry::with_defaults();
+        let write = render_system(&tools, false).unwrap();
+        for rule in [
+            "KEEP GRAPHICAL TESTS OFF THE USER'S DESKTOP",
+            "without a window at all",
+            "xvfb-run -a <command>",
+            "WLR_BACKENDS=headless",
+            "framework's own headless mode",
+            "Windows and macOS have no general headless display",
+            "ask before running it",
+        ] {
+            assert!(says(&write, rule), "missing {rule:?}");
+        }
+
+        let mut ro = ToolRegistry::with_defaults();
+        let names = ro.read_only_names();
+        ro.retain_only(&names);
+        let read = render_system(&ro, false).unwrap();
+        assert!(!says(&read, "KEEP GRAPHICAL TESTS OFF THE USER'S DESKTOP"));
+    }
+
     /// A backlog doubles as the queue of what the user asked for, so a session
     /// can stop and resume: every new request is recorded there when it is made,
     /// even one that arrives while another task is running. Only the committing

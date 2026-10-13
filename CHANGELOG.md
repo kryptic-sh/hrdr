@@ -137,6 +137,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The system prompt keeps graphical tests off the user's desktop.** A writing
+  agent is steered to windowless tests first, then a private display (Xvfb, a
+  headless Sway, a browser's headless mode), and must ask before running a
+  graphical test on the user's own screen (`crates/hrdr-agent`).
 - **The system prompt treats a project backlog as the queue of requested work.**
   A committing main agent now records every task the user asks for in the
   backlog as soon as it is asked, including requests made while another task is
