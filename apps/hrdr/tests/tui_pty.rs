@@ -857,14 +857,9 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
     let status = s.wait_exit(EXIT);
     assert!(status.success(), "clean exit. Screen:\n{}", s.snapshot());
     let start = Instant::now();
-    while rt
-        .block_on(peer.discover())
-        .unwrap()
-        .iter()
-        .any(|session| {
-            session.session_id == sender.session_id && session.working_directory == sender.cwd
-        })
-    {
+    while rt.block_on(peer.discover()).unwrap().iter().any(|session| {
+        session.session_id == sender.session_id && session.working_directory == sender.cwd
+    }) {
         assert!(
             start.elapsed() < EXIT,
             "the exited session is still discoverable"
