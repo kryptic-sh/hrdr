@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(180);
+/// For waits that span the coordinator's real `cargo install`: a from-scratch
+/// release build of hrdr, which CI's Windows runners take several minutes over.
+/// Under [`WAIT`] those waits timed out on CI while the build was still running.
+const INSTALL_WAIT: Duration = Duration::from_secs(20 * 60);
 const POLL: Duration = Duration::from_millis(100);
 const REQUIRED_JOBS: &[&str] = &[
     "rustfmt",
@@ -510,7 +514,7 @@ fn wait_for_recovery(fixture: &Fixture, server: &MockServer, session: &Session) 
             return;
         }
         assert!(
-            recovery_started.elapsed() < WAIT,
+            recovery_started.elapsed() < INSTALL_WAIT,
             "timed out waiting for recovery continuation; chat count: {}\nfixture Cargo log:\n{}\nfixture operation:\n{}\nsession open-locks:\n{}\ncoordinator output / recovery screen:\n{screen}",
             server.chat_bodies().len(),
             fs::read_to_string(&fixture.cargo_log).unwrap_or_default(),
@@ -540,7 +544,7 @@ fn update_installs_default_cargo_binary_and_recovers_once() {
     let _ = session.wait_for_exit(&fixture);
     fixture.assert_checkout_clean("update handoff");
 
-    let installed_build_info = wait_until("default Cargo install", || {
+    let installed_build_info = wait_until_within("default Cargo install", INSTALL_WAIT, || {
         let bytes = fs::read(&fixture.installed).ok()?;
         (bytes != fixture.old_binary)
             .then(|| {
@@ -676,9 +680,11 @@ fn recovery_continues_once_after_snapshot_sharing_violation_clears() {
     });
     let _ = session.wait_for_exit(&fixture);
 
-    wait_until("completed Cargo install before coordinator launch", || {
-        cargo_ready.exists().then_some(())
-    });
+    wait_until_within(
+        "completed Cargo install before coordinator launch",
+        INSTALL_WAIT,
+        || cargo_ready.exists().then_some(()),
+    );
     let snapshot = fixture.source_snapshot();
     let held = fs::OpenOptions::new()
         .read(true)
@@ -1039,13 +1045,17 @@ fn compact_terminal_text(text: &str) -> String {
         .collect()
 }
 
-fn wait_until<T>(what: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+fn wait_until<T>(what: &str, observe: impl FnMut() -> Option<T>) -> T {
+    wait_until_within(what, WAIT, observe)
+}
+
+fn wait_until_within<T>(what: &str, budget: Duration, mut observe: impl FnMut() -> Option<T>) -> T {
     let start = Instant::now();
     loop {
         if let Some(value) = observe() {
             return value;
         }
-        assert!(start.elapsed() < WAIT, "timed out waiting for {what}");
+        assert!(start.elapsed() < budget, "timed out waiting for {what}");
         std::thread::sleep(POLL);
     }
 }
