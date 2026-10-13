@@ -837,8 +837,12 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
         .block_on(peer.discover())
         .unwrap()
         .into_iter()
-        .find(|session| session.session_id == sender.session_id)
-        .expect("the TUI session is discoverable under the id it sent as");
+        // Other tests' sessions share the directory and can share an id; the
+        // id and cwd pair is what names one session, as `message_session` uses.
+        .find(|session| {
+            session.session_id == sender.session_id && session.working_directory == sender.cwd
+        })
+        .expect("the TUI session is discoverable under the id and cwd it sent as");
     assert_eq!(
         rt.block_on(peer.send(&target, "PONG_FROM_PEER".into()))
             .unwrap(),
@@ -857,7 +861,9 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
         .block_on(peer.discover())
         .unwrap()
         .iter()
-        .any(|session| session.session_id == sender.session_id)
+        .any(|session| {
+            session.session_id == sender.session_id && session.working_directory == sender.cwd
+        })
     {
         assert!(
             start.elapsed() < EXIT,

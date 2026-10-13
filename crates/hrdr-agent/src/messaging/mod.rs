@@ -26,6 +26,9 @@ const MAX_PROBES: usize = 64;
 /// Probes in flight at once during discovery. Bounds the connections it opens
 /// while keeping a full directory's worst case to a few protocol deadlines.
 const PROBE_CONCURRENCY: usize = 8;
+/// Pause before a failed probe's single retry: long enough for a briefly
+/// starved peer to reach its accept loop.
+const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// How long a discovery-directory operation retries a contended lock. Longer
 /// than the wire [`DEADLINE`]: a peer holds the lock across an fsync, which a
 /// loaded disk can stretch well past it.
@@ -123,9 +126,10 @@ impl Messaging {
     /// [`PROBE_CONCURRENCY`] probes run at once, so discovery opens a bounded
     /// number of connections rather than one per registry candidate.
     ///
-    /// A candidate whose probe fails — unreachable, or a session speaking another
-    /// protocol version — is left out rather than failing the whole scan: one
-    /// incompatible session must not hide every other one.
+    /// A candidate whose probe fails twice — unreachable, or a session speaking
+    /// another protocol version — is left out rather than failing the whole scan:
+    /// one incompatible session must not hide every other one. The retry keeps a
+    /// live session that was momentarily too loaded to answer in the list.
     pub async fn discover(&self) -> io::Result<Vec<SessionDescriptor>> {
         use futures_util::StreamExt;
 
@@ -135,14 +139,19 @@ impl Messaging {
                 "messaging discovery probe budget exceeded",
             ));
         }
-        let probes =
-            futures_util::stream::iter(candidates)
-                .map(|candidate| async move {
-                    exchange(&self.directory, &candidate, Payload::Probe).await
-                })
-                .buffered(PROBE_CONCURRENCY)
-                .collect::<Vec<_>>()
-                .await;
+        let probes = futures_util::stream::iter(candidates)
+            .map(|candidate| async move {
+                match exchange(&self.directory, &candidate, Payload::Probe).await {
+                    Err(_) => {
+                        sleep(PROBE_RETRY_DELAY).await;
+                        exchange(&self.directory, &candidate, Payload::Probe).await
+                    }
+                    probe => probe,
+                }
+            })
+            .buffered(PROBE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
         Ok(probes
             .into_iter()
             .filter_map(|probe| match probe {

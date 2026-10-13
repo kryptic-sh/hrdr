@@ -332,3 +332,44 @@ async fn a_tool_called_while_messaging_starts_waits_for_it() {
         .expect("the tool waited for the start");
     assert!(listed.contains("\"sessions\""), "{listed}");
 }
+
+/// Between a turn's end and its `Done` the agent is already idle, but the turn
+/// still owns its handle. A peer message arriving then must wait for that
+/// `Done` — which relaunches for anything queued — rather than start a turn the
+/// late `Done` would then mistake for its own.
+#[tokio::test]
+async fn a_peer_message_arriving_before_done_is_run_after_it() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![MockReply::Text("handled".into())]).await;
+    let id = started(&mut h, "done race").await;
+    let sender = peer("done-race-sender").await;
+    let target = find(&sender, &id).await.unwrap();
+    assert_eq!(
+        sender.send(&target, "check the logs".into()).await.unwrap(),
+        SendStatus::Accepted
+    );
+
+    // The finished turn's `Done` has not been handled yet.
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.turn_handle = Some(tokio::spawn(async {}));
+    h.app.registry.end_turn(hrdr_agent::MAIN_KEY);
+    assert!(!h.app.running());
+    h.app.maybe_deliver_peer();
+    assert_eq!(
+        h.app.registry.pending(hrdr_agent::MAIN_KEY).len(),
+        1,
+        "queued behind the finishing turn"
+    );
+    assert!(!h.app.running(), "no turn is started under the old handle");
+
+    h.app.on_turn_msg(TurnMsg::Done(None));
+    assert!(
+        h.app.running(),
+        "Done relaunches for the queued peer message"
+    );
+    h.pump().await;
+    let texts = peer_texts(&h);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].contains("check the logs"));
+    sender.close().await;
+}

@@ -272,7 +272,10 @@ impl App {
         let Some(active) = self.messaging.active.as_ref() else {
             return;
         };
-        let running = self.running();
+        // A turn whose `Done` is still in flight counts as running: the agent is
+        // already marked idle then, but launching here would race that `Done`,
+        // which relaunches for anything left on the queue anyway.
+        let running = self.running() || self.turn_handle.is_some();
         if running && self.registry.has_pending_peer(hrdr_agent::MAIN_KEY) {
             return;
         }
