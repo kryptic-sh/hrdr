@@ -85,10 +85,12 @@ push each verified slice to `main` before proceeding to the next slice.
    tested, reassess the entries against current code and implement actionable
    slices, with tests, review, verification, and separate coherent commits. Keep
    items requiring user decisions explicit rather than guessing answers.
-3. **Backlog pruning.** Remove obsolete or already-resolved entries after
-   checking the current implementation and relevant verification evidence. Age
-   alone is not a reason to delete an entry; preserve unresolved work and
-   coverage gaps. Remove completed entries as each implementation slice lands.
+3. **Backlog pruning — first pass done 2026-10-14.** Two read-only audits
+   checked the entries after this queue against the code; only entries confirmed
+   resolved (re-read at the cited symbol) were deleted, and shipped review
+   findings were removed from their sections. Gaps: an audit judged by reading,
+   so an entry it could not decide stayed; the queue above was not audited this
+   way.
 4. **LLM-managed session names.** Generate the default session name through the
    LLM on its first turn. Let the agent rename the session when its direction,
    goal, or progress changes enough that the existing name no longer fits.
@@ -190,7 +192,18 @@ push each verified slice to `main` before proceeding to the next slice.
    budget. The 2026-10-12 `auth.json.lock` timeout in
    `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`
    was the lock's whole-wait budget running out behind fifteen progressing
-   writers; fixed in `StoreLock::acquire`. The ignored coordinator unit tests
+   writers; fixed in `StoreLock::acquire`. **Remaining, 2026-10-14:** (1) Unix
+   has no self-update at all — `apps/hrdr/src/update_tool.rs` and the
+   coordinator's install/launch path are `cfg(windows)`. The request covers Unix
+   restart behaviour too: there a running binary can be replaced in place and
+   the process can `exec` its successor, so the Windows retained-binary dance is
+   unnecessary, but the admission, CI gate, journal, recovery claim and
+   continuation must be wired and tested on Linux and macOS (CI only from this
+   machine). (2) Queue persistence is not needed for today's contract: the
+   handoff waits for quiescence, and a queued steer relaunches a turn at `Done`,
+   so queued messages are delivered before the handoff rather than lost. It
+   becomes necessary once the contract is broadened to hand off with work
+   outstanding. The ignored coordinator unit tests
    (`prepared_request_is_accepted_by_the_strict_parser` and its siblings) need
    an executable launched from `CARGO_HOME/bin` and are run by neither CI nor
    the local gate, so the junction assertion added to that test is unexecuted.
@@ -219,8 +232,33 @@ push each verified slice to `main` before proceeding to the next slice.
     request contents as diagnostics. Reference checkout:
     `~/Projects/mxaddict/codex` from `https://github.com/openai/codex.git`,
     cloned at `a06545b311fe01e51ce855c7aa5d8da21e9e7aaf`; pin the reference
-    revision used for the comparison. No comparison or implementation has been
-    performed yet.
+    revision used for the comparison. **Comparison done 2026-10-14, against
+    `openai/codex` at `a06545b311fe01e51ce855c7aa5d8da21e9e7aaf`
+    (`~/Projects/mxaddict/codex`); nothing implemented — it needs the owner's
+    answers below.** hrdr's `hrdr-llm::codex` request sends `originator: hrdr`,
+    the bearer token, the provider's `ChatGPT-Account-Id`, an optional
+    `x-openai-internal-codex-responses-lite`, and `prompt_cache_key` in the
+    body. Codex additionally sends: `originator: codex_cli_rs` (its
+    `DEFAULT_ORIGINATOR`, `login/src/auth/default_client.rs`) and a matching
+    `User-Agent`; `session-id` / `thread-id` and `x-client-request-id`
+    (`codex-api/src/requests/headers.rs`, `endpoint/responses.rs`);
+    `x-openai-subagent` naming the request kind for review, compaction and
+    memory consolidation requests; the sticky-routing `x-codex-turn-state`
+    token, read from a response and replayed for the rest of the turn;
+    `x-codex-installation-id`, `x-codex-window-id`, `x-codex-turn-metadata`,
+    `x-codex-beta-features`; and a `client_metadata` body object (installation,
+    session, thread and turn ids, `request_kind`, …;
+    `core/src/responses_metadata.rs`). **Questions for the owner:** (a)
+    Dashboard attribution most plausibly keys on `originator`, but sending
+    `codex_cli_rs` from hrdr would present hrdr to OpenAI as Codex — a client
+    impersonation. Recommended: keep `hrdr`. Is that acceptable even if hrdr
+    usage then shows under a different category, or not at all? (b) Which
+    discrepancy prompted this — usage missing, mis-categorized, or counted
+    differently? Answering needs an authorized account and a before/after look
+    at the dashboard, which this session could not do. (c) Independently of
+    attribution, `x-codex-turn-state` sticky routing and `x-openai-subagent` on
+    compaction requests may have functional effects (cache locality, request
+    classification). Adopt them as Codex-private headers, or leave them?
 
 **GUI-testing prompt guidance — not executed here (2026-10-14):** the `Tests`
 rule in `templates/write.md` names `xvfb-run -a` and a Sway compositor started
@@ -858,8 +896,6 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
     implementation, and `halves_round_to_the_even_neighbour` asserts the rule
     itself — but no image in the published table lands on a tie that changes its
     patch count, so nothing proves the two interact as the vendor's code does.
-- **A PDF's page count is a byte scan for `/Type /Page`.** A compressed page
-  tree (most real PDFs) falls back to file size at 50 KB/page. Both err high.
 - **Idle and delivered are one state for a sub-agent, which is why the pane
   refuses on idleness.** Established while making the pane refuse to steer a
   finished sub-agent: `delegation.rs` registers every sub-agent `running: true`
@@ -1727,21 +1763,11 @@ forever, giving a spurious permanent busy error; `openai_refresh` requires
 `refresh_token` in the response (`oauth.rs:361`) — a spec-minimal server forces
 a re-login; the wrap-up round shares `overflow_compacted`
 (`turn_loop.rs:524, 842`) — a second overflow on the forced wrap-up errors the
-turn; `parse_scalar` quote-stripping loses legitimately edge-quoted values
-(cosmetic until finding 1's edit truncates).
+turn.
 
-**From the 2026-08-05 correctness pass:** history persist spawns one OS thread
-per `record` (`history.rs:148-163`; chain joins previous handle so writes never
-reorder, but a burst while the disk is slow piles up one waiting thread per
-outstanding write — a bounded worker channel would be equivalent); `fetch`'s
-`is_blocked_host` is advisory — correctness rests on the connect-time
-`SsrfGuardResolver`, one refactor from being the only guard (`web.rs:244-250`);
-`parse_imf_fixdate` pre-1970 wrap (`client.rs:391`: `days as u64` wraps, one
-spurious 60 s wait — practically unreachable); `trust.rs` newline in a directory
-name (`trust.rs:100`: `writeln!` of a path containing `\n` splits the store, so
-that directory can never be trusted and re-asks every launch — requires the user
-to have answered yes on such a path, and is a permanently-untrustable directory,
-not a trust escalation).
+**From the 2026-08-05 correctness pass:** `fetch`'s `is_blocked_host` is
+advisory — correctness rests on the connect-time `SsrfGuardResolver`, one
+refactor from being the only guard (`web.rs`).
 
 **From the 2026-08-05 security audit:** the verification-gate prompt section is
 repo-authored content the trust gate does not cover — `Gate::detect` runs
@@ -1786,9 +1812,6 @@ own shell redirection, but the transcript contains model output).
 - `pack_loader_segments` counts `chars`, not display cells — safe only because
   every loader/summary segment is ASCII or width-1 braille; a wide (CJK) segment
   would overrun the width.
-- A `Reasoning` entry that never settles (interrupted turn, restored session)
-  keeps `took_ms: None` and shows a spinner forever; the resume path never
-  re-stamps it.
 
 **From the 2026-08-06 security audit.** One claim was demoted from a finding to
 hardening, with the trace that disproved the repro: the claim
@@ -1823,9 +1846,10 @@ overrides it). Residual, recorded as hardening below.
   NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) forms of an internal address —
   the same class as the unspecified `::` that was closed, and each reachable by
   spelling a loopback or private v4 address inside a v6 literal.
-- `grep_line_is_secret`'s `-`-delimited token parse (`lib.rs:1261-1276`) can
-  mis-attribute a line to a wrong path prefix — a crafted filename can false-
-  negative the courtesy filter.
+- The secret-line filter's `-`-delimited token parse
+  (`SecretLineMemo::is_secret_line` → `line_path_token` in `hrdr-tools`) takes
+  the first `sep<digits>sep` run, so it can mis-attribute a line to a wrong path
+  prefix — a crafted filename can false-negative the courtesy filter.
 - Landlock grants full `AccessFs::from_all` (incl. `REFER`) on writable roots —
   safe only because the `/` rule lacks REFER on the source side of a cross-root
   rename; the `NotEnforced` → refuse-spawn check is the backstop.
@@ -2778,113 +2802,6 @@ and`hrdr-agent/src/prompt.rs`prompt _text_ — read, not audited
 line-by-line.`apps/hrdr/src/main.rs` beyond the trust gate was not audited by
 chunk 1 (covered by chunk 2).
 
-## Tidy review 2026-08-14
-
-`:tidy` over the whole tree (working tree clean at the time), split across two
-sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm + hrdr-tools +
-hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-read at its cited
-lines by the sweep lead; behavior-preserving only.
-`cargo check --workspace --all-targets` is clean — the only true dead code was
-the three deleted items. **Status: all 13 items shipped 2026-08-14 (commit
-057c5a4).**
-
-1. **Five byte-identical fuzzy-filter functions — extract one shared helper.**
-   `filter_effort_choices` (`hrdr-app/src/effort.rs`), `filter_themes`
-   (`themes.rs`), `filter_sessions` (`sessions.rs`), `filter_login_providers`
-   (`login.rs`), `filter_model_choices` (`hrdr-agent/src/models.rs`) — all five
-   are the same empty-query → `(0..len)`, else trim/lowercase char vec +
-   `filter_map(fuzzy_match_hay)` (the models.rs copy just writes the empty check
-   after building `q` — same outcome). A 6th copy, `filter_prompt_entries`
-   (`hrdr-app/src/commands/prompt_commands.rs`), is the same family. Action: add
-   `pub fn fuzzy_filter(haystacks: &[String], query: &str) -> Vec<usize>` beside
-   `fuzzy_match_hay` (`hrdr-agent/src/models.rs`) and make each a one-line
-   delegate. Public surfaces preserved.
-2. **Dead pub functions — delete.** `save_agent_session` and
-   `latest_session_for_cwd` (`hrdr-app/src/sessions.rs`) — zero callers in the
-   whole workspace (the TUI uses the locked `open_latest_session_for_cwd`;
-   CHANGELOG confirms the non-locked variant's TUI use is historical). hrdr-app
-   is not published → plain deletion, not an external-API decision.
-3. **Dead pub method — delete.** `ToolContext::mark_read_partial`
-   (`hrdr-tools/src/lib.rs`) — zero callers; the paged-read bookkeeping is done
-   by `record_read` and `mark_read` has ~30 callers. hrdr-tools is a workspace
-   crate (not published), so no out-of-workspace consumer breaks — treat as a
-   workspace-internal API decision.
-4. **Duplicated stale-lock predicate — delegate session.rs to store_lock.rs.**
-   `session.rs`'s `is_stale_lock` + `owner_process_alive` vs `store_lock.rs`'s
-   `is_stale_lock` + `process_alive` are the same logic (store_lock's own
-   comment says it "mirrors" session's); store_lock's is parameterized by the
-   staleness age, session's hardcodes `STALE_LOCK_AGE_SECS`. Action: make
-   `store_lock::is_stale_lock` `pub(crate)` and call it from session.rs's
-   `try_reserve` / `acquire_open_lock` with `STALE_LOCK_AGE_SECS`; delete the
-   two session.rs fns. Identical predicate, same constant.
-5. **Duplicated SHA-256 hex helper — share one.** `digest_hex`
-   (`attachment_store.rs`) and `account_digest` (`chatgpt_models.rs`) are the
-   same lowercase-hex SHA-256. Action: make `digest_hex` `pub(crate)` and have
-   `account_digest` call it. Identical output.
-6. **Per-keystroke allocations in `is_known_command`** (`hrdr-app/src/lib.rs`):
-   `resolve_alias` runs once on the input and again per ~37 registry entry, on
-   every keystroke of `/…` completion and per submit. `resolve_alias` is
-   idempotent on canonical names (verified — none of the alias arms match a
-   canonical name), so the `any()` is exactly set membership. Action: precompute
-   the resolved canonical-name set once (`OnceLock`) and check membership.
-   Behavior unchanged.
-7. **Needless allocation in `is_test_path`** (`hrdr-tools/src/test_nudge.rs`):
-   `full.rsplit('/').next().unwrap_or_default().to_string()` is only used via
-   `&str` methods — drop `.to_string()`, let `name` borrow `full`.
-8. **Redundant `let cap = max_bytes;`** (`hrdr-llm/src/capped_read.rs`, in both
-   capped readers) — use the parameter directly. Private fns, no API impact.
-9. **Needless clone in an error path** (`apps/hrdr/src/main.rs`):
-   `cli.model.clone().unwrap_or_default()` inside `map_err` →
-   `cli.model.as_deref().unwrap_or_default()`, formats identically.
-10. **`CompletionShell::generate` — six near-identical calls**
-    (`apps/hrdr/src/main.rs`): map `self` to the clap `Shell` in one match then
-    a single `generate` call — with the caveat that the Nushell arm uses
-    `clap_complete_nushell::Nushell`, a different type, so it stays separate.
-    Low value (readability only).
-11. **Unneeded `pub` on an internal-only re-export** (`hrdr-editor/src/lib.rs`:
-    `pub use host::HrdrHost`) — no consumer outside hrdr-editor; only used
-    inside lib.rs (VimEngine's field type). Could be a private `use`. Trivial.
-12. **`push_str(&format!("\t{desc}"))` — temporary String for a segment**
-    (`hrdr-tools/src/mcp/client.rs`, two sites):
-    `out.push('\t'); out.push_str(desc);`. Micro.
-13. **`await_oauth_code` is newly unused** (came with the 2026-08-14 OAuth
-    bind-first fix — `hrdr-agent/src/oauth.rs`): no caller remains now that the
-    login flows use `await_oauth_code_on`. hrdr-agent is a workspace crate (not
-    published) — delete, or keep only as a thin wrapper.
-
-**Shipped 2026-08-14 (057c5a4):** shared `fuzzy_filter` behind the six filter
-fns; deleted `save_agent_session`/`latest_session_for_cwd`/`mark_read_partial`/
-`await_oauth_code`; session.rs's stale-lock predicate delegated to the
-parameterized `store_lock` one; shared `digest_hex`; `is_known_command`'s
-canonical-name set precomputed; `is_test_path` borrow; `capped_read` cap
-rebinding dropped; `as_deref` in the `--model` error path;
-`CompletionShell::generate` collapsed (Nushell separate); `HrdrHost` re-export
-made private; two `format!` temporaries replaced with `push('\t')`.
-
-**Dropped as not-tidy:** `auth_key` vs `ProviderName::auth_key` (deliberately
-returns the raw input spelling for custom names — delegating would change
-stored-key lookup); `short_file_list` vs `sample` (same join shape, different
-output strings); `plain.rs` `paste` override (deliberate direct-insert path);
-`try_reserve` vs store `acquire` (different contention policies — only the
-staleness predicate is duplicated, which is item 4); `blob_dir` vs `blob_dir_in`
-(thin wrapper, both used, adds meaning); `redact_secret_diffs` vs `DiffRedactor`
-(same state machine, different emitted bytes — unifying changes output);
-`write_atomic` vs `atomic_write` (different crates, different semantics —
-symlink targets, permission carry); the codebase-wide `push_str(&format!(…))`
-idiom (30+ sites, clippy's `format_push_string` not enabled); `ask_to_trust`
-wrapper (documented seam feeding the testable `trust_gate_with`); sandbox's
-`#[cfg_attr(allow(dead_code))]` items (platform-gated macOS/Windows code);
-`mcp/mod.rs` `#[allow(unused_imports)]` (`parse_sse_for_id` used via `super::*`
-in tests — the allow is load-bearing); 3× duplicated mock-server `args` vec
-(test code, each site different).
-
-**Coverage:** hrdr-agent, hrdr-app, hrdr-editor, hrdr-llm, hrdr-tools (all
-modules incl. tools/ and mcp/), hrdr-tui, hrdr-test-support, apps/hrdr —
-fn-reference scan over all non-test modules; every `#[allow(dead_code)]` item
-accounted for; all single-use helpers checked for real call sites. GAP: the bulk
-of `hrdr-tui/src/app/e2e.rs` (10.7k lines of tests) was not scanned for
-test-side duplication.
-
 ## Performance review 2026-08-14
 
 `:perf` over the whole tree (working tree clean at the time), split across two
@@ -2960,70 +2877,6 @@ re-lowering per `/next`/`/prev` (command-frequency, not per-keystroke). GAP:
 split across two read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
 hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
 candidate was re-traced at its cited lines by the sweep lead before recording.
-**Status: all 3 shipped 2026-08-28 — `40bdb6f` (session-lock release via the
-pid-guard), `94090bf` (completion-cache bump on turn end), `d541dde` (skills on
-`/cwd`).**
-
-1. **Medium — `Session::save` still removes the reservation lock by path,
-   defeating the pid-guard added in `2823fc2`.** `hrdr-agent/src/session.rs:867`
-   unconditionally `remove_file`s `.{id}.lock`, while the guard the fix added to
-   `Reservation::drop` (`session.rs:540`) and `SessionLock::drop` (`:609`) is
-   `remove_lock_file_if_owned` (`store_lock.rs:284`). That leaves a second,
-   unguarded release path for the same lock. On Windows `process_alive` answers
-   `false` for every pid (`store_lock.rs:326-329`), so a live lock older than
-   `STALE_LOCK_AGE_SECS = 60` (`session.rs:26`) is reapable; a first save whose
-   blob-write phase exceeds 60 s lets a second instance reap and reclaim the
-   reservation, then the first instance's `:867` deletes the _second_ instance's
-   lock — the two-window lost-update the locks exist to prevent. The
-   `Reservation` guard is held across every save (`save_session` `:1620`;
-   `hrdr-tui` `spawn_save` `:378`), so removing `:867` and letting the
-   pid-guarded Drop be the sole release is the fix. Repro:
-
-   ```
-   // Windows, two hrdr instances, same cwd + session name.
-   // A's first save spends >60s writing blob attachments (slow/network FS).
-   // B starts a same-named session during that window.
-   Expect: B mints a distinct id; A never deletes B's lock.
-   Actual: both hold `slug`; A's `:867` deletes B's reclaimed `.{slug}.lock`,
-           and the two sessions silently overwrite one another.
-   ```
-
-2. **Low — completion memoization serves stale sub-agent names after a turn
-   ends.** `hrdr-tui/src/app/completion.rs:26-33` memoizes `active_completions`
-   on `(editor content, completion_generation)`, but `compute_completions` reads
-   the sub-agent list through `agent_names`
-   (`hrdr-app/src/commands/helpers.rs:397-402`), which is `[]` whenever the turn
-   task holds the agent lock (`try_lock` fails). No site bumps
-   `completion_generation` when a turn ends, so a popup computed with the lock
-   held is served again with the lock free. Before `ff2c949` this recomputed
-   every frame and self-corrected within one. Fix:
-   `bump_completion_generation()` in the `TurnMsg::Done` handler
-   (`app.rs:3027`). Repro:
-
-   ```
-   state: sub-agent profile configured; main turn running (lock held)
-   input: type `@`, let the turn finish (content stays `@`)
-   Expect: once the turn ends the `@` popup lists sub-agent names
-   Actual: the popup keeps showing no names until the next keystroke
-   ```
-
-3. **Low — `/cwd` rediscovers commands but not skills.** `TuiHost::cwd_changed`
-   (`hrdr-tui/src/app/commands.rs:417-424`) refreshes `self.app.commands` for
-   the new directory but leaves `self.app.skills` as the previous directory's
-   set; `apply_cwd` (`app.rs:2570-2571`) and `reload_cmd` (`commands.rs:186`)
-   refresh both, so this is an asymmetric pre-existing path. A skill that exists
-   only in the old directory is still offered as a `:name` completion after the
-   switch. Fix: `cwd_changed` should also set
-   `self.app.skills = hrdr_app::discover_skills(new, self.app.project_instructions)`.
-   Repro:
-
-   ```
-   state: project A has .agents/skills/foo/SKILL.md; project B (trusted) does not
-   input: start in A, `/cwd /path/to/B`, then type `:foo`
-   Expect: no `:foo` suggestion (B has no such skill)
-   Actual: `:foo` still offered from A's stale `self.skills`
-   ```
-
 **Cleared (suspected, traced, safe — do not re-investigate):** attachment digest
 memoization (`00989fd` — `Attachment.bytes` is a private `Arc<[u8]>` with no
 mutation path, so the construction-time `sha256` cannot drift; `read_blob`
@@ -3076,36 +2929,6 @@ by the 2026-08-14 passes; their cleared items were not re-derived.
 across two read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and
 hrdr-llm + hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every
 candidate was re-traced at its cited lines by the sweep lead before recording.
-**Status: the finding shipped 2026-08-28 (`d8e181d`); 1 new hardening note; the
-rest cleared.**
-
-1. **Low — `read_blob` joins an untrusted `sha256` without the 64-hex check, so
-   a crafted session file reads arbitrary paths (existence/size oracle, not
-   exfiltration).** `hrdr-agent/src/attachment_store.rs:260` builds
-   `dir.join(&r.sha256)` from the deserialized on-disk `AttachmentRef.sha256`
-   (`#[derive(Deserialize)]`; the on-disk `Raw.attachments` → `attachment_refs`
-   at `session.rs:219,275`) with no `is_blob_name` guard, while the deletion
-   side `sweep_blobs` (`:363`) does gate on `is_blob_name` (`:157`, exactly 64
-   lowercase hex). `r.sha256 = "../…"` or an absolute path reaches
-   `std::fs::metadata` then `std::fs::read` (`:261,:273`); the read is bounded
-   by `r.len == meta.len()` (`:270`) and the bytes are discarded because the
-   digest check (`:277`) can never match a non-64-hex name — so content never
-   reaches the model, but the `Missing`/`Unreadable`/`Corrupt` category plus the
-   attacker-controlled `filename` are surfaced in the resume notice
-   (`resolve_attachments` `:314-320`), giving a file-existence/size oracle on
-   paths the attacker can guess. Fix: reject `r.sha256` unless
-   `is_blob_name(&r.sha256)` in `read_blob`, returning `Corrupt`. Repro:
-
-   ```
-   state: a session file whose attachments[0].files[0] = {
-            "sha256": "../../../etc/passwd", "len": <target size>,
-            "media_type": "image/png", "filename": "x" }
-   input: resume that session
-   Expect: no filesystem read outside the blob dir; the attachment is Corrupt
-   Actual: the guessed path is stat'd and read; existence is distinguishable
-           via the resume notice's Missing/Unreadable/Corrupt category
-   ```
-
 **Cleared (suspected, traced, safe — do not re-investigate):** SSRF in
 `fetch`/`search` (connect-time `SsrfGuardResolver`, `is_blocked_ip` covers
 loopback/private/link-local/CGNAT/unspecified plus IPv4-mapped v6, redirects
@@ -3179,58 +3002,8 @@ lost-update (the correctness medium).
 `:tidy` over the whole tree (working tree clean at the time), split across two
 read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-read
-at its cited lines by the sweep lead; behavior-preserving only. **Status: all 7
-applied 2026-08-28 — `d541dde` (rediscover), `be89e1a` (dead code), `c10a38f`
-(sha256_hex), `9302af8` (three extractions).**
-
-1. **Delete dead `fuzzy_match` + `fuzzy_match_q`.**
-   `hrdr-agent/src/models.rs:771` and `:782` are orphaned by the 2026-08-14
-   `fuzzy_filter` refactor — the only references are `fuzzy_match` →
-   `fuzzy_match_q` → `fuzzy_match_hay`, and `fuzzy_match` itself has zero
-   callers repo-wide (the six picker filters all delegate to `fuzzy_filter` →
-   `fuzzy_match_hay`, `:809`). Action: delete both, and drop `fuzzy_match` from
-   the re-export at `hrdr-agent/src/lib.rs:183` (keep
-   `fuzzy_filter`/`fuzzy_match_hay`, which stay used).
-
-2. **Delete the identity no-op `filetime_from`.**
-   `hrdr-agent/src/store_lock.rs:719` is literally
-   `fn filetime_from(t: SystemTime) -> SystemTime { t }`; its sole caller `:423`
-   is a no-op rebind, and the comment above it describes `set_mtime`, not this
-   fn. Test-only (`#[cfg(unix)]`). Action: delete the fn and the
-   `let old = filetime_from(old);` line (use `old` directly).
-
-3. **Needless `Option<String>` clone in the session-saved notice.**
-   `hrdr-tui/src/app/session.rs:312-313` clones `state().id` to dodge the
-   `&mut self` borrow on `self.system`. Action: materialize the notice first —
-   `let notice = hrdr_app::session_saved_notice(self.state().id.as_deref().unwrap_or_default());`
-   then `self.system(notice)`. Same class as the shipped `--model` fix.
-
-4. **Duplicated lowercase-hex SHA-256 (new from `00989fd`).**
-   `hrdr-llm/src/media.rs:708-712` is byte-for-byte the same derivation as
-   `hrdr-agent/src/attachment_store.rs:145-150` (`digest_hex`). Action: add
-   `pub fn sha256_hex(bytes: &[u8]) -> String` in hrdr-llm (beside
-   `Attachment`), use it at `media.rs:708`, and make
-   `attachment_store::digest_hex` a one-line delegate. hrdr-agent already
-   depends on hrdr-llm (`Cargo.toml:11`); both pin `sha2`, so no new dependency.
-
-5. **Duplicated discovery-refresh block — resolves with correctness finding
-   #3.** `hrdr-tui/src/app.rs:2570-2572` (`apply_cwd`) and
-   `hrdr-tui/src/app/commands.rs:185-187` (`reload_cmd`) are identical (discover
-   commands + discover skills + bump). Action: extract one private
-   `fn rediscover(&mut self, cwd: &Path)` and call it from both — and from
-   `cwd_changed` (`commands.rs:417`), which today does the commands half only;
-   folding it in also fixes correctness finding #3 (stale `:skill` completion).
-
-6. **Duplicated timeout-floor-note append.**
-   `hrdr-tools/src/tools/verify.rs:212-218` and `:229-235` are the same
-   `if let Some(asked) = raised_from { … }` block. Action: extract
-   `fn append_timeout_note(s: &mut String, raised_from: Option<u64>)` and call
-   it from `report_failure`/`report_pass`.
-
-7. **Duplicated todos snapshot under lock.** `hrdr-tui/src/app/session.rs:166`
-   and `:303` both do
-   `self.todos.lock().map(|t| t.clone()).unwrap_or_default()`. Action: extract
-   `fn todos_snapshot(&self) -> Vec<TodoItem>`; the two mutation sites stay.
+at its cited lines by the sweep lead; behavior-preserving only. Every finding
+shipped; what remains is what was declined.
 
 **Dropped as not-tidy:** `confirm_identity_with`/`Entitlements` re-export
 (deliberate DI seam, same shape as `ask_to_trust`); `split_fence`/
@@ -3268,20 +3041,9 @@ recent commits. GAP: not line-by-line — the bulk of `hrdr-tools/src/tools/*` a
 `:perf` over the whole tree (working tree clean at the time), split across two
 read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced
-at its cited lines by the sweep lead. **Status: 3 shipped 2026-08-28 (`5e3516b`
-file ranking, `77c7b80` editor batch, `3619655` clock hoist), 1 declined, 1
-micro left, 1 deliberate-tradeoff revisit — see the note after the coverage
-section.**
-
-1. **`rank_file_matches` sorts the whole 20k-file index per keystroke, then
-   keeps 8.** `hrdr-app/src/completion.rs:178-201` builds a `Vec` of up to
-   `WALK_MAX_FILES` (20_000) tuples, runs a full `sort_by`, then `.take(8)` —
-   O(F log F) comparisons + O(F) allocation per keystroke; the empty-query case
-   (`@` alone) scores every entry. Called on every `@` keystroke via
-   `file_completion_items` (`hrdr-tui/src/app/completion.rs:184`), one recompute
-   per keystroke (the memo keys on content). Fix: bounded top-8 selection —
-   `select_nth_unstable_by(7, …)` then sort only the 8, or a fixed-size 8-slot
-   best-list during the `filter_map` pass. O(F), same ordering for the kept 8.
+at its cited lines by the sweep lead. **Status: findings 1, 3 and 4 shipped
+2026-08-28 and are removed here; 2 and 5 remain, with the deliberate-tradeoff
+revisit — see the note after the coverage section.**
 
 2. **`HighlightCache::highlight` deep-clones the whole accumulated block on
    every call.** `hrdr-app/src/highlight.rs:140` does
@@ -3293,27 +3055,7 @@ section.**
    `Arc<Vec<HlLine>>` (clone the `Arc`), or return a shared slice so the stable
    committed prefix is not re-copied.
 
-3. **`PlainEngine` is O(n²) on paste and Ctrl+W.** `hrdr-editor/src/plain.rs` —
-   `insert`/`backspace` are per-char `Vec::insert`/`remove` (`:53-57`,
-   `:59-65`), and `paste` loops `insert` per char (`:233-239`) while
-   `delete_word` loops `backspace` per char (`:140-147`). A pasted code block or
-   a long-word Ctrl+W is O(n²) memmoves. Fix: `paste` → one
-   `chars.splice(cursor..cursor, text.chars().filter(|&c| c != '\r'))` + one
-   cursor bump; `delete_word` → compute the range then `drain` once (exactly
-   what `kill_to_line_start` already does at `:149-153`). A gap-buffer/rope is
-   the larger fix if mid-buffer typing ever matters.
-
-4. **Loop-invariant spinner-frame clock read per chunk per frame.**
-   `hrdr-tui/src/ui.rs:2890-2891` computes `frame_idx`/`frame` from
-   `app.header_anchor.elapsed()` _inside_ the
-   `for (i, entry) in transcript.iter().enumerate()` loop (`:2880`) — a real
-   clock read plus index math per top-level chunk, ~8.3 Hz while
-   `spinner_live()` keeps the ticker alive, over an unboundedly growing
-   transcript. They depend only on wall time, not `i`. Fix: hoist both lines
-   above the loop (the comment at `:2864` already says "one clock read for the
-   whole frame").
-
-5. **SSE decoder drops its line-buffer capacity on every line.**
+3. **SSE decoder drops its line-buffer capacity on every line.**
    `hrdr-llm/src/sse.rs:141` does `std::mem::take(&mut self.line_buf)`, leaving
    a zero-capacity `Vec` that the next line grows byte-by-byte (1→2→4→…) — once
    per SSE line (≈ per token) on every streamed response. Fix: preserve capacity
@@ -3417,52 +3159,6 @@ prompts; the workspace map built from the jailed sub-agent's resolved `cwd`;
 307/308; `MAX_PASTE_CHARS` paste cap — each with a regression test that failed
 before the fix).**
 
-1. **MEDIUM — terminal escape-sequence injection via displayed text.**
-   (`hrdr-tui/src/ui.rs` render path; also `hrdr-editor/src/plain.rs`,
-   `trust_prompt.rs`): the only transform before text becomes a ratatui `Span`
-   is `expand_tabs` (handles `\t` only); ESC bytes survive to the terminal
-   verbatim (ratatui-crossterm `Print(cell.symbol())`). A
-   `!printf '\x1b[2J \x1b[H\x1b[?25l' && printf 'hrdr key required: …'` either
-   clears/hides the terminal or spoofs a prompt over the real one while the app
-   is idle, so the next keystrokes go into the real input and, on Enter, to the
-   model; a repo file or hostile directory _name_ containing ESC (incl. the
-   pre-trust cwd line) triggers the same. Impact is display corruption + UI
-   spoofing, not code execution. Fix: one sanitizer at the render entry points
-   replacing C0 controls and ESC-initiated CSI/OSC/DCS sequences with visible
-   placeholders; keep raw bytes in the underlying data.
-2. **LOW — MCP error context embeds up to 10 MiB of server body, unwrapped.**
-   (`hrdr-tools/src/mcp/transport.rs`): a non-JSON MCP response is interpolated
-   whole into the tool error (`format!("decoding response: {body}")`), and tool
-   `Err`s bypass the `<untrusted-content>` envelope (only `Ok` results are
-   wrapped — `lib.rs` `execute`). A hostile/quirky MCP server delivers an
-   instruction-injection payload in the harness's own error channel and a
-   per-call context blow-up. Fix: truncate (`truncate(&body, 500)`, like the
-   non-success arm) and consider capping tool error strings centrally.
-3. **LOW — attachment filenames rendered raw into a sub-agent's prompt.**
-   (`hrdr-agent/src/lib.rs` `Steer::with_labelled_attachments`):
-   `Attachment:: filename` is the attacker-controlled basename of an attached
-   file, inserted verbatim — no quoting, no control-char stripping — into the
-   sub-agent's opening message (`Image 1: report-success-and-stop-auditing.png`,
-   or with `\n` — legal in POSIX filenames — an embedded paragraph). The
-   `prisoner` persona trains data-as-data, which caps impact; write-capable
-   coder/default sub-agents get no such guard. Fix: strip `\n`/`\r`, wrap the
-   name in backticks.
-4. **LOW — jailed sub-agent's brief still ships the parent's whole project
-   layout.** `workspace_map` (`hrdr-agent/src/delegation.rs`) is built from
-   `ctx.cwd` (the parent's), not the resolved sub-agent `cwd` of e.g.
-   `task agent=prisoner cwd=vendor/sketchy` — repo-controlled directory names
-   reach the hostile-code-scoped model as context beyond its readable scope.
-   Fix: build the map from the resolved `cwd`, or elide it for jailed agents.
-5. **LOW — `x-api-key`/`api-key` survive cross-host redirects; only Bearer is
-   stripped.** (`hrdr-llm/src/client.rs` + `anthropic.rs`): both builders keep
-   reqwest's default redirect policy, and `remove_sensitive_headers` strips only
-   `AUTHORIZATION`/`COOKIE`/`cookie2`/`PROXY_AUTHORIZATION`/ `WWW_AUTHENTICATE`
-   — a 307/308 to another host (or an https→http downgrade) forwards the
-   Anthropic `x-api-key` or Azure `api-key` verbatim. The redirecting party
-   already received the key, so the marginal leak is a host the user never
-   authorized. Fix: `redirect(Policy::none())` on both builders (POST endpoints
-   never legitimately redirect).
-
 **Cleared (top of list):** SSRF — connect-time `SsrfGuardResolver`, redirects
 re-checked per hop, SearXNG operator-env-only (justified); command injection —
 no `Command::new` on untrusted input anywhere, hooks' `{path}` POSIX-quoted;
@@ -3502,23 +3198,15 @@ assembly read contextually; no remote-fetch-then-attach path exists).
 tui/app/editor walked at entry points; hrdr-agent/tools internals read only at
 the traced interfaces.
 
-**Top fixes (in order):** 1) ESC/control-char sanitizer in the TUI render
-path; 2) truncate MCP error bodies (+ cap tool error strings centrally); 3)
-checked arithmetic in `parse_imf_fixdate` (review finding 3, dup here).
-
 ## Tidy review 2026-08-30
 
 `:tidy` over the whole tree (clean), split across three sub-agents; every
 candidate verified at its cited lines (top items by the sweep lead; clippy
 `--workspace --all-targets --all-features -D warnings` is clean in all crates —
 compiler-verified dead code is none anywhere). **Status: eight items shipped
-2026-08-30 (capture_overflow_error hoisted to types.rs; url_host doc fixed;
-Gate::matched → is_whole; join_roots/join_paths merged; four whitespace-collapse
-copies → collapse_whitespace; apply_cwd/cwd_changed share apply_cwd_view; the
-five doc-rot sites rewritten — including the dead `[forbidden_flag]` link; the
-triplicated SSE drain is one `sse::next_sse_events`); five items open —
-recorded, not applied.** Findings 1–2 of wave 1 and 1–4 of wave 3 are safe,
-behavior-preserving dedups; nothing behavior-changing proposed.
+2026-08-30 and are not listed; five remain open — recorded, not applied.**
+Findings 1–2 of wave 1 and 1–4 of wave 3 are safe, behavior-preserving dedups;
+nothing behavior-changing proposed.
 
 1. **Tool-preview head/tail logic duplicated across three arms of `tool_lines`**
    — `hrdr-tui/src/ui.rs`: mutation-preview head re-implements `preview_head`;
@@ -3632,31 +3320,27 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    `hrdr-app/src/highlight.rs`: full-output `block.lines.clone()` per call even
    when one line is new; each streaming frame of a growing code block is O(total
    lines). Fix: return a borrow or share lines behind an `Rc`.
-9. **MEDIUM — overflow spool writes each line with an unbuffered `write(2)`.**
-   `hrdr-tools/src/tools/shell.rs`: past the output cap, the overflow file is
-   written one line at a time; a 100 KLOC build wall ≈ 100 K write syscalls.
-   Fix: wrap in `BufWriter`, flush on drop.
-10. **MEDIUM — per-file `canonicalize_nearest` in the grep/replace walkers.**
-    `grep.rs`/`replace.rs`: every walked file pays an lstat + full realpath
-    (≈depth+2 syscalls) just to answer the deny-list check; 20 K files ≈ 100–200
-    K extra syscalls. Fix: run `secret_file_reason` on the raw walker path first
-    (zero syscalls for `.env`/`id_rsa`/`.ssh` — the common case) and
-    canonicalize only when the raw check is `None`.
-11. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
+9. **MEDIUM — per-file `canonicalize_nearest` in the grep/replace walkers.**
+   `grep.rs`/`replace.rs`: every walked file pays an lstat + full realpath
+   (≈depth+2 syscalls) just to answer the deny-list check; 20 K files ≈ 100–200
+   K extra syscalls. Fix: run `secret_file_reason` on the raw walker path first
+   (zero syscalls for `.env`/`id_rsa`/`.ssh` — the common case) and canonicalize
+   only when the raw check is `None`.
+10. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
     `metadata().len()` guard and no match-count bound on memory (the read
     completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
     (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
     and stop once `matches > max_matches`.
-12. **LOW — recall lowercases name/description/body once per token, per turn.**
+11. **LOW — recall lowercases name/description/body once per token, per turn.**
     `hrdr-tools/src/memory.rs` `recall_score` → `relevance_score` per query
     token: ~100–300 lowercased copies of content per turn (both scopes). Fix:
     lowercase the three fields once per memory outside the token loop.
-13. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
+12. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
     `WindowScanner`: each page re-counts newlines from the start — O(N) per
     page, ~O(N×pages) over a large file paged start-to-finish. Fix: let
     `ReadRecord` carry the last-scanned byte offset and resume there (coverage
     already guarantees contiguous-from-line-1 paging).
-14. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
+13. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
     `record` + `transcript_log.rs`: ~3-4 small allocations + 3 lock acquisitions
     per chunk (per token group). Bounded per token, the hottest loop in
     hrdr-agent; a 60k-token reply ≈ 240k small allocations. Fix: move each event
@@ -3665,7 +3349,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     (Prior `## Performance review — second pass 2026-08-04` #2 made the same
     measurement and dropped it as infeasible for the `Record::from_event` half —
     this adds the still-available `deque double-push` half.)
-15. **LOW — no-usage fallback re-estimates the whole history every round.**
+14. **LOW — no-usage fallback re-estimates the whole history every round.**
     `budget.rs`: `estimate_tokens_in_messages` per round when the server reports
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
     dropped the running-counter fix as risk > value (~µs per round) — noted, not
