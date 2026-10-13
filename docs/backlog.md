@@ -538,6 +538,20 @@ reason below is what the attempt showed — not a guess about what it might do.
   for a document. Three existing tests went red and are the only reason this was
   not shipped silently.
 
+## Needs a decision 2026-10-14 — replacing `serde_yaml_ng`
+
+The scheduled `cargo-deny` run began failing on RUSTSEC-2024-0449:
+`unsafe-libyaml` is unmaintained. It is an "unmaintained" advisory, not a
+vulnerability, and it reaches us only through `serde_yaml_ng` 0.10.0, which is
+still its newest release. `deny.toml` now ignores it with a reason, the same
+treatment as the two syntect-borne advisories. **Question for the owner:**
+should the YAML crate be replaced? It is used for memory/skill frontmatter
+(`parse_frontmatter`) and for CI workflow parsing in `gate.rs`, which reads
+untrusted YAML. A pure-Rust parser such as `noyalib` or `serde-saphyr` would
+remove the C-transpiled `unsafe` code, but it is a new dependency. Any swap must
+keep `gate.rs`'s recursion and byte caps, and the strict-frontmatter behaviour
+described above. Until there is a decision, the ignore stays.
+
 ## Compaction rewrite
 
 The plan (`docs/compaction-rewrite-plan.md`) is archived into this section. The
