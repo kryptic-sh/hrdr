@@ -101,15 +101,14 @@ push each verified slice to `main` before proceeding to the next slice.
    Reassess previously deferred upgrades against current upstream releases;
    record any upgrades still blocked and why. Commit and push verified slices to
    `main` after the preceding queued work.
-6. **Cross-platform terminal titles.** Fix the reported Windows behavior where
-   the title remains `PowerShell`. On Windows, macOS, and Linux, display the
-   working-directory basename and current session name, prefixed by a status
-   emoji as the first character, similar to Claude Code CLI. Distinguish busy /
-   working, idle, done, and waiting for user answers at a glance. Keep the title
-   synchronized with cwd, session-name, and status changes. Extend the existing
-   title implementation rather than adding a competing update path. Test the
-   title content and lifecycle updates across the supported CI matrix, with
-   local Windows and WSL checks for faster feedback.
+6. **Terminal titles — Windows report unresolved.** The status/cwd/name title
+   shipped (`hrdr-tui`'s `app::title`), and `tests/tui_pty.rs` shows on Windows
+   that the OSC title reaches a ConPTY client. The reported Windows symptom (the
+   tab staying `PowerShell`) was not reproduced, so its cause is unknown: a
+   terminal setting such as Windows Terminal's `suppressApplicationTitle`, or a
+   host that ignores OSC titles, would produce it with hrdr working. **Question
+   for the owner:** which terminal and profile showed `PowerShell`? The macOS
+   and Linux pty runs are on CI only.
 7. **Multiple selectable shells.** Extend the shell tool so the LLM can select
    an available shell per command on Windows, macOS, and Linux. Prefer Bash by
    default on every platform: on Windows specifically resolve Git Bash ahead of

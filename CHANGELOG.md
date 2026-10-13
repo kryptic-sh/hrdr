@@ -131,9 +131,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   slash command sends the description through the model so it can normalize the
   text and call the existing `goal` tool, and the TUI now renders pending goals
   above TODO rows in the existing TODO panel (`hrdr-app`, `hrdr-tui`).
-- **The TUI sets the terminal title from the session name.** Interactive
-  sessions now emit a cross-platform terminal title in the form
-  `hrdr - {session_name}` as the session is named or renamed (`hrdr-tui`).
+- **The TUI sets the terminal title from the session's status, directory and
+  name.** Interactive sessions emit a cross-platform title of the form
+  `{status} {cwd basename} · {session name}`, where the leading emoji reads
+  working (⏳), waiting on you (❓, a prompt is open or the last reply asked a
+  question), done (✅, a turn finished since you last touched the session) or
+  idle (💤). It follows directory, name and status changes (`hrdr-tui`).
 
 ### Changed
 

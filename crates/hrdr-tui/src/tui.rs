@@ -41,20 +41,6 @@ fn sync_cursor<W: std::io::Write>(
     Ok(())
 }
 
-fn terminal_title(session_name: &str) -> String {
-    let name: String = session_name
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if name.is_empty() {
-        "hrdr".to_string()
-    } else {
-        format!("hrdr - {name}")
-    }
-}
-
 fn sync_title<W: std::io::Write>(
     out: &mut W,
     title: String,
@@ -70,7 +56,7 @@ fn sync_title<W: std::io::Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::{App, edited_file_message, handle_recovery_event, terminal_title};
+    use super::{App, edited_file_message, handle_recovery_event};
 
     #[test]
     fn edited_file_path_style_preserves_raw_path() {
@@ -120,21 +106,6 @@ mod tests {
         assert!(app.composer_is_empty());
         assert_eq!(app.steering_len_for_test(), 0);
     }
-
-    #[test]
-    fn terminal_title_uses_session_name() {
-        assert_eq!(terminal_title("release work"), "hrdr - release work");
-        assert_eq!(terminal_title("  release work  "), "hrdr - release work");
-    }
-
-    #[test]
-    fn terminal_title_drops_control_sequences() {
-        assert_eq!(
-            terminal_title("ship\u{1b}]0;spoof\u{7}"),
-            "hrdr - ship]0;spoof"
-        );
-        assert_eq!(terminal_title("\n\t"), "hrdr");
-    }
 }
 
 pub(crate) enum Wake {
@@ -173,7 +144,7 @@ pub(crate) async fn run_recovery_loop(app: &mut App, terminal: &mut Tui) -> Resu
         crate::cursor_backend::draw_frame(terminal, |f| ui::draw(f, app))?;
         sync_title(
             terminal.backend_mut(),
-            terminal_title(&app.state().name),
+            app.terminal_title(),
             &mut terminal_title_sent,
         )?;
         sync_cursor(
@@ -261,7 +232,7 @@ pub(crate) async fn run_loop(
         crate::cursor_backend::draw_frame(terminal, |f| ui::draw(f, app))?;
         sync_title(
             terminal.backend_mut(),
-            terminal_title(&app.state().name),
+            app.terminal_title(),
             &mut terminal_title_sent,
         )?;
         sync_cursor(

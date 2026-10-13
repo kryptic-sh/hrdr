@@ -874,3 +874,44 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
     rt.block_on(peer.close());
     Ok(())
 }
+
+/// 13. The terminal title reaches the terminal: an OSC title sequence carrying
+///     the status emoji and the working directory's name, on every platform
+///     (on Windows through ConPTY, which re-emits a console title as OSC).
+#[test]
+fn the_terminal_title_names_the_status_and_directory() -> Result<(), String> {
+    if skip_for_want_of_a_pty() {
+        return Ok(());
+    }
+    let server = MockServer::start(vec![]);
+    let mut s = Session::spawn(&server.base_url());
+    s.wait_for("mock-model", BOOT);
+    let place = s
+        ._project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let expected = format!("💤 {place}");
+    let start = Instant::now();
+    loop {
+        let raw = grab(&s.screen).clone();
+        if raw.contains(&format!("\u{1b}]0;{expected}"))
+            || raw.contains(&format!("\u{1b}]2;{expected}"))
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < EXIT,
+            "no OSC title {expected:?} in the terminal output: {:?}",
+            raw.match_indices("\u{1b}]")
+                .map(|(at, _)| raw[at..].chars().take(60).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    s.send("\x11");
+    assert!(s.wait_exit(EXIT).success());
+    Ok(())
+}

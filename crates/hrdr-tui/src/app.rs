@@ -89,6 +89,7 @@ mod handoff;
 pub(crate) use handoff::validate_handoff_payload;
 mod messaging;
 mod messaging_tools;
+mod title;
 pub use handoff::{
     AdmittedUpdate, DeferredUpdate, PreparedUpdateCoordinator, UpdateRequestReceiver,
     UpdateRequestSender, update_request_bridge,
@@ -792,6 +793,9 @@ pub(crate) struct App {
     admitted_update: Option<AdmittedUpdate>,
     /// Discovery and peer delivery for this session (`session_messaging`).
     pub(crate) messaging: messaging::MessagingState,
+    /// A turn finished and the user has not interacted since: the terminal
+    /// title shows it as done until they do.
+    turn_unseen: bool,
     /// A slash command's data output (`/status`, `/cost`, `/help`, …) shown
     /// in an Esc-dismissible popup. `None` when nothing is open.
     pub(crate) popup: Option<NoticePopup>,
@@ -1112,6 +1116,7 @@ impl App {
             update_preparing: false,
             admitted_update: None,
             messaging,
+            turn_unseen: false,
             popup: None,
             end_button: None,
             tool_hits: Vec::new(),
@@ -1334,6 +1339,7 @@ impl App {
     }
 
     pub(crate) fn on_key(&mut self, key: KeyEvent) -> Action {
+        self.note_user_input();
         if self.handoff_gate {
             return Action::None;
         }
@@ -1937,6 +1943,7 @@ impl App {
     /// spellings are already there: prefix it with `@`, or press Ctrl+]
     /// ([`Self::paste_clipboard`]), which reads the clipboard's *file* flavour.
     pub(crate) fn on_paste(&mut self, text: &str) {
+        self.note_user_input();
         if self.handoff_gate {
             return;
         }
@@ -2071,6 +2078,10 @@ impl App {
     /// Mouse: wheel scrolls the transcript; a left click on the follow button
     /// resumes following the newest output.
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
+        // Motion alone is the pointer passing over, not the user attending.
+        if m.kind != crossterm::event::MouseEventKind::Moved {
+            self.note_user_input();
+        }
         self.disarm();
         if let Some(sel) = &mut self.model_selector {
             selector_wheel(sel, m.kind);
@@ -3540,6 +3551,7 @@ impl App {
                     return;
                 }
                 self.registry.end_turn(hrdr_agent::MAIN_KEY);
+                self.turn_unseen = true;
                 self.prepare_deferred_update();
                 // `refresh_subagent_dir` may have skipped this while the completed
                 // turn held the mutex. Retry now, before saving or launching queued

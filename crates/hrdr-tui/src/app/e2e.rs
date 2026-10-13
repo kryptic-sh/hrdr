@@ -28,6 +28,7 @@ use crate::ui;
 use hrdr_agent::AgentConfig;
 
 mod messaging;
+mod title;
 
 /// Stand-in for the binary's `art.txt` (the TUI takes the art from its caller).
 const TEST_LOGO: &str = "██   ██ ██████  ██████  ██████\n██   ██ ██   ██ ██   ██ ██   ██\n███████ ██████  ██   ██ ██████\n██   ██ ██   ██ ██   ██ ██   ██\n██   ██ ██   ██ ██████  ██   ██";
