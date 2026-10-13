@@ -669,6 +669,14 @@ impl Agent {
                 // per turn to either finish the list or explicitly defer it,
                 // instead of silently accepting the promise as done.
                 if !nudged_this_turn && self.bg_handle_count() == 0 {
+                    // An item linked to a still-running watch is waiting, not
+                    // neglected: its watch's delivery wakes the agent to it.
+                    let watches = self
+                        .ctx
+                        .background_tasks
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
                     let unfinished: Vec<TodoItem> = self
                         .ctx
                         .todos
@@ -676,7 +684,9 @@ impl Agent {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .iter()
                         .filter(|t| {
-                            t.status.as_str() != "completed" && t.status.as_str() != "cancelled"
+                            t.status.as_str() != "completed"
+                                && t.status.as_str() != "cancelled"
+                                && !hrdr_tools::waits_on_running_watch(t, &watches)
                         })
                         .cloned()
                         .collect();

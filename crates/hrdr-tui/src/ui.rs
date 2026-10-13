@@ -1406,6 +1406,7 @@ mod todo_panel_tests {
             id: 7,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         };
         assert_eq!(todo_row(&t, "⠋"), "⠋ #7 fix it");
         // An id-less (legacy) item renders as `#0` — unassigned, but the shape
@@ -1415,6 +1416,7 @@ mod todo_panel_tests {
             id: 0,
             status: "completed".to_string(),
             evidence: None,
+            waits_on: None,
         };
         assert_eq!(todo_row(&t, "✓"), "✓ #0 legacy");
     }

@@ -1097,12 +1097,14 @@ async fn agent_run_nudges_once_then_ends_on_pending_todos() {
             id: 0,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         },
         TodoItem {
             content: "add a test".to_string(),
             id: 0,
             status: "pending".to_string(),
             evidence: None,
+            waits_on: None,
         },
     ];
 
@@ -1573,6 +1575,175 @@ async fn agent_run_resume_re_arms_restored_crons() {
     assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
 }
 
+fn running_watch(id: u64) -> hrdr_tools::BackgroundTask {
+    hrdr_tools::BackgroundTask {
+        id,
+        kind: hrdr_tools::BackgroundKind::Watch,
+        label: "watch: ci".to_string(),
+        ..Default::default()
+    }
+}
+
+fn todo_item(content: &str, status: &str, waits_on: Option<u64>) -> TodoItem {
+    TodoItem {
+        content: content.to_string(),
+        id: 0,
+        status: status.to_string(),
+        evidence: None,
+        waits_on,
+    }
+}
+
+/// A TODO item linked to a running watch is waiting, not neglected: the
+/// turn-end nudge leaves it out, and still names an unrelated unfinished item.
+#[tokio::test]
+async fn agent_run_nudges_only_items_not_waiting_on_a_running_watch() {
+    let server = MockServer::start(vec![
+        MockResp::Sse(vec![
+            text_chunk("c1", "Waiting on CI."),
+            stop_chunk("c1"),
+            "[DONE]".to_string(),
+        ]),
+        MockResp::Sse(vec![
+            text_chunk("c2", "Deferring the notes."),
+            stop_chunk("c2"),
+            "[DONE]".to_string(),
+        ]),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    agent
+        .background_tasks()
+        .lock()
+        .unwrap()
+        .push(running_watch(70));
+    *agent.todos().lock().unwrap() = vec![
+        todo_item("confirm the release published", "in_progress", Some(70)),
+        todo_item("write release notes", "pending", None),
+    ];
+
+    agent.run_input("release it", |_| {}).await.unwrap();
+
+    let nudges: Vec<&ChatMessage> = agent
+        .messages()
+        .iter()
+        .filter(|m| m.origin == MessageOrigin::Nudge)
+        .collect();
+    assert_eq!(nudges.len(), 1, "{nudges:?}");
+    let body = nudges[0].content.as_deref().unwrap();
+    assert!(body.contains("write release notes"), "{body}");
+    assert!(
+        !body.contains("confirm the release published"),
+        "the item waiting on a running watch is not nudged: {body}"
+    );
+}
+
+/// When every open item waits on a running watch the turn simply ends, so the
+/// agent can wait for the watch. Only one reply is queued: a nudge round would
+/// hang the request.
+#[tokio::test]
+async fn agent_run_does_not_nudge_when_every_open_item_waits_on_a_running_watch() {
+    let server = MockServer::start(vec![MockResp::Sse(vec![
+        text_chunk("c1", "Waiting on CI."),
+        stop_chunk("c1"),
+        "[DONE]".to_string(),
+    ])])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    agent
+        .background_tasks()
+        .lock()
+        .unwrap()
+        .push(running_watch(71));
+    *agent.todos().lock().unwrap() = vec![todo_item(
+        "confirm the release published",
+        "in_progress",
+        Some(71),
+    )];
+
+    agent.run_input("release it", |_| {}).await.unwrap();
+
+    assert!(
+        !agent
+            .messages()
+            .iter()
+            .any(|m| m.origin == MessageOrigin::Nudge)
+    );
+}
+
+/// A link to a watch that has already ended blocks nothing: the item is nudged
+/// like any other unfinished one.
+#[tokio::test]
+async fn agent_run_nudges_an_item_whose_watch_has_ended() {
+    let server = MockServer::start(vec![
+        MockResp::Sse(vec![
+            text_chunk("c1", "Done for now."),
+            stop_chunk("c1"),
+            "[DONE]".to_string(),
+        ]),
+        MockResp::Sse(vec![
+            text_chunk("c2", "Deferring."),
+            stop_chunk("c2"),
+            "[DONE]".to_string(),
+        ]),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    let mut ended = running_watch(72);
+    ended.done = true;
+    ended.delivered = true;
+    agent.background_tasks().lock().unwrap().push(ended);
+    *agent.todos().lock().unwrap() = vec![todo_item(
+        "confirm the release published",
+        "in_progress",
+        Some(72),
+    )];
+
+    agent.run_input("release it", |_| {}).await.unwrap();
+
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|m| m.origin == MessageOrigin::Nudge),
+        "a stale link must not leave the item blocked forever"
+    );
+}
+
+/// The watch's delivery names the items that waited on it, whatever its
+/// outcome, so the agent reassesses them instead of leaving them parked.
+#[test]
+fn a_delivered_watch_names_the_items_waiting_on_it() {
+    let mut agent = Agent::new(AgentConfig::default()).unwrap();
+    let mut finished = running_watch(73);
+    finished.done = true;
+    finished.result = Some("watch #73 timed out after 60s".to_string());
+    agent.background_tasks().lock().unwrap().push(finished);
+    *agent.todos().lock().unwrap() = vec![
+        todo_item("confirm the release published", "in_progress", Some(73)),
+        todo_item("unrelated", "pending", None),
+    ];
+
+    agent.drain_background(&mut |_| {});
+
+    let delivered = agent
+        .messages()
+        .last()
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or_default()
+        .to_string();
+    assert!(delivered.contains("timed out"), "{delivered}");
+    assert!(delivered.contains("waiting on watch #73"), "{delivered}");
+    assert!(
+        delivered.contains("confirm the release published"),
+        "{delivered}"
+    );
+    assert!(!delivered.contains("unrelated"), "{delivered}");
+}
+
 /// No pending TODOs (empty list, or every item already `completed`) means
 /// nothing to nudge about — the turn ends on the first text-only reply,
 /// same as before this defense existed. The mock server has only one
@@ -1594,6 +1765,7 @@ async fn agent_run_no_nudge_when_todos_all_completed() {
         id: 0,
         status: "completed".to_string(),
         evidence: None,
+        waits_on: None,
     }];
 
     let mut events: Vec<AgentEvent> = Vec::new();
@@ -1636,12 +1808,14 @@ async fn agent_run_no_nudge_when_todos_completed_or_cancelled() {
             id: 0,
             status: "completed".to_string(),
             evidence: None,
+            waits_on: None,
         },
         TodoItem {
             content: "skip the other".to_string(),
             id: 0,
             status: "cancelled".to_string(),
             evidence: None,
+            waits_on: None,
         },
     ];
 
@@ -1686,6 +1860,7 @@ async fn agent_run_no_nudge_while_a_background_subagent_is_running() {
         id: 0,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
     let handle = tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -1751,6 +1926,7 @@ async fn agent_run_wrap_up_round_never_nudges() {
         id: 0,
         status: "pending".to_string(),
         evidence: None,
+        waits_on: None,
     }];
 
     let mut events: Vec<AgentEvent> = Vec::new();
@@ -2124,12 +2300,14 @@ async fn agent_run_re_nudges_when_nudged_todos_are_deleted_not_resolved() {
             id: 0,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         },
         TodoItem {
             content: "add a test".to_string(),
             id: 0,
             status: "pending".to_string(),
             evidence: None,
+            waits_on: None,
         },
     ];
 
@@ -2212,12 +2390,14 @@ async fn agent_run_does_not_re_nudge_when_todos_are_resolved_in_place() {
             id: 0,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         },
         TodoItem {
             content: "add a test".to_string(),
             id: 0,
             status: "pending".to_string(),
             evidence: None,
+            waits_on: None,
         },
     ];
 

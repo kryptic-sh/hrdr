@@ -1068,12 +1068,14 @@ mod tests {
                 id: 1,
                 status: "pending".to_string(),
                 evidence: None,
+                waits_on: None,
             },
             hrdr_tools::TodoItem {
                 content: "add a test".to_string(),
                 id: 2,
                 status: "in_progress".to_string(),
                 evidence: None,
+                waits_on: None,
             },
         ];
 
@@ -1117,6 +1119,7 @@ mod tests {
             id: 2,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         }];
 
         let sent = prepare_outgoing_tracked(

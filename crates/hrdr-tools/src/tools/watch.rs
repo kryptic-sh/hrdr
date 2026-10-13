@@ -87,9 +87,11 @@ impl Tool for WatchTool {
          and wake me when it does. For a CI run finishing, a deploy's health endpoint coming up, a \
          build artifact appearing — things that complete on their own schedule. The call returns an \
          id immediately; END YOUR TURN, and the result is delivered to you like a finished background \
-         task when the condition flips. The check runs under the same guardrails and sandbox as \
-         `shell`; a check blocked by a guardrail stops the watch. Cancel a watch with `task_cancel \
-         <id>`. Not a general repeat-a-command tool — use `shell` when you want a command's output."
+         task when the condition flips. A TODO item that cannot progress until then can name the \
+         id in its `waits_on`, so ending your turn does not count it as unfinished. The check runs \
+         under the same guardrails and sandbox as `shell`; a check blocked by a guardrail stops the \
+         watch. Cancel a watch with `task_cancel <id>`. Not a general repeat-a-command tool — use \
+         `shell` when you want a command's output."
     }
 
     /// The check command may mutate the tree (like any `shell` command); it is

@@ -2060,7 +2060,14 @@ impl hrdr_tools::Tool for TaskCancelTool {
         if kind == "watch" {
             Ok(format!(
                 "Cancelled watch #{id}. It only polled a check — nothing was written to your \
-                 working directory, and its result will not be delivered."
+                 working directory, and its result will not be delivered.{}",
+                hrdr_tools::watch_dependents_note(
+                    &ctx.todos
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    id,
+                )
+                .unwrap_or_default()
             ))
         } else {
             Ok(format!(

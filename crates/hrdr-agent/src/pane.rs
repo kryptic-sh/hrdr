@@ -1056,6 +1056,7 @@ mod tests {
             id: 0,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         }]));
         live.update(1, |e| {
             e.effort = Some("high".into());

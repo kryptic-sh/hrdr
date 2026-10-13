@@ -70,7 +70,7 @@ pub use tools::{
     DEFAULT_VERIFY_TIMEOUT_SECS, DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, EditTool,
     FindTool, GoalTool, GrepTool, LsTool, ReadTool, ReplaceTool, Shell, ShellTool, TodoTool,
     TreeTool, VerifyTool, WatchTool, WriteTool, available_shell_tools, redact_secret_diffs,
-    run_user_command,
+    run_user_command, waits_on_running_watch, watch_dependents_note,
 };
 pub use verification::{CheckKind, Scope, VerificationLedger};
 pub use web::{WebFetchTool, WebSearchTool};
@@ -120,6 +120,12 @@ pub struct TodoItem {
     /// items restored from a session saved before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// The id of the `watch` this item is waiting on. While that watch is
+    /// running the item is blocked, not neglected, so the turn-end nudge leaves
+    /// it alone; once the watch finishes, its delivery names the item for
+    /// reassessment. A link to a watch that is no longer running is inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waits_on: Option<u64>,
 }
 
 fn default_status() -> String {

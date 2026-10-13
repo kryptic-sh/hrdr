@@ -1141,6 +1141,7 @@ mod tests {
             id: 0,
             status: status.to_string(),
             evidence: None,
+            waits_on: None,
         };
         let mut todos = vec![
             todo("done thing", "completed"),

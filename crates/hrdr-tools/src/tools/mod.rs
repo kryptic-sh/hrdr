@@ -137,7 +137,7 @@ pub use read::ReadTool;
 pub use replace::ReplaceTool;
 pub use secret_diff::redact_secret_diffs;
 pub use shell::{CommandRun, Shell, ShellTool, available_shell_tools, run_user_command};
-pub use todo::TodoTool;
+pub use todo::{TodoTool, waits_on_running_watch, watch_dependents_note};
 pub use tree::TreeTool;
 pub use verify::{DEFAULT_VERIFY_TIMEOUT_SECS, VerifyTool};
 pub use watch::{DEFAULT_WATCH_INTERVAL_SECS, DEFAULT_WATCH_TIMEOUT_SECS, WatchTool};

@@ -4546,6 +4546,7 @@ mod roundtrip_audit {
                 id: 0,
                 status: "completed".into(),
                 evidence: None,
+                waits_on: None,
             }],
             goals: vec![hrdr_tools::GoalItem {
                 content: "a goal".into(),

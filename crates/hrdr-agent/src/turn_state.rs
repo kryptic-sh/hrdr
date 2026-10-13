@@ -145,7 +145,16 @@ impl Agent {
             )));
             let body =
                 format!("[Background task #{id} ({label}) finished — its result:]\n{result}");
-            let body = format!("{body}{}", Self::BACKGROUND_ARRIVAL_REMINDER);
+            let dependents = hrdr_tools::watch_dependents_note(
+                &self
+                    .ctx
+                    .todos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                id,
+            )
+            .unwrap_or_default();
+            let body = format!("{body}{dependents}{}", Self::BACKGROUND_ARRIVAL_REMINDER);
             self.push_user_message(body, MessageOrigin::Tool);
         }
     }

@@ -30,7 +30,8 @@ impl Tool for TodoTool {
                         "properties": {
                             "content": {"type": "string", "description": "The task, in a few words."},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"], "description": "pending: not started. in_progress: exactly one item at a time. completed: done. cancelled: abandoned."},
-                            "evidence": {"type": "string", "description": "How you verified this item: the command you ran and what it reported (e.g. `cargo test -p x: 12 passed`). REQUIRED to move an item to `completed` — the call is rejected without it. Omit for every other status."}
+                            "evidence": {"type": "string", "description": "How you verified this item: the command you ran and what it reported (e.g. `cargo test -p x: 12 passed`). REQUIRED to move an item to `completed` — the call is rejected without it. Omit for every other status."},
+                            "waits_on": {"type": "integer", "description": "The id of a running `watch` this item cannot progress without. While that watch runs, ending your turn does not count the item as left unfinished; when the watch reports, reassess the item. Only for pending or in_progress items."}
                         },
                         "required": ["content", "status"]
                     }
@@ -67,6 +68,9 @@ impl Tool for TodoTool {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(err) = unevidenced_completions(&prior, &items) {
+                bail!(err);
+            }
+            if let Some(err) = invalid_watch_links(ctx, &items) {
                 bail!(err);
             }
             assign_ids(&prior, &mut items);
@@ -149,11 +153,13 @@ fn parse_item(v: serde_json::Value) -> Result<TodoItem> {
         })
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let waits_on = m.remove("waits_on").and_then(|w| w.as_u64());
     Ok(TodoItem {
         content,
         id,
         status,
         evidence,
+        waits_on,
     })
 }
 
@@ -194,6 +200,78 @@ fn unevidenced_completions(prior: &[TodoItem], next: &[TodoItem]) -> Option<Stri
             .collect::<Vec<_>>()
             .join(", "),
     ))
+}
+
+/// The error owed when an item names a `waits_on` that is not a running watch,
+/// or `None` when every link is valid. A link on a finished item is refused
+/// too: only work still to do can be blocked.
+fn invalid_watch_links(ctx: &ToolContext, items: &[TodoItem]) -> Option<String> {
+    let tasks = ctx
+        .background_tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let problems: Vec<String> = items
+        .iter()
+        .filter_map(|t| {
+            let watch = t.waits_on?;
+            if !matches!(t.status.as_str(), "pending" | "in_progress") {
+                return Some(format!(
+                    "`{}` is {} — only pending or in_progress items can wait on a watch",
+                    t.content, t.status
+                ));
+            }
+            (!waits_on_running_watch(t, &tasks)).then(|| {
+                format!(
+                    "`{}` waits on #{watch}, which is not a running watch",
+                    t.content
+                )
+            })
+        })
+        .collect();
+    if problems.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "invalid `waits_on`: {}\nLink an item only to a watch that is still running (the id the \
+         `watch` call returned), or drop `waits_on`.",
+        problems.join("; ")
+    ))
+}
+
+/// Whether `item` is blocked on a watch that is still running — the one case
+/// in which an unfinished item is waiting rather than neglected. A link to a
+/// finished, cancelled or unknown watch is inert.
+pub fn waits_on_running_watch(item: &TodoItem, tasks: &[crate::BackgroundTask]) -> bool {
+    item.waits_on.is_some_and(|watch| {
+        tasks.iter().any(|task| {
+            task.id == watch
+                && task.kind == crate::BackgroundKind::Watch
+                && !task.done
+                && !task.cancelled
+        })
+    })
+}
+
+/// The note naming the unfinished TODO items that wait on watch `id`, now that
+/// the watch has ended — or `None` when nothing waits on it. Whatever the
+/// outcome (met, failed, timed out, cancelled), those items are no longer
+/// blocked, so the agent is asked to reassess each one rather than leave it
+/// waiting on a watch that will never report again.
+pub fn watch_dependents_note(todos: &[TodoItem], id: u64) -> Option<String> {
+    let waiting: Vec<String> = todos
+        .iter()
+        .filter(|t| {
+            t.waits_on == Some(id) && matches!(t.status.as_str(), "pending" | "in_progress")
+        })
+        .map(|t| format!("#{} {}", t.id, t.content))
+        .collect();
+    (!waiting.is_empty()).then(|| {
+        format!(
+            "\n\n[TODO items waiting on watch #{id}, which has ended — reassess each now: finish \
+             it, update it, or cancel it, and drop its `waits_on`:\n{}]",
+            waiting.join("\n")
+        )
+    })
 }
 
 /// Give every incoming item with `id == 0` a stable reference id.
@@ -262,7 +340,11 @@ fn render_todos(todos: &[TodoItem]) -> String {
             "in_progress" => "⠋",
             _ => " ",
         };
-        out.push_str(&format!("#{} {mark} {}\n", t.id, t.content));
+        out.push_str(&format!("#{} {mark} {}", t.id, t.content));
+        if let Some(watch) = t.waits_on {
+            out.push_str(&format!(" (waits on watch #{watch})"));
+        }
+        out.push('\n');
         // Echo the evidence back under its item. It is the model's own claim,
         // and putting it where the user reads the list is what makes an empty
         // one visible to somebody other than the model that wrote it.
@@ -283,6 +365,7 @@ mod tests {
             id: 0,
             status: status.to_string(),
             evidence: evidence.map(str::to_string),
+            waits_on: None,
         }
     }
 
@@ -292,6 +375,7 @@ mod tests {
             id,
             status: status.to_string(),
             evidence: evidence.map(str::to_string),
+            waits_on: None,
         }
     }
 
@@ -426,5 +510,85 @@ mod tests {
             "minting starts past the largest id seen, echoed ones included"
         );
         assert_eq!(next[2].id, 102, "minting continues in order");
+    }
+
+    fn watch(id: u64, done: bool) -> crate::BackgroundTask {
+        crate::BackgroundTask {
+            id,
+            kind: crate::BackgroundKind::Watch,
+            done,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn waits_on_must_name_a_running_watch_and_renders_with_its_item() {
+        let ctx = ToolContext::new(".");
+        ctx.background_tasks
+            .lock()
+            .unwrap()
+            .extend([watch(40, false), watch(41, true)]);
+        let call = |todos: serde_json::Value| TodoTool.execute(json!({ "todos": todos }), &ctx);
+
+        let listed = call(json!([
+            {"content": "confirm the release", "status": "in_progress", "waits_on": 40}
+        ]))
+        .await
+        .unwrap();
+        assert!(
+            listed.contains("confirm the release (waits on watch #40)"),
+            "{listed}"
+        );
+        assert_eq!(ctx.todos.lock().unwrap()[0].waits_on, Some(40));
+
+        for (todos, why) in [
+            (
+                json!([{"content": "a", "status": "pending", "waits_on": 41}]),
+                "a finished watch",
+            ),
+            (
+                json!([{"content": "a", "status": "pending", "waits_on": 99}]),
+                "an unknown id",
+            ),
+            (
+                json!([{"content": "a", "status": "cancelled", "waits_on": 40}]),
+                "a finished item",
+            ),
+        ] {
+            let error = call(todos).await.unwrap_err().to_string();
+            assert!(error.contains("invalid `waits_on`"), "{why}: {error}");
+        }
+        assert_eq!(
+            ctx.todos.lock().unwrap()[0].content,
+            "confirm the release",
+            "a refused call leaves the list as it was"
+        );
+    }
+
+    #[test]
+    fn only_a_running_watch_blocks_and_only_open_items_are_named_when_it_ends() {
+        let tasks = [watch(40, false), watch(41, true)];
+        let mut blocked = item("deploy", "pending", None);
+        blocked.waits_on = Some(40);
+        assert!(waits_on_running_watch(&blocked, &tasks));
+        blocked.waits_on = Some(41);
+        assert!(
+            !waits_on_running_watch(&blocked, &tasks),
+            "an ended watch is inert"
+        );
+        blocked.waits_on = None;
+        assert!(!waits_on_running_watch(&blocked, &tasks));
+
+        let mut open = item_with_id("confirm", "in_progress", None, 3);
+        open.waits_on = Some(40);
+        let mut closed = item_with_id("old", "completed", Some("ok"), 4);
+        closed.waits_on = Some(40);
+        let note = watch_dependents_note(&[open, closed], 40).unwrap();
+        assert!(note.contains("#3 confirm"), "{note}");
+        assert!(
+            !note.contains("#4 old"),
+            "a finished item is not reassessed: {note}"
+        );
+        assert!(watch_dependents_note(&[], 40).is_none());
     }
 }

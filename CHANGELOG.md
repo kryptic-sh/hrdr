@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A TODO item can wait on a running watch.** The `todo` tool accepts
+  `waits_on: <watch id>` on a pending or in-progress item and rejects a link to
+  anything but a running watch. While the watch runs, the turn-end nudge leaves
+  that item alone and still nudges unrelated unfinished ones; when the watch
+  succeeds, fails, times out or is cancelled, its report names the waiting items
+  for reassessment, and a link to an ended watch blocks nothing
+  (`crates/hrdr-tools`, `crates/hrdr-agent`).
 - **Interactive sessions can message your other hrdr sessions.** Each TUI
   session registers its id, name and working directory for same-user discovery.
   The new `sessions` and `message_session` tools let the agent list the others

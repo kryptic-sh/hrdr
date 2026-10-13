@@ -629,6 +629,7 @@ async fn idle_logo_redraws_on_timer_only_while_its_glyphs_are_visible() {
                 content: "working".into(),
                 status: "in_progress".into(),
                 evidence: None,
+                waits_on: None,
             }]
         };
         term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -4492,6 +4493,7 @@ async fn todo_panel_copy_contains_no_rule() {
         id: 7,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
 
     let mut term = Terminal::new(TestBackend::new(WIDTH, 24)).unwrap();
@@ -7411,24 +7413,28 @@ async fn the_todo_panel_matches_the_input_pane_but_for_a_green_rule() {
             id: 0,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         },
         hrdr_agent::Todo {
             content: "wait here".to_string(),
             id: 0,
             status: "pending".to_string(),
             evidence: None,
+            waits_on: None,
         },
         hrdr_agent::Todo {
             content: "landed".to_string(),
             id: 0,
             status: "completed".to_string(),
             evidence: None,
+            waits_on: None,
         },
         hrdr_agent::Todo {
             content: "skip it".to_string(),
             id: 0,
             status: "cancelled".to_string(),
             evidence: None,
+            waits_on: None,
         },
     ];
 
@@ -7529,12 +7535,14 @@ async fn clicking_the_finished_row_unfolds_the_done_todos() {
             id: 0,
             status: "in_progress".to_string(),
             evidence: None,
+            waits_on: None,
         },
         hrdr_agent::Todo {
             content: "landed".to_string(),
             id: 0,
             status: "completed".to_string(),
             evidence: None,
+            waits_on: None,
         },
     ];
 
@@ -7624,6 +7632,7 @@ async fn each_panel_owns_a_blank_row_above_it() {
         id: 0,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
     let rows = draw(&mut h, &mut term);
     let text_y = rows
@@ -8065,6 +8074,7 @@ async fn the_generating_line_closes_the_transcript() {
         id: 0,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
     h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
     // The loader tracks the *model* working, not merely a turn being in flight.
@@ -11641,6 +11651,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         id: 0,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
 
     // Register a sub-agent with its own TODO.
@@ -11650,6 +11661,7 @@ async fn the_todo_panel_shows_the_active_agents_list() {
         id: 0,
         status: "pending".to_string(),
         evidence: None,
+        waits_on: None,
     }]));
     let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.registry.register(hrdr_agent::AgentEntry {
@@ -11720,6 +11732,7 @@ async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
         id: 0,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
 
     // Register a running sub-agent with its own TODO.
@@ -11729,6 +11742,7 @@ async fn the_todo_panel_stays_up_while_a_sub_agent_runs() {
         id: 0,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }]));
     let sub_agent = hrdr_agent::Agent::new(hrdr_agent::AgentConfig::default()).unwrap();
     h.app.registry.register(hrdr_agent::AgentEntry {
@@ -11799,6 +11813,7 @@ async fn the_todo_panel_sits_one_blank_row_off_the_block_above() {
         id: 7,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
     h.app.push_entry(Entry::assistant("hello there"));
 
@@ -11909,6 +11924,7 @@ async fn a_tinted_block_above_the_todo_panel_gets_the_separator() {
         id: 7,
         status: "in_progress".to_string(),
         evidence: None,
+        waits_on: None,
     }];
     h.app.push_entry(Entry::user("a user prompt"));
 

@@ -5683,6 +5683,40 @@ mod tests {
     /// `task_cancel` stops a watch: the poller stops before the round that
     /// would pass, nothing is delivered, and the success message names a watch
     /// instead of promising edits to check with `git diff`.
+    /// Cancelling a watch ends what its TODO items waited on, and the cancel
+    /// is the only report the agent gets, so it names them for reassessment.
+    #[tokio::test]
+    async fn task_cancel_of_a_watch_names_the_items_waiting_on_it() {
+        let agent = Agent::new(AgentConfig::default()).unwrap();
+        agent
+            .background_tasks()
+            .lock()
+            .unwrap()
+            .push(hrdr_tools::BackgroundTask {
+                id: 81,
+                kind: hrdr_tools::BackgroundKind::Watch,
+                label: "watch: ci".to_string(),
+                ..Default::default()
+            });
+        *agent.todos().lock().unwrap() = vec![hrdr_tools::TodoItem {
+            content: "confirm the release published".to_string(),
+            id: 5,
+            status: "in_progress".to_string(),
+            evidence: None,
+            waits_on: Some(81),
+        }];
+        let tool = TaskCancelTool {
+            bg_handles: bg_handles(),
+            live: agent.registry(),
+        };
+        let out = tool
+            .execute(serde_json::json!({"id": 81}), &agent.ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("Cancelled watch #81"), "{out}");
+        assert!(out.contains("#5 confirm the release published"), "{out}");
+    }
+
     #[tokio::test]
     async fn task_cancel_stops_a_watch_and_says_so() {
         let Some(shell) = hrdr_tools::Shell::detect() else {

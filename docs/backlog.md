@@ -130,17 +130,11 @@ push each verified slice to `main` before proceeding to the next slice.
    guardrails, quoting, timeouts, and process cleanup for each selected shell.
    Test discovery, priority, explicit selection, missing-shell errors, and
    prompt accuracy across the supported CI matrix.
-8. **Watch-aware TODO nudges.** Let a TODO item explicitly reference the watch
-   job it is waiting for, so the harness can track the dependency. Suppress
-   end-of-turn completion nudges for items blocked on a running watch and let
-   the agent wait for its result. Continue nudging unrelated actionable TODOs.
-   On watch success, failure, timeout, or cancellation, deliver the outcome and
-   reassess the dependent TODO rather than silently completing it or leaving it
-   blocked forever. Validate references and cover watch completion races and
-   stale links in tests. This interprets the request's repeated "TODO item"
-   wording as a TODO-to-watch link; clarify whether TODO-to-TODO dependencies
-   are additionally wanted before expanding the scope.
-
+8. **TODO-to-TODO dependencies — question for the owner.** Watch-aware TODO
+   nudges shipped: an item's `waits_on` names a running watch (see the
+   changelog). The request's repeated "TODO item" wording could also mean one
+   TODO item waiting on another; that was not built. Should it be, and should a
+   blocked item then be exempt from the nudge the same way?
 9. **Self-update, restart, and turn continuation — requested 2026-10-09.**
    Highest priority after finishing the current path-rendering slice, per the
    user's clarification; take this before the other Windows backlog items. Add a
