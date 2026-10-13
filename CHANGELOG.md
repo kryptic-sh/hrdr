@@ -125,6 +125,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The system prompt treats a project backlog as the queue of requested work.**
+  A committing main agent now records every task the user asks for in the
+  backlog as soon as it is asked, including requests made while another task is
+  running, and keeps entries current so a stopped session can resume without
+  losing them (`crates/hrdr-agent`).
 - **Compaction now splits oversized newest turns instead of preserving them
   whole.** When the latest turn exceeds the verbatim-tail token budget,
   `Agent::compact` keeps only a message-aligned suffix so compacted sessions do

@@ -1918,6 +1918,39 @@ mod tests {
         );
     }
 
+    /// A backlog doubles as the queue of what the user asked for, so a session
+    /// can stop and resume: every new request is recorded there when it is made,
+    /// even one that arrives while another task is running. Only the committing
+    /// main agent maintains it; a read-only agent or a sub-agent does not.
+    #[test]
+    fn the_prompt_says_record_every_requested_task_in_the_backlog() {
+        let tools = ToolRegistry::with_defaults();
+        let write = render_system(&tools, false).unwrap();
+        assert!(
+            says(&write, "record every new task the user asks for in it"),
+            "{write}"
+        );
+        assert!(
+            says(
+                &write,
+                "including work requested while another task is still in progress"
+            ),
+            "requests added mid-task are queued too"
+        );
+        assert!(
+            says(&write, "resumable from it without losing a request"),
+            "the point of the rule is stop/resume"
+        );
+
+        let mut ro = ToolRegistry::with_defaults();
+        let names = ro.read_only_names();
+        ro.retain_only(&names);
+        let read = render_system(&ro, false).unwrap();
+        assert!(!says(&read, "record every new task the user asks for"));
+        let sub = render_system(&tools, true).unwrap();
+        assert!(!says(&sub, "record every new task the user asks for"));
+    }
+
     /// Sub-agents run in parallel in one tree, so each appending to
     /// `[Unreleased]` would collide. A sub-agent is therefore told NOT to touch the
     /// changelog — it does not get the "log as you work" rule — and the main

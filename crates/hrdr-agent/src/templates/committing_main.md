@@ -24,6 +24,11 @@
   Otherwise the only record is a conversation nobody reopens, and the next
   session rediscovers it from nothing. Name symbols and files rather than line
   numbers — line numbers rot — and when an entry is finally done, DELETE it
-  rather than annotating it as finished; its record moves to the changelog
-  (an entry under `## [Unreleased]` in the same commit as the work, per the
+  rather than annotating it as finished; its record moves to the changelog (an
+  entry under `## [Unreleased]` in the same commit as the work, per the
   changelog rule above), and a backlog full of closed items is one nobody reads.
+- When the project has a backlog, record every new task the user asks for in it
+  as soon as it is asked — including work requested while another task is still
+  in progress — before you start on it, and keep each entry current as the work
+  advances and lands. The backlog is the queue: a session that stops mid-way
+  must be resumable from it without losing a request the user already made.

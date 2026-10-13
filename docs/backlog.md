@@ -81,18 +81,13 @@ push each verified slice to `main` before proceeding to the next slice.
    Implement and test initial naming and subsequent meaningful renaming after
    the preceding queued work. The handling of explicitly user-assigned names
    remains a design decision to resolve before implementation.
-5. **Queued-work system-prompt rule.** Update hrdr's system prompt so that, when
-   a backlog file exists, every new task requested by the user is recorded
-   there, including work added while another task is in progress. Keep the
-   backlog current as work is completed so sessions can stop and resume without
-   losing queued requests. Add regression coverage for the prompt rule.
-6. **Dependency updates.** Update the project's dependencies to current stable
+5. **Dependency updates.** Update the project's dependencies to current stable
    releases using the package manager, regenerate lockfiles, resolve API
    compatibility changes, and run the full verification and dependency checks.
    Reassess previously deferred upgrades against current upstream releases;
    record any upgrades still blocked and why. Commit and push verified slices to
    `main` after the preceding queued work.
-7. **Cross-platform terminal titles.** Fix the reported Windows behavior where
+6. **Cross-platform terminal titles.** Fix the reported Windows behavior where
    the title remains `PowerShell`. On Windows, macOS, and Linux, display the
    working-directory basename and current session name, prefixed by a status
    emoji as the first character, similar to Claude Code CLI. Distinguish busy /
@@ -101,7 +96,7 @@ push each verified slice to `main` before proceeding to the next slice.
    title implementation rather than adding a competing update path. Test the
    title content and lifecycle updates across the supported CI matrix, with
    local Windows and WSL checks for faster feedback.
-8. **Multiple selectable shells.** Extend the shell tool so the LLM can select
+7. **Multiple selectable shells.** Extend the shell tool so the LLM can select
    an available shell per command on Windows, macOS, and Linux. Prefer Bash by
    default on every platform: on Windows specifically resolve Git Bash ahead of
    PowerShell, falling back to PowerShell when Git Bash is unavailable. Do not
@@ -113,7 +108,7 @@ push each verified slice to `main` before proceeding to the next slice.
    guardrails, quoting, timeouts, and process cleanup for each selected shell.
    Test discovery, priority, explicit selection, missing-shell errors, and
    prompt accuracy across the supported CI matrix.
-9. **Headless-first GUI testing guidelines.** Add guidance to hrdr's system
+8. **Headless-first GUI testing guidelines.** Add guidance to hrdr's system
    prompt for unit and end-to-end tests requiring graphical facilities: prefer
    headless execution or an isolated graphical environment so tests do not open
    windows, steal focus, or send input to the user's active desktop. Cover Linux
@@ -125,18 +120,18 @@ push each verified slice to `main` before proceeding to the next slice.
    behavior. When interactive UI is unavoidable, require explicit permission
    before running on the user's desktop and report the limitation. Validate
    platform-specific instructions and add regression coverage for the guidance.
-10. **Watch-aware TODO nudges.** Let a TODO item explicitly reference the watch
-    job it is waiting for, so the harness can track the dependency. Suppress
-    end-of-turn completion nudges for items blocked on a running watch and let
-    the agent wait for its result. Continue nudging unrelated actionable TODOs.
-    On watch success, failure, timeout, or cancellation, deliver the outcome and
-    reassess the dependent TODO rather than silently completing it or leaving it
-    blocked forever. Validate references and cover watch completion races and
-    stale links in tests. This interprets the request's repeated "TODO item"
-    wording as a TODO-to-watch link; clarify whether TODO-to-TODO dependencies
-    are additionally wanted before expanding the scope.
+9. **Watch-aware TODO nudges.** Let a TODO item explicitly reference the watch
+   job it is waiting for, so the harness can track the dependency. Suppress
+   end-of-turn completion nudges for items blocked on a running watch and let
+   the agent wait for its result. Continue nudging unrelated actionable TODOs.
+   On watch success, failure, timeout, or cancellation, deliver the outcome and
+   reassess the dependent TODO rather than silently completing it or leaving it
+   blocked forever. Validate references and cover watch completion races and
+   stale links in tests. This interprets the request's repeated "TODO item"
+   wording as a TODO-to-watch link; clarify whether TODO-to-TODO dependencies
+   are additionally wanted before expanding the scope.
 
-11. **Self-update, restart, and turn continuation — requested 2026-10-09.**
+10. **Self-update, restart, and turn continuation — requested 2026-10-09.**
     Highest priority after finishing the current path-rendering slice, per the
     user's clarification; take this before the other Windows backlog items. Add
     a model tool for working on the hrdr codebase that installs hrdr through
@@ -204,7 +199,7 @@ push each verified slice to `main` before proceeding to the next slice.
     `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`:
     a writer timed out acquiring `auth.json.lock`; preserve and root-cause that
     contention before treating a later self-update gate as green.
-12. **Windows multiline-paste transport investigation — deferred branch.**
+11. **Windows multiline-paste transport investigation — deferred branch.**
     Pending work is preserved and pushed at `wip/windows-paste-transport` commit
     `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY
     LF/CRLF regressions, approved `crossterm_winapi` test-only probes, and the
@@ -215,7 +210,7 @@ push each verified slice to `main` before proceeding to the next slice.
     Crossterm parser path; verify loaded DLL and host paths so fallback cannot
     masquerade as a result. Do not merge this branch or release from it until
     the regressions pass across the required matrix.
-13. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
+12. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
     implementation: usage accounting, request categorization, and credit usage
