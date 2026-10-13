@@ -833,16 +833,28 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
     };
     assert_eq!(message.sent, "PING_FROM_TUI");
     let sender = message.peer.expect("peer provenance");
-    let target = rt
-        .block_on(peer.discover())
-        .unwrap()
-        .into_iter()
-        // Other tests' sessions share the directory and can share an id; the
-        // id and cwd pair is what names one session, as `message_session` uses.
-        .find(|session| {
+    // Polled: under a loaded parallel run a live session's probe can miss its
+    // deadline. Other tests' sessions share the directory and can share an id;
+    // the id and cwd pair is what names one session, as `message_session` uses.
+    let start = Instant::now();
+    let target = loop {
+        let live = rt.block_on(peer.discover()).unwrap();
+        if let Some(target) = live.iter().find(|session| {
             session.session_id == sender.session_id && session.working_directory == sender.cwd
-        })
-        .expect("the TUI session is discoverable under the id and cwd it sent as");
+        }) {
+            break target.clone();
+        }
+        assert!(
+            start.elapsed() < EXIT,
+            "the TUI session ({:?} in {:?}) never became discoverable; discovery saw: {:?}",
+            sender.session_id,
+            sender.cwd,
+            live.iter()
+                .map(|session| (&session.session_id, &session.working_directory))
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
         rt.block_on(peer.send(&target, "PONG_FROM_PEER".into()))
             .unwrap(),
