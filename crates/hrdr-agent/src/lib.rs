@@ -6638,6 +6638,7 @@ mod tests {
             prompt_cache_ttl: Some("1h".to_string()),
             subagents: Some(false),
             memory: Some(false),
+            session_messaging: Some(false),
             memory_dir: Some("/tmp/mem".to_string()),
             subagent_model: Some(spec("claude-sonnet-4-6")),
             subagent: vec![],
@@ -6703,6 +6704,7 @@ mod tests {
         assert!(cfg.allow_unpriced);
         assert!(!cfg.subagents);
         assert!(!cfg.memory);
+        assert!(!cfg.session_messaging);
         assert_eq!(
             cfg.memory_dir.as_deref(),
             Some(std::path::Path::new("/tmp/mem"))

@@ -391,6 +391,11 @@ pub struct AgentConfig {
     /// Default `true`; `$HRDR_MEMORY`. Storage lives under the XDG data dir
     /// (project-scoped by cwd, plus a shared global scope).
     pub memory: bool,
+    /// Let other hrdr sessions run by the same OS user discover this session and
+    /// send its agent messages, which arrive marked as peer messages rather than
+    /// human input. Default `true`; `session_messaging = false` or
+    /// `$HRDR_SESSION_MESSAGING=0` turns it off.
+    pub session_messaging: bool,
     /// Turns a completed TODO stays in the list before it is aged out. The list is
     /// agent state the model re-reads every turn, so this is the agent's business:
     /// without it a headless run (or any sub-agent) accumulates finished items
@@ -805,6 +810,7 @@ pub(crate) struct FileConfig {
     pub(crate) allow_unpriced: Option<bool>,
     pub(crate) subagents: Option<bool>,
     pub(crate) memory: Option<bool>,
+    pub(crate) session_messaging: Option<bool>,
     pub(crate) memory_dir: Option<String>,
     pub(crate) subagent_model: Option<ModelSpec>,
     #[serde(default)]
@@ -1055,6 +1061,7 @@ impl Default for AgentConfig {
             api_version: None,
             subagents: true,
             memory: true,
+            session_messaging: true,
             todo_ttl: DEFAULT_TODO_TTL_TURNS,
             delegated: false,
             memory_dir: None,
@@ -1714,6 +1721,9 @@ impl AgentConfig {
         if let Some(v) = fc.memory {
             self.memory = v;
         }
+        if let Some(v) = fc.session_messaging {
+            self.session_messaging = v;
+        }
         if let Some(v) = fc.memory_dir {
             self.memory_dir = Some(PathBuf::from(v));
         }
@@ -2057,6 +2067,10 @@ pub(crate) const ENV_SETTERS: &[(&str, EnvSetter)] = &[
     }),
     ("HRDR_MEMORY", |c, v| {
         c.memory = env_bool(v)?;
+        Ok(())
+    }),
+    ("HRDR_SESSION_MESSAGING", |c, v| {
+        c.session_messaging = env_bool(v)?;
         Ok(())
     }),
     ("HRDR_MEMORY_DIR", |c, v| {

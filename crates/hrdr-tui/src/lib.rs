@@ -251,6 +251,9 @@ pub async fn run_handoff_recovery(
             tui::run_loop(&mut app, &mut terminal, None, false).await?;
         }
     }
+    drop(terminal);
+    drop(_guard);
+    report_undelivered_peer_messages(&app);
     Ok(())
 }
 
@@ -339,5 +342,17 @@ async fn run_inner(
     }
     app.connect_mcp().await;
     tui::run_loop(&mut app, &mut terminal, command, true).await?;
+    drop(terminal);
+    drop(_guard);
+    report_undelivered_peer_messages(&app);
     Ok(())
+}
+
+/// Say, on the restored terminal, how many peer messages the exiting session
+/// accepted but never handed its agent — their senders were told "accepted".
+fn report_undelivered_peer_messages(app: &App) {
+    let undelivered = app.messaging.undelivered_on_exit;
+    if undelivered > 0 {
+        eprintln!("hrdr: {undelivered} peer message(s) were not delivered before exit");
+    }
 }

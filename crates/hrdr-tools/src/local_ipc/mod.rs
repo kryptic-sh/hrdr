@@ -19,6 +19,10 @@ mod platform;
 #[path = "windows.rs"]
 mod platform;
 
+/// Environment variable naming the parent of the discovery directory, overriding
+/// the platform default. The parent must already exist.
+pub const PARENT_ENV: &str = "HRDR_IPC_DIR";
+
 /// An open, validated per-user discovery directory.
 ///
 /// The retained handle identifies the validated object even if its pathname changes.
@@ -34,8 +38,15 @@ pub struct UserDirectory {
 impl UserDirectory {
     /// Open the platform's private discovery directory, creating it if absent.
     /// Existing insecure directories are rejected without changing their permissions.
+    ///
+    /// [`PARENT_ENV`] replaces the system parent when it is set and non-empty, so a
+    /// test suite (or anyone wanting a private group of sessions) gets its own
+    /// discovery scope. Only sessions sharing a parent can see one another.
     pub fn open() -> io::Result<Self> {
-        Self::open_in(&platform::system_parent()?)
+        match std::env::var_os(PARENT_ENV).filter(|parent| !parent.is_empty()) {
+            Some(parent) => Self::open_in(Path::new(&parent)),
+            None => Self::open_in(&platform::system_parent()?),
+        }
     }
 
     /// Open under an existing trusted parent instead of the system location.
@@ -67,6 +78,21 @@ mod tests {
         let second = UserDirectory::open_in(root.path()).unwrap();
         assert!(first._directory.metadata().unwrap().is_dir());
         assert!(second._directory.metadata().unwrap().is_dir());
+    }
+
+    /// `hrdr-test-support` points the override at the suite's sandbox, so this
+    /// also proves no test registers in the real per-user directory.
+    #[test]
+    fn the_parent_override_scopes_discovery() {
+        let parent = std::env::var_os(PARENT_ENV).expect("the test sandbox sets the override");
+        let directory = UserDirectory::open().unwrap();
+        assert_eq!(
+            directory.path,
+            Path::new(&parent)
+                .canonicalize()
+                .unwrap()
+                .join(platform::name())
+        );
     }
 
     #[test]

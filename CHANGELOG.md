@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Interactive sessions can receive messages from your other hrdr sessions.**
+  Each TUI session registers its id, name and working directory for same-user
+  discovery. A peer message wakes an idle agent or waits, one at a time, behind
+  a busy turn, and always arrives marked as peer input. Disable it with
+  `session_messaging = false` or `$HRDR_SESSION_MESSAGING=0`; `$HRDR_IPC_DIR`
+  scopes discovery to a private directory (`crates/hrdr-tui`).
 - **`hrdr --build-info` reports executable provenance without starting a
   session.** It prints version, source commit, target, and build-time source
   state for safe self-update admission diagnostics.

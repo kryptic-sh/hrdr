@@ -101,6 +101,12 @@ fn sandbox_user_state() {
         // real `/run/user/$UID`, which a Landlock sandbox inherited from the
         // parent process (the hrdr agent) would otherwise block.
         std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
+        // Session messaging registers every running session in a per-user
+        // discovery directory outside `$HOME` (`/tmp` on unix, the known
+        // LocalAppData folder on Windows, which ignores the environment). Give
+        // the suite its own, so a test session is never discoverable by — and
+        // never discovers — the developer's real sessions.
+        std::env::set_var("HRDR_IPC_DIR", root.join("runtime"));
         // No test reaches models.dev. Building an `Agent` warms the catalog in the
         // background, which is right in production and wrong in a test suite:
         // hundreds of agents would each open a network request, making the suite

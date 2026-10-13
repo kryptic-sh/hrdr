@@ -971,6 +971,24 @@ Disable entirely with `memory = false` in config or `$HRDR_MEMORY=0`. Memory is
 distinct from `AGENTS.md`, which stays the human-authored, read-only project
 instructions.
 
+### Session messaging
+
+Every interactive session registers itself, by session id, name and working
+directory, in a private per-user discovery directory, so the other hrdr sessions
+you run can find it and message its agent. Nothing else can: discovery is scoped
+to your OS user, and each sender is authenticated by the operating system. A
+message from another session reaches the agent marked as a peer message, never
+as something you typed. It wakes an idle agent, and a busy agent takes the next
+one after it has read the last. Messages wait in a bounded inbox, and a session
+that exits before delivering some reports how many were dropped. The
+registration follows the session: it is renamed with the session and moves when
+you switch sessions.
+
+Turn it off with `session_messaging = false` in config or
+`$HRDR_SESSION_MESSAGING=0`. `$HRDR_IPC_DIR` replaces the parent of the
+discovery directory (`/tmp` on Unix, the local AppData folder on Windows), which
+gives a group of sessions a private scope of their own.
+
 ### Sandbox
 
 **Sandboxing is a cautionary tool, not a requirement.** An agent working in your

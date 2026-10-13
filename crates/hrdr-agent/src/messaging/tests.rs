@@ -17,7 +17,7 @@ impl Drop for WorkerExitGuard {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_waits_for_worker_destruction() {
     let root = root();
-    let mut target = runtime(root.path(), "target", "/target").await;
+    let target = runtime(root.path(), "target", "/target").await;
     let (release, released) = std::sync::mpsc::channel();
     let exit = Arc::new(WorkerExit {
         entered: Notify::new(),
@@ -60,24 +60,32 @@ async fn runtime(root: &std::path::Path, id: &str, cwd: &str) -> Messaging {
 #[tokio::test]
 async fn close_reaps_finished_listener_once() {
     let root = root();
-    let mut target = runtime(root.path(), "target", "/target").await;
-    target.shutdown.take().unwrap().send(()).unwrap();
+    let target = runtime(root.path(), "target", "/target").await;
+    target
+        .shutdown
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .send(())
+        .unwrap();
+    let task = target.task.lock().unwrap().as_ref().unwrap().abort_handle();
     timeout(DEADLINE, async {
-        while !target.task.as_ref().unwrap().is_finished() {
+        while !task.is_finished() {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
     assert_eq!(target.close().await, 0);
-    assert!(target.task.is_none());
+    assert!(target.task.lock().unwrap().is_none());
     assert_eq!(target.close().await, 0);
 }
 
 #[tokio::test]
 async fn close_joins_native_handshake_workers() {
     let root = root();
-    let mut target = runtime(root.path(), "target", "/target").await;
+    let target = runtime(root.path(), "target", "/target").await;
     let mut peers = Vec::new();
     for _ in 0..MAX_WORKERS {
         let mut peer =
@@ -105,7 +113,7 @@ async fn close_racing_delivery_preserves_every_accepted_message() {
     let root = root();
     let sender = runtime(root.path(), "sender", "/sender").await;
     for _ in 0..16 {
-        let mut target = runtime(root.path(), "target", "/target").await;
+        let target = runtime(root.path(), "target", "/target").await;
         let descriptor = target.descriptor();
         let delivery = sender.send(&descriptor, "racing".into());
         let close = async {
@@ -213,7 +221,7 @@ async fn native_inbox_count_bytes_and_utf8_limits() {
 async fn native_refresh_close_and_new_generation() {
     let root = root();
     let a = runtime(root.path(), "a", "/one").await;
-    let mut b = runtime(root.path(), "b", "/two").await;
+    let b = runtime(root.path(), "b", "/two").await;
     let old = b.descriptor();
     b.refresh("renamed".into(), "/three".into()).await.unwrap();
     assert_eq!(b.descriptor().endpoint, old.endpoint);
@@ -306,7 +314,7 @@ async fn native_drop_releases_lease_and_excludes_stale() {
     let root = root();
     let a = runtime(root.path(), "a", "/one").await;
     let b = runtime(root.path(), "b", "/two").await;
-    let task = b.task.as_ref().unwrap().abort_handle();
+    let task = b.task.lock().unwrap().as_ref().unwrap().abort_handle();
     drop(b);
     timeout(DEADLINE, async {
         while !task.is_finished() {

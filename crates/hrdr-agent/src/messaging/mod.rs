@@ -48,8 +48,8 @@ pub struct Messaging {
     directory: Arc<UserDirectory>,
     shared: Arc<Shared>,
     refresh: mpsc::Sender<Refresh>,
-    shutdown: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<()>>,
+    shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Messaging {
@@ -93,8 +93,8 @@ impl Messaging {
             directory,
             shared,
             refresh,
-            shutdown: Some(shutdown),
-            task: Some(task),
+            shutdown: Mutex::new(Some(shutdown)),
+            task: Mutex::new(Some(task)),
         })
     }
 
@@ -177,21 +177,39 @@ impl Messaging {
         notified.await;
     }
 
+    /// Messages accepted but not yet dequeued.
+    pub fn pending(&self) -> usize {
+        self.shared.state.lock().unwrap().inbox.len()
+    }
+
+    /// Whether the runtime still admits messages.
+    pub fn is_open(&self) -> bool {
+        self.shared.state.lock().unwrap().open
+    }
+
+    /// Resolve on the next arrival or close, without inspecting the inbox — for a
+    /// consumer that dequeues elsewhere and only needs waking. An arrival with no
+    /// waiter is kept for the next call, so none is lost between calls. Shares
+    /// [`Self::wait`]'s wakeups: use one or the other.
+    pub async fn arrival(&self) {
+        self.shared.notify.notified().await;
+    }
+
     /// Refuse admission atomically and return the pending cancellation count.
     /// Pending typed messages remain available through dequeue after closing.
-    pub async fn close(&mut self) -> usize {
+    pub async fn close(&self) -> usize {
         let pending = {
             let mut state = self.shared.state.lock().unwrap();
             state.open = false;
             state.inbox.len()
         };
         self.shared.notify.notify_one();
-        if let Some(shutdown) = self.shutdown.take() {
+        if let Some(shutdown) = self.shutdown.lock().unwrap().take() {
             let _ = shutdown.send(());
         }
-        if let Some(task) = &mut self.task {
+        let task = self.task.lock().unwrap().take();
+        if let Some(task) = task {
             let _ = task.await;
-            self.task.take();
         }
         pending
     }
@@ -201,7 +219,7 @@ impl Drop for Messaging {
     fn drop(&mut self) {
         self.shared.state.lock().unwrap().open = false;
         self.shared.notify.notify_one();
-        if let Some(task) = &self.task {
+        if let Some(task) = self.task.lock().unwrap().as_ref() {
             task.abort();
         }
     }

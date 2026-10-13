@@ -87,6 +87,7 @@ mod completion;
 use completion::CompletionKind;
 mod handoff;
 pub(crate) use handoff::validate_handoff_payload;
+mod messaging;
 pub use handoff::{
     AdmittedUpdate, DeferredUpdate, PreparedUpdateCoordinator, UpdateRequestReceiver,
     UpdateRequestSender, update_request_bridge,
@@ -286,6 +287,16 @@ pub(crate) enum TurnMsg {
     Done(Option<String>),
     /// A deferred update coordinator was prepared after the requesting turn ended.
     UpdatePrepared(Result<AdmittedUpdate, String>),
+    /// Session messaging started for the session id, publishing `(name, cwd)`.
+    MessagingStarted(
+        String,
+        (String, String),
+        Result<Arc<hrdr_agent::messaging::Messaging>, String>,
+    ),
+    /// The session id's published `(name, cwd)` was refreshed.
+    MessagingRefreshed(String, (String, String), Result<(), String>),
+    /// A peer message arrived; the loop iteration this wakes delivers it.
+    PeerReady,
     /// An off-thread session save finished: `Ok(path)` once the snapshot is
     /// atomically on disk, or the error. Sent by the save task spawned by
     /// [`App::enqueue_save`]; the coalescer's in-flight flag clears here.
@@ -778,6 +789,8 @@ pub(crate) struct App {
     pending_update: Option<Box<dyn DeferredUpdate>>,
     update_preparing: bool,
     admitted_update: Option<AdmittedUpdate>,
+    /// Discovery and peer delivery for this session (`session_messaging`).
+    pub(crate) messaging: messaging::MessagingState,
     /// A slash command's data output (`/status`, `/cost`, `/help`, …) shown
     /// in an Esc-dismissible popup. `None` when nothing is open.
     pub(crate) popup: Option<NoticePopup>,
@@ -940,6 +953,7 @@ impl App {
         // ageing itself is the agent's — hand the preference over.
         config.todo_ttl = todo_ttl;
         let cfg = config.clone();
+        let session_messaging = cfg.session_messaging;
         let agent = if recovery.is_some() {
             Agent::new_passive(config)?
         } else {
@@ -1095,6 +1109,7 @@ impl App {
             pending_update: None,
             update_preparing: false,
             admitted_update: None,
+            messaging: messaging::MessagingState::new(session_messaging),
             popup: None,
             end_button: None,
             tool_hits: Vec::new(),
@@ -3586,6 +3601,13 @@ impl App {
                     self.drain_pending_compaction();
                 }
             }
+            TurnMsg::MessagingStarted(id, published, result) => {
+                self.on_messaging_started(id, published, result);
+            }
+            TurnMsg::MessagingRefreshed(id, published, result) => {
+                self.on_messaging_refreshed(id, published, result);
+            }
+            TurnMsg::PeerReady => {}
             TurnMsg::UpdatePrepared(result) => {
                 self.update_preparing = false;
                 match result {

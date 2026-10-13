@@ -27,6 +27,8 @@ use super::{App, Entry, EntryKind, LoginModal, StatusBarMode, TurnMsg};
 use crate::ui;
 use hrdr_agent::AgentConfig;
 
+mod messaging;
+
 /// Stand-in for the binary's `art.txt` (the TUI takes the art from its caller).
 const TEST_LOGO: &str = "██   ██ ██████  ██████  ██████\n██   ██ ██   ██ ██   ██ ██   ██\n███████ ██████  ██   ██ ██████\n██   ██ ██   ██ ██   ██ ██   ██\n██   ██ ██   ██ ██████  ██   ██";
 

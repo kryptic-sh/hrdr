@@ -297,6 +297,7 @@ impl App {
             && self.composer_is_empty()
             && self.stash.is_empty()
             && self.pending_attachments.is_empty()
+            && self.messaging.pending() == 0
     }
 }
 

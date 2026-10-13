@@ -39,17 +39,19 @@ push each verified slice to `main` before proceeding to the next slice.
    than presenting peer text as a human instruction. Resume from
    `hrdr-agent::messaging::Messaging::{start, descriptor, refresh, discover, send, dequeue, wait, close}`
    and `hrdr-tools::local_ipc`; do not rebuild the existing transport,
-   registration, or peer-provenance layers. Remaining slices:
-   - Default-enabled `session_messaging` configuration and disable control.
+   registration, or peer-provenance layers. Done: the default-enabled
+   `session_messaging` flag (`$HRDR_SESSION_MESSAGING`), the `$HRDR_IPC_DIR`
+   discovery-parent override (the test sandbox sets it), and the TUI lifecycle
+   in `hrdr-tui`'s `app::messaging` (start once the session has an id, refresh
+   name/cwd, rotate on session replacement, wake idle agents, one peer message
+   at a time on a busy agent's steering queue, report undelivered messages on
+   rotation and exit, peer inbox blocks update handoff). A brand-new session is
+   not discoverable until its first message mints an id. Remaining slices:
    - Model-facing session discovery/send tools exposing safe session selections,
      not endpoint-bearing internal descriptors; runtime-issued child-agent
      identities rather than caller-supplied sender metadata.
-   - TUI and headless lifecycle integration: start after session selection, wake
-     idle agents, queue busy-agent delivery, update name/cwd metadata, rotate
-     generations on session replacement, and report queued cancellation.
-     Preserve bounded admission through transfer into steering queues, not just
-     the runtime inbox. Keep headless commands finite after accepted work
-     drains.
+   - Headless lifecycle integration. Keep headless commands finite after
+     accepted work drains.
    - Real client-process end-to-end tests for tools, disabling, busy/idle
      delivery, session switches and shutdown on the Windows/macOS/Linux CI
      matrix.

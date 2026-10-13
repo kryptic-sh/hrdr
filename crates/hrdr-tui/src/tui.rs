@@ -245,6 +245,10 @@ pub(crate) async fn run_loop(
         // A detached sub-agent that finished while the agent was idle wakes it,
         // so its result reaches the model without waiting for the user to type.
         app.maybe_deliver_background();
+        // Keep this session's peer registration current, and wake (or queue
+        // behind the running turn) the next message another session sent.
+        app.sync_messaging();
+        app.maybe_deliver_peer();
         // A turn that caught a tool panic ran through the process-global panic
         // hook, which left the alt screen and dropped raw mode before
         // `catch_unwind` recovered. Re-enter before drawing, or every frame from
@@ -266,6 +270,7 @@ pub(crate) async fn run_loop(
             &mut cursor_insert,
         )?;
         if app.should_quit {
+            app.shutdown_messaging().await;
             if app.handoff_exit {
                 break;
             }
