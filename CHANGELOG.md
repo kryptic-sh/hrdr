@@ -12,9 +12,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session registers its id, name and working directory for same-user discovery.
   The new `sessions` and `message_session` tools let the agent list the others
   and message one. A peer message wakes an idle agent or waits, one at a time,
-  behind a busy turn, and always arrives marked as peer input. Disable it with
-  `session_messaging = false` or `$HRDR_SESSION_MESSAGING=0`; `$HRDR_IPC_DIR`
-  scopes discovery to a private directory (`crates/hrdr-tui`).
+  behind a busy turn, and always arrives marked as peer input. A headless
+  `hrdr run` is discoverable while its prompt's turn runs, then runs the
+  messages it accepted and exits. Disable it with `session_messaging = false` or
+  `$HRDR_SESSION_MESSAGING=0`; `$HRDR_IPC_DIR` scopes discovery to a private
+  directory (`crates/hrdr-tui`).
 - **`hrdr --build-info` reports executable provenance without starting a
   session.** It prints version, source commit, target, and build-time source
   state for safe self-update admission diagnostics.

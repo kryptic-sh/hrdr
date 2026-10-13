@@ -990,6 +990,10 @@ message, naming it by id and working directory. The model never sees how a
 session is reached, and the recipient learns who sent a message from this
 session's own registration, not from anything the model writes.
 
+A headless `hrdr run` registers too, named after its prompt, while its prompt's
+turn runs: peers can steer it mid-task. When that turn ends it stops accepting
+messages, runs the ones it already accepted, and exits.
+
 Turn it off with `session_messaging = false` in config or
 `$HRDR_SESSION_MESSAGING=0`. `$HRDR_IPC_DIR` replaces the parent of the
 discovery directory (`/tmp` on Unix, the local AppData folder on Windows), which

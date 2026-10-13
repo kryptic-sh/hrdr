@@ -46,6 +46,10 @@ pub enum Chat {
     /// connection open without finishing — the turn stays "running" so a caller
     /// can cancel it (Esc) mid-flight. The socket is closed after a long sleep.
     Hang(Vec<String>),
+    /// Record the request, then hold the reply until the test signals (or drops
+    /// the sender), then stream these payloads like [`Chat::Sse`] — so a test
+    /// can act while a turn is provably mid-request.
+    Gated(std::sync::mpsc::Receiver<()>, Vec<String>),
 }
 
 /// A running mock endpoint. Dropping it stops the listener thread.
@@ -164,6 +168,10 @@ fn handle(mut stream: TcpStream, queue: &Mutex<VecDeque<Chat>>, chat_bodies: &Mu
         let next = queue.lock().unwrap().pop_front();
         match next {
             Some(Chat::Sse(lines)) => write_sse(&mut stream, &lines),
+            Some(Chat::Gated(release, lines)) => {
+                let _ = release.recv_timeout(std::time::Duration::from_secs(120));
+                write_sse(&mut stream, &lines);
+            }
             Some(Chat::Drop) => { /* write nothing: connection resets */ }
             Some(Chat::Status(code)) => write_status(&mut stream, code),
             Some(Chat::StatusBody(code, body)) => {

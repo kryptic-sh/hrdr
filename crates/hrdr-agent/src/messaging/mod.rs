@@ -26,6 +26,10 @@ const MAX_PROBES: usize = 64;
 /// Probes in flight at once during discovery. Bounds the connections it opens
 /// while keeping a full directory's worst case to a few protocol deadlines.
 const PROBE_CONCURRENCY: usize = 8;
+/// How long a discovery-directory operation retries a contended lock. Longer
+/// than the wire [`DEADLINE`]: a peer holds the lock across an fsync, which a
+/// loaded disk can stretch well past it.
+const DIRECTORY_DEADLINE: Duration = Duration::from_secs(10);
 
 struct State {
     descriptor: SessionDescriptor,
@@ -399,7 +403,7 @@ async fn exchange(
 }
 
 async fn retry<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    let end = Instant::now() + DEADLINE;
+    let end = Instant::now() + DIRECTORY_DEADLINE;
     loop {
         match operation() {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < end => {

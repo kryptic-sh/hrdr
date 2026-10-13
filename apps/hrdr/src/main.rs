@@ -19,6 +19,7 @@
 #[cfg(test)]
 extern crate hrdr_test_support;
 
+mod headless_messaging;
 mod update_check;
 mod update_coordinator;
 #[cfg(windows)]
@@ -1183,6 +1184,7 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
                 .ok()
                 .flatten();
     }
+    let session_messaging = config.session_messaging;
     let mut agent = Agent::new(config)?;
     // Prepare the outgoing prompt: expand `@file` mentions and route any
     // `@agent` mention to the matching sub-agent (parity with the TUI), and
@@ -1230,78 +1232,104 @@ async fn run_headless(config: AgentConfig, prompt: String, json: bool, quiet: bo
         .lock()
         .unwrap()
         .push_back(outgoing.into_steer(display));
-    let result = agent
-        .run(steering, |ev| {
-            if json {
-                println!("{}", event_json(&ev));
+    let messaging = headless_messaging::HeadlessMessaging::start(
+        session_messaging,
+        &agent.cwd(),
+        &prompt,
+        &steering,
+        quiet,
+    )
+    .await;
+    let mut on_event = |ev| {
+        if json {
+            println!("{}", event_json(&ev));
+            let _ = std::io::stdout().flush();
+            return;
+        }
+        match ev {
+            AgentEvent::Text(t) => {
+                print!("{}", sanitize_terminal_text(&t));
                 let _ = std::io::stdout().flush();
-                return;
             }
-            match ev {
-                AgentEvent::Text(t) => {
-                    print!("{}", sanitize_terminal_text(&t));
-                    let _ = std::io::stdout().flush();
-                }
-                AgentEvent::Reasoning(_) => {}
-                AgentEvent::ToolStart { name, args, .. } if !quiet => {
-                    chrome_line(
-                        crossterm::style::Color::DarkYellow,
-                        &format!("⚙ {name}"),
-                        &format!(" {}", hrdr_tools::truncate_inline(&args, 120)),
-                    );
-                }
-                AgentEvent::ToolOutput { chunk, .. } if !quiet => {
-                    chrome_fragment(
-                        crossterm::style::Color::DarkGrey,
-                        &sanitize_terminal_text(&chunk),
-                    );
-                    let _ = std::io::stderr().flush();
-                }
-                AgentEvent::Notice(text) if !quiet => chrome_line(crossterm::style::Color::DarkGrey, &format!("[{text}]"), ""),
-                AgentEvent::ToolEnd { name, ok, .. } if !quiet => {
-                    let (mark, colour) = if ok {
-                        ("✓", crossterm::style::Color::DarkGreen)
-                    } else {
-                        ("✗", crossterm::style::Color::DarkRed)
-                    };
-                    chrome_line(colour, mark, &format!(" {name}"));
-                }
-                AgentEvent::Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_prompt_tokens,
-                    reasoning_tokens,
-                    session_cost_usd,
-                    cost_partial,
-                    ..
-                } if !quiet => {
-                    let cached = cached_prompt_tokens
-                        .map(|c| format!(" ({c} cached)"))
-                        .unwrap_or_default();
-                    let reasoning = reasoning_tokens
-                        .map(|r| format!(" · reasoning {r}"))
-                        .unwrap_or_default();
-                    let cost = session_cost_usd
-                        .map(|c| {
-                            format!(
-                                " · est. {}",
-                                hrdr_app::fmt_cost_maybe_partial(c, cost_partial)
-                            )
-                        })
-                        .unwrap_or_default();
-                    chrome_line(
-                            crossterm::style::Color::DarkGrey,
-                            &format!(
-                                "[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}"
-                            ),
-                            "",
-                        );
-                }
-                AgentEvent::TurnDone => println!(),
-                _ => {}
+            AgentEvent::Reasoning(_) => {}
+            AgentEvent::ToolStart { name, args, .. } if !quiet => {
+                chrome_line(
+                    crossterm::style::Color::DarkYellow,
+                    &format!("⚙ {name}"),
+                    &format!(" {}", hrdr_tools::truncate_inline(&args, 120)),
+                );
             }
-        })
-        .await;
+            AgentEvent::ToolOutput { chunk, .. } if !quiet => {
+                chrome_fragment(
+                    crossterm::style::Color::DarkGrey,
+                    &sanitize_terminal_text(&chunk),
+                );
+                let _ = std::io::stderr().flush();
+            }
+            AgentEvent::Notice(text) if !quiet => {
+                chrome_line(crossterm::style::Color::DarkGrey, &format!("[{text}]"), "")
+            }
+            AgentEvent::ToolEnd { name, ok, .. } if !quiet => {
+                let (mark, colour) = if ok {
+                    ("✓", crossterm::style::Color::DarkGreen)
+                } else {
+                    ("✗", crossterm::style::Color::DarkRed)
+                };
+                chrome_line(colour, mark, &format!(" {name}"));
+            }
+            AgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+                cached_prompt_tokens,
+                reasoning_tokens,
+                session_cost_usd,
+                cost_partial,
+                ..
+            } if !quiet => {
+                let cached = cached_prompt_tokens
+                    .map(|c| format!(" ({c} cached)"))
+                    .unwrap_or_default();
+                let reasoning = reasoning_tokens
+                    .map(|r| format!(" · reasoning {r}"))
+                    .unwrap_or_default();
+                let cost = session_cost_usd
+                    .map(|c| {
+                        format!(
+                            " · est. {}",
+                            hrdr_app::fmt_cost_maybe_partial(c, cost_partial)
+                        )
+                    })
+                    .unwrap_or_default();
+                chrome_line(
+                    crossterm::style::Color::DarkGrey,
+                    &format!(
+                        "[usage] ctx {prompt_tokens}{cached} · out {completion_tokens}{reasoning}{cost}"
+                    ),
+                    "",
+                );
+            }
+            AgentEvent::TurnDone => println!(),
+            _ => {}
+        }
+    };
+    // The prompt's turn, then one more per peer message it accepted (see
+    // `headless_messaging`): the command ends once that bounded queue drains.
+    let mut result = agent.run(steering.clone(), &mut on_event).await;
+    if let Some(messaging) = &messaging {
+        while result.is_ok() && messaging.next_turn(&steering).await {
+            result = agent.run(steering.clone(), &mut on_event).await;
+        }
+    }
+    if let Some(messaging) = messaging {
+        let undelivered = messaging.finish().await;
+        if undelivered > 0 && !quiet {
+            chrome_line(
+                crossterm::style::Color::DarkGrey,
+                &format!("[{undelivered} peer message(s) were not delivered]"),
+                "",
+            );
+        }
+    }
     for note in agent
         .run_session_hooks(hrdr_tools::HookEvent::SessionEnd)
         .await

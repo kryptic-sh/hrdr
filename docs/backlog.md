@@ -53,9 +53,15 @@ push each verified slice to `main` before proceeding to the next slice.
    a candidate whose probe fails instead of failing the whole scan. A brand-new
    session is not discoverable until its first message mints an id; only the
    main agent gets the tools — sub-agents cannot message peers, so no child
-   identity is issued yet. Remaining slices:
-   - Headless lifecycle integration. Keep headless commands finite after
-     accepted work drains.
+   identity is issued yet. Headless `hrdr run` (`apps/hrdr`'s
+   `headless_messaging`) registers as `run-<pid>` during its prompt's turn,
+   closes admission when that turn ends, and runs the accepted messages as
+   further turns; `tests/headless_messaging.rs` covers it across real processes.
+   One full-suite run saw the peer's `Messaging::start` fail with `WouldBlock`:
+   the directory mutation lock is held across an fsync in `MutationGuard`, and
+   the retry budget was the 2s wire deadline. Directory operations now retry for
+   `DIRECTORY_DEADLINE`; one later full run passed, which does not prove the
+   flake is gone. Remaining slices:
    - Real client-process end-to-end tests for tools, disabling, busy/idle
      delivery, session switches and shutdown on the Windows/macOS/Linux CI
      matrix.
