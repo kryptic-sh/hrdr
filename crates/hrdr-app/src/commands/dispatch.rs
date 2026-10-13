@@ -1634,7 +1634,7 @@ mod tests {
         seed_messages(&host).await;
 
         assert!(dispatch(&mut host, "/export out.json"));
-        settle(|| dir.path().join("out.json").exists()).await;
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
         let text = std::fs::read_to_string(dir.path().join("out.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(v.is_array(), "expected a JSON array, got: {text}");
@@ -1648,7 +1648,7 @@ mod tests {
         seed_messages(&host).await;
 
         assert!(dispatch(&mut host, "/export out.md"));
-        settle(|| dir.path().join("out.md").exists()).await;
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
         let text = std::fs::read_to_string(dir.path().join("out.md")).unwrap();
         assert!(
             text.starts_with("## User"),
@@ -1664,7 +1664,7 @@ mod tests {
         seed_messages(&host).await;
 
         assert!(dispatch(&mut host, "/export --json out"));
-        settle(|| dir.path().join("out").exists()).await;
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
         let text = std::fs::read_to_string(dir.path().join("out")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(v.is_array(), "expected a JSON array, got: {text}");
