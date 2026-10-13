@@ -15,8 +15,8 @@ use super::{BASH_LINE_CAP, DEFAULT_TOOL_TIMEOUT_SECS};
 // ---- shell ----
 
 /// The shell interpreter this session runs commands through, resolved once from
-/// `PATH`: Windows prefers PowerShell, while Unix prefers `bash` and falls back
-/// to POSIX `sh`. The model is told which one it has (see
+/// `PATH`: `bash` first everywhere — Git Bash on Windows — then PowerShell on
+/// Windows, then POSIX `sh`. The model is told which one it has (see
 /// [`Shell::tool_description`]) so it can write for the real dialect.
 ///
 /// **This enum is the single seam for shell support.** Everything that differs
@@ -34,9 +34,11 @@ pub enum Shell {
 }
 
 impl Shell {
-    /// Resolve the session's shell, and **only if it actually runs**. Windows
-    /// prefers native PowerShell; other platforms prefer `bash` and fall back to
-    /// POSIX `sh`. `None` when no supported shell can run.
+    /// Resolve the session's shell, and **only if it actually runs**. `bash`
+    /// comes first on every platform (on Windows, Git Bash — never the WSL
+    /// launcher; see [`Shell::resolved`]); Windows then falls back to PowerShell,
+    /// and every platform finally to POSIX `sh`. `None` when no supported shell
+    /// can run.
     ///
     /// Existence on `PATH` is not enough, and Windows is why. `C:\Windows\System32\
     /// bash.exe` is the **WSL launcher**, which exists on a stock install whether or
@@ -49,14 +51,31 @@ impl Shell {
     /// the answer is cached for the process, because this costs a subprocess and the
     /// answer cannot change under a running session.
     pub fn detect() -> Option<Shell> {
-        static SHELL: std::sync::OnceLock<Option<Shell>> = std::sync::OnceLock::new();
-        *SHELL.get_or_init(|| {
+        Self::available().first().copied()
+    }
+
+    /// Every supported shell that runs on this machine, in preference order —
+    /// the default ([`Shell::detect`]) first. The `shell` tool offers all of
+    /// them, so a command can be written for whichever dialect suits it.
+    pub fn available() -> &'static [Shell] {
+        static SHELLS: std::sync::OnceLock<Vec<Shell>> = std::sync::OnceLock::new();
+        SHELLS.get_or_init(|| {
             #[cfg(windows)]
-            const CANDIDATES: &[Shell] = &[Shell::PowerShell, Shell::Bash, Shell::Posix];
+            const CANDIDATES: &[Shell] = &[Shell::Bash, Shell::PowerShell, Shell::Posix];
             #[cfg(not(windows))]
             const CANDIDATES: &[Shell] = &[Shell::Bash, Shell::Posix];
-            CANDIDATES.iter().copied().find(|s| s.runs())
+            CANDIDATES.iter().copied().filter(|s| s.runs()).collect()
         })
+    }
+
+    /// The name a caller selects this shell by — the `shell` tool's `shell`
+    /// argument.
+    pub fn name(self) -> &'static str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::Posix => "sh",
+            Shell::PowerShell => "powershell",
+        }
     }
 
     /// Whether this shell is on `PATH` **and** can run a trivial command.
@@ -66,7 +85,10 @@ impl Shell {
     /// probe must not print to the terminal a TUI owns — and any spawn error, any
     /// signal, any non-zero status all read the same: not usable.
     fn runs(self) -> bool {
-        std::process::Command::new(self.executable())
+        let Some(executable) = self.resolved() else {
+            return false;
+        };
+        std::process::Command::new(executable)
             .args(self.invoke_args())
             .arg("exit 0")
             .stdin(std::process::Stdio::null())
@@ -96,17 +118,38 @@ impl Shell {
 
     /// The interpreter as spawned: [`Shell::program`] resolved through `PATH` once
     /// per process (see [`crate::proc::resolve_program`] for why a bare name is
-    /// not good enough on Windows).
+    /// not good enough on Windows). Falls back to the bare program name, which
+    /// then fails to spawn, when [`Shell::resolved`] found nothing.
     pub(crate) fn executable(self) -> &'static std::ffi::OsStr {
-        static BASH: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
-        static POSIX: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
-        static POWERSHELL: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+        self.resolved()
+            .unwrap_or_else(|| std::ffi::OsStr::new(self.program()))
+    }
+
+    /// The interpreter this shell runs as, or `None` when this machine has none.
+    ///
+    /// On Windows `bash` means Git Bash, and only Git Bash: the `bash.exe` under
+    /// `System32` or `WindowsApps` is the WSL launcher, which runs commands in a
+    /// Linux distribution with Linux paths — a different machine, as far as the
+    /// working directory is concerned. See [`git_bash`].
+    fn resolved(self) -> Option<&'static std::ffi::OsStr> {
+        static BASH: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        static POSIX: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        static POWERSHELL: std::sync::OnceLock<Option<std::ffi::OsString>> =
+            std::sync::OnceLock::new();
         let resolved = match self {
             Shell::Bash => &BASH,
             Shell::Posix => &POSIX,
             Shell::PowerShell => &POWERSHELL,
         };
-        resolved.get_or_init(|| crate::proc::resolve_program(self.program(), None))
+        resolved
+            .get_or_init(|| {
+                #[cfg(windows)]
+                if self == Shell::Bash {
+                    return git_bash().map(std::ffi::OsString::from);
+                }
+                Some(crate::proc::resolve_program(self.program(), None))
+            })
+            .as_deref()
     }
 
     fn powershell_prelude() -> &'static str {
@@ -176,18 +219,103 @@ impl Shell {
     }
 }
 
+/// Git Bash on this machine, if there is one.
+///
+/// First a `bash` on `PATH` that is not a WSL launcher. Failing that, the one
+/// that ships with the Git on `PATH`: `git --exec-path` names Git's own install
+/// (`<git>\mingw64\libexec\git-core`), however it was installed or shimmed, and
+/// its `bash.exe` sits in `<git>\bin`. Only a few levels up are searched, so an
+/// unrelated `bin\bash.exe` near the drive root is never mistaken for it.
+#[cfg(windows)]
+fn git_bash() -> Option<std::path::PathBuf> {
+    /// Levels above `git --exec-path` that may hold Git's `bin` directory.
+    const EXEC_PATH_DEPTH: usize = 4;
+
+    if let Ok(found) = which::which_all_global("bash") {
+        let mut found = found;
+        if let Some(bash) = found.find(|path| !is_wsl_launcher(path)) {
+            return Some(bash);
+        }
+    }
+    let output = std::process::Command::new(crate::proc::resolve_program("git", None))
+        .arg("--exec-path")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let exec_path = std::path::PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    exec_path
+        .ancestors()
+        .take(EXEC_PATH_DEPTH)
+        .map(|dir| dir.join("bin").join("bash.exe"))
+        .find(|bash| bash.is_file())
+}
+
+/// Whether `path` is one of the WSL launchers Windows puts on `PATH` as
+/// `bash.exe`: the one in the system directory, or the app execution alias
+/// under `WindowsApps`.
+#[cfg(windows)]
+fn is_wsl_launcher(path: &std::path::Path) -> bool {
+    let lower = path.to_string_lossy().to_lowercase();
+    let in_system_dir = std::env::var_os("SystemRoot").is_some_and(|root| {
+        let root = root.to_string_lossy().to_lowercase();
+        ["system32", "sysnative", "syswow64"]
+            .iter()
+            .any(|dir| lower.starts_with(&format!("{root}\\{dir}\\")))
+    });
+    in_system_dir || lower.contains("\\microsoft\\windowsapps\\")
+}
+
 /// The single, platform-agnostic `shell` tool. It runs whatever shell was
-/// auto-detected (PowerShell on native Windows, otherwise `bash` or POSIX `sh`);
+/// auto-detected (`bash` — Git Bash on Windows — else PowerShell on Windows,
+/// else POSIX `sh`);
 /// its name is always `shell`, and its description names the actual interpreter
 /// in use.
 pub struct ShellTool {
-    shell: Shell,
+    /// Never empty; the first is the default.
+    shells: Vec<Shell>,
 }
 
 impl ShellTool {
     /// A `shell` tool that runs commands through `shell`.
     pub fn new(shell: Shell) -> Self {
-        Self { shell }
+        Self {
+            shells: vec![shell],
+        }
+    }
+
+    /// A `shell` tool offering every shell in `shells`, the first by default.
+    /// `None` when `shells` is empty.
+    pub fn with_shells(shells: &[Shell]) -> Option<Self> {
+        (!shells.is_empty()).then(|| Self {
+            shells: shells.to_vec(),
+        })
+    }
+
+    fn default_shell(&self) -> Shell {
+        self.shells[0]
+    }
+
+    /// The shell a call asked for, or the default when it named none.
+    fn select(&self, name: Option<&str>) -> Result<Shell> {
+        let Some(name) = name else {
+            return Ok(self.default_shell());
+        };
+        self.shells
+            .iter()
+            .copied()
+            .find(|shell| shell.name() == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shell {name:?} is not available here; available: {}",
+                    self.shells
+                        .iter()
+                        .map(|shell| shell.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
     }
 }
 
@@ -301,6 +429,9 @@ struct ShellArgs {
     /// to every reader downstream of a tool call.
     #[serde(default)]
     keep_ansi: bool,
+    /// Which installed shell runs the command; the default when absent.
+    #[serde(default)]
+    shell: Option<String>,
 }
 
 /// The JSON-Schema for the `shell` tool; only the command description differs by
@@ -369,7 +500,7 @@ impl Tool for ShellTool {
         "shell"
     }
     fn description(&self) -> &'static str {
-        self.shell.tool_description()
+        self.default_shell().tool_description()
     }
     /// Wraps its own payload, so the denial and timeout notes it appends land
     /// outside the envelope rather than inside a block the model is told to ignore.
@@ -377,7 +508,10 @@ impl Tool for ShellTool {
         true
     }
     fn shell(&self) -> Option<Shell> {
-        Some(self.shell)
+        Some(self.default_shell())
+    }
+    fn shells(&self) -> Vec<Shell> {
+        self.shells.clone()
     }
     /// Self-managed: this tool kills the process group at its own deadline and
     /// returns what the command printed *before* it hung, with a note saying it
@@ -388,18 +522,32 @@ impl Tool for ShellTool {
         None
     }
     fn parameters(&self) -> serde_json::Value {
-        shell_parameters("Shell command to run.")
+        let mut parameters = shell_parameters("Shell command to run.");
+        if self.shells.len() > 1 {
+            let names: Vec<&str> = self.shells.iter().map(|shell| shell.name()).collect();
+            parameters["properties"]["shell"] = json!({
+                "type": "string",
+                "enum": names,
+                "default": self.default_shell().name(),
+                "description": format!(
+                    "Which installed shell runs this command; `{}` when omitted. Write the command in that shell's own syntax.",
+                    self.default_shell().name()
+                ),
+            });
+        }
+        parameters
     }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<String> {
         reject_timeout_ms(&args)?;
         let a: ShellArgs = crate::tool_args("shell", args)?;
+        let shell = self.select(a.shell.as_deref())?;
         if let Some(msg) = crate::check_guardrails(&a.command, &ctx.guardrails) {
             bail!("command blocked: {msg}");
         }
         // Guardrails first, confinement second: a blocked command never runs,
         // sandboxed or not.
         let mut cmd = crate::sandbox::sandboxed_shell_command(
-            self.shell,
+            shell,
             &a.command,
             &ctx.sandbox,
             &ctx.sandbox_notices,
@@ -1013,17 +1161,150 @@ fn cap_display(text: &str, max_bytes: usize, max_lines: usize, from_tail: bool) 
 }
 
 /// The shell tool for this machine as a 0-or-1 `Vec` (so the registry can
-/// register it in the same presence-gated loop as its other tools). `bash`
-/// first, then POSIX `sh`; empty when neither is on `PATH`.
+/// register it in the same presence-gated loop as its other tools), offering
+/// every [`Shell::available`] shell; empty when none runs.
 pub fn available_shell_tools() -> Vec<std::sync::Arc<dyn Tool>> {
-    Shell::detect()
-        .map(|shell| vec![std::sync::Arc::new(ShellTool::new(shell)) as std::sync::Arc<dyn Tool>])
+    ShellTool::with_shells(Shell::available())
+        .map(|tool| vec![std::sync::Arc::new(tool) as std::sync::Arc<dyn Tool>])
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use crate::test_env;
+
+    /// The WSL launchers Windows installs as `bash.exe` are never Git Bash.
+    #[cfg(windows)]
+    #[test]
+    fn wsl_launchers_are_not_git_bash() {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        for launcher in [
+            format!(r"{root}\System32\bash.exe"),
+            format!(r"{root}\SysWOW64\bash.exe"),
+            r"C:\Users\someone\AppData\Local\Microsoft\WindowsApps\bash.exe".to_string(),
+        ] {
+            assert!(
+                super::is_wsl_launcher(std::path::Path::new(&launcher)),
+                "{launcher}"
+            );
+        }
+        for git_bash in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Users\someone\scoop\apps\git\current\bin\bash.exe",
+        ] {
+            assert!(
+                !super::is_wsl_launcher(std::path::Path::new(git_bash)),
+                "{git_bash}"
+            );
+        }
+    }
+
+    /// A command marker only the named shell prints: each line is a syntax error
+    /// or prints nothing in the other dialects. The marker is assembled at run
+    /// time, so a shell that rejects the command and echoes its text back in the
+    /// error cannot print it.
+    fn identify(shell: super::Shell) -> &'static str {
+        match shell {
+            super::Shell::Bash => "test -n \"$BASH_VERSION\" && echo \"is\"\"-bash\"",
+            super::Shell::Posix => "case \"${0##*/}\" in sh|sh.exe) echo \"is\"\"-posix\";; esac",
+            super::Shell::PowerShell => "if ($PSVersionTable) { 'is' + '-powershell' }",
+        }
+    }
+
+    /// Every offered shell is selectable by name and actually runs the command;
+    /// omitting `shell` runs the default; an unknown name is refused with the
+    /// list of what is offered. The schema carries the choice only when there is
+    /// one to make.
+    #[tokio::test]
+    async fn each_offered_shell_runs_when_named_and_the_first_is_the_default() {
+        use crate::Tool;
+
+        let available = super::Shell::available();
+        if available.is_empty() {
+            return;
+        }
+        assert!(super::ShellTool::with_shells(&[]).is_none());
+        let single = super::ShellTool::new(available[0]);
+        assert!(single.parameters()["properties"].get("shell").is_none());
+
+        let tool = super::ShellTool::with_shells(available).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::ToolContext::new(dir.path());
+        for &shell in available {
+            let marker = match shell {
+                super::Shell::Bash => "is-bash",
+                super::Shell::Posix => "is-posix",
+                super::Shell::PowerShell => "is-powershell",
+            };
+            let out = tool
+                .execute(
+                    serde_json::json!({"command": identify(shell), "shell": shell.name()}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(out.contains(marker), "{}: {out}", shell.name());
+        }
+        let default = tool
+            .execute(serde_json::json!({"command": identify(available[0])}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(tool.shell(), Some(available[0]));
+        assert!(default.contains("is-"), "{default}");
+
+        let error = tool
+            .execute(
+                serde_json::json!({"command": "echo", "shell": "fish"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not available"), "{error}");
+        assert!(error.contains(available[0].name()), "{error}");
+
+        if available.len() > 1 {
+            let schema = tool.parameters();
+            assert_eq!(
+                schema["properties"]["shell"]["default"],
+                available[0].name()
+            );
+            assert_eq!(
+                schema["properties"]["shell"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                available.len()
+            );
+            // A shell this machine has, but the tool was not given, is refused.
+            let missing = available[1];
+            let error = single
+                .execute(
+                    serde_json::json!({"command": "echo", "shell": missing.name()}),
+                    &ctx,
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not available"), "{error}");
+        }
+    }
+
+    /// With Git installed, Windows sessions get Git Bash ahead of PowerShell.
+    /// CI's Windows runners have Git; a machine without it falls through to
+    /// PowerShell, which the assertion allows only when no Git Bash exists.
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefers_git_bash_when_it_exists() {
+        match super::git_bash() {
+            Some(bash) => {
+                assert!(!super::is_wsl_launcher(&bash), "{}", bash.display());
+                assert!(bash.is_file(), "{}", bash.display());
+                assert_eq!(super::Shell::detect(), Some(super::Shell::Bash));
+            }
+            None => assert_ne!(super::Shell::detect(), Some(super::Shell::Bash)),
+        }
+    }
 
     /// The exit-status line carries a NUMBER, not the platform's rendering of
     /// `ExitStatus`.

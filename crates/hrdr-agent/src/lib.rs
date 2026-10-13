@@ -4605,10 +4605,10 @@ mod tests {
             "write",
             "shell",
         ];
-        if tools.shell().is_some_and(|s| s.needs_posix_caveat()) {
+        if tools.shells().iter().any(|s| s.needs_posix_caveat()) {
             expected.push("shell_posix");
         }
-        if tools.shell().is_some_and(|s| s.is_powershell()) {
+        if tools.shells().iter().any(|s| s.is_powershell()) {
             expected.push("shell_powershell");
         }
         expected.extend([

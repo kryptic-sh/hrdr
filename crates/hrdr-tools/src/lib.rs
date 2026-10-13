@@ -1609,6 +1609,12 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Every [`Shell`] this tool can run a command through, its default
+    /// ([`Tool::shell`]) first. Empty for every tool but `shell`.
+    fn shells(&self) -> Vec<Shell> {
+        self.shell().into_iter().collect()
+    }
+
     /// How long a call to this tool may run before the dispatcher cuts it off,
     /// in seconds. The model can override it per call with `timeout_secs`.
     ///
@@ -1839,6 +1845,16 @@ impl ToolRegistry {
     /// Drives the prompt's shell gating and the Environment block's `Shell:` line.
     pub fn shell(&self) -> Option<Shell> {
         self.tools.values().find_map(|t| t.shell())
+    }
+
+    /// Every shell the registered `shell` tool offers, its default first; empty
+    /// when there is no shell tool.
+    pub fn shells(&self) -> Vec<Shell> {
+        self.tools
+            .values()
+            .find(|t| t.shell().is_some())
+            .map(|t| t.shells())
+            .unwrap_or_default()
     }
 
     /// The default set: file/search/todo/web tools plus the `shell` tool when a

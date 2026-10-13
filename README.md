@@ -10,12 +10,13 @@ tasks in a terminal. It is provider-agnostic: point it at any
 OpenAI, llama.cpp, OpenRouter — and it streams tokens and runs tools until the
 job is done.
 
-hrdr runs a native shell tool for the platform it is on. On Windows it prefers
-**Windows PowerShell** (`powershell.exe -NoProfile -NonInteractive -Command`) so
-`.cmd` shims and Windows-installed tools work without WSL. On Linux/macOS it
-runs `bash`, falling back to POSIX `sh`; Windows users who prefer Unix workflows
-can still run hrdr under **WSL** or put **Git Bash** on `PATH`, but native
-PowerShell is first-class.
+hrdr runs a native shell tool for the platform it is on, offering every
+supported shell the machine has and letting the model pick one per command.
+`bash` is the default everywhere. On Windows that is **Git Bash**, found on
+`PATH` or next to the installed Git (never the WSL `bash.exe` launcher), with
+**Windows PowerShell** (`powershell.exe -NoProfile -NonInteractive -Command`)
+offered beside it and used as the default when Git Bash is absent. POSIX `sh` is
+offered too, and is the default where there is no `bash`.
 
 > Active development. The agent loop, adaptive tool set, sub-agents, sessions,
 > config hot-reload, and a rich TUI are in place. hrdr connects to any running
@@ -77,9 +78,10 @@ sudo rpm -i hrdr-*.rpm
   reads stay broad by design (see "Sandbox"). Token-bounded outputs and
   line-numbered reads for precise edits — and when `shell` output overflows, the
   **full** result is saved to a per-session temp file and the model is pointed
-  at it instead of losing the overflow. The `shell` tool is presence-aware: on
-  Windows it prefers native PowerShell, and elsewhere it runs `bash` with a
-  POSIX `sh` fallback, so the model is only offered a shell it can actually use.
+  at it instead of losing the overflow. The `shell` tool is presence-aware: it
+  offers only shells that run here — `bash` (Git Bash on Windows) by default,
+  plus PowerShell on Windows and POSIX `sh` — and the prompt names each one with
+  its syntax rules.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a

@@ -136,7 +136,7 @@ pub fn capability_sections_for(
     can_write: bool,
     can_delegate: bool,
     delegated: bool,
-    shell: Option<hrdr_tools::Shell>,
+    shells: &[hrdr_tools::Shell],
     has_jail_tools: bool,
 ) -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&'static str, &'static str)> = Vec::new();
@@ -146,7 +146,7 @@ pub fn capability_sections_for(
     // jail-only tools — `Agent::new` strips them for every other mode — so a prompt
     // built from a raw default registry would otherwise be told it is jailed
     // while holding a shell and every write tool.
-    let jailed = has_jail_tools && !can_write && shell.is_none();
+    let jailed = has_jail_tools && !can_write && shells.is_empty();
     // First, because for a jailed agent it is the only capability section there
     // is: `can_write` and `can_delegate` are both false, so every gate below is
     // skipped and this would otherwise be an agent told nothing about the
@@ -156,12 +156,14 @@ pub fn capability_sections_for(
     }
     if can_write {
         out.push((SECTION_WRITE, frag::WRITE));
-        if let Some(shell) = shell {
+        // Dialect guidance for every shell the tool offers, not only the
+        // default: a command may be run in any of them.
+        if !shells.is_empty() {
             out.push((SECTION_SHELL, frag::SHELL));
-            if shell.needs_posix_caveat() {
+            if shells.iter().any(|shell| shell.needs_posix_caveat()) {
                 out.push((SECTION_SHELL_POSIX, frag::SHELL_POSIX));
             }
-            if shell.is_powershell() {
+            if shells.iter().any(|shell| shell.is_powershell()) {
                 out.push((SECTION_SHELL_POWERSHELL, frag::SHELL_POWERSHELL));
             }
         }
@@ -217,7 +219,7 @@ pub fn capability_sections(
         can_write,
         can_delegate,
         delegated,
-        tools.shell(),
+        &tools.shells(),
         has_jail_tools,
     )
 }
@@ -453,8 +455,19 @@ pub fn environment_section(
     ];
     // Name the shell the `shell` tool runs, so the model writes for it — but only
     // when the agent actually has a shell (a read-only agent gets no line).
-    if let Some(shell) = tools.shell() {
-        lines.push(format!("- Shell: {}", shell.env_label()));
+    match tools.shells().as_slice() {
+        [] => {}
+        [shell] => lines.push(format!("- Shell: {}", shell.env_label())),
+        [default, others @ ..] => lines.push(format!(
+            "- Shells: {} (default); also {}. Pick one per command with the `shell` tool's \
+             `shell` argument, and write the command in that shell's syntax.",
+            default.env_label(),
+            others
+                .iter()
+                .map(|shell| format!("{} (`{}`)", shell.env_label(), shell.name()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
     // A limit a tool's own schema cannot carry: the `task` caps come from config
     // (max_readonly_subagents / max_write_subagents), so they differ per session
@@ -1283,7 +1296,9 @@ mod tests {
         shell: Option<hrdr_tools::Shell>,
     ) -> String {
         let mut out = base_section();
-        for (_, body) in capability_sections_for(can_write, can_delegate, delegated, shell, false) {
+        for (_, body) in
+            capability_sections_for(can_write, can_delegate, delegated, shell.as_slice(), false)
+        {
             out.push_str(&section_text(body));
         }
         out
@@ -2068,7 +2083,7 @@ mod tests {
         // dialect pitfall note.
         let p = render(Some(hrdr_tools::Shell::Bash));
         assert!(says(&p, "Shell:"), "{p}");
-        assert!(!says(&p, "POSIX `sh`, NOT bash"), "{p}");
+        assert!(!says(&p, "POSIX `sh` is NOT bash"), "{p}");
         assert!(!says(&p, "Windows PowerShell"), "{p}");
         assert_eq!(
             p.matches("Run a slow or noisy command once, raw").count(),
@@ -2079,20 +2094,20 @@ mod tests {
         // POSIX sh: the Shell section plus the bashism warning.
         let p = render(Some(hrdr_tools::Shell::Posix));
         assert!(says(&p, "Shell:"), "{p}");
-        assert!(says(&p, "POSIX `sh`, NOT bash"), "{p}");
+        assert!(says(&p, "POSIX `sh` is NOT bash"), "{p}");
         assert!(!says(&p, "Windows PowerShell"), "{p}");
 
         // PowerShell: the Shell section plus the PowerShell syntax warning.
         let p = render(Some(hrdr_tools::Shell::PowerShell));
         assert!(says(&p, "Shell:"), "{p}");
-        assert!(!says(&p, "POSIX `sh`, NOT bash"), "{p}");
-        assert!(says(&p, "write PowerShell, not POSIX shell"), "{p}");
+        assert!(!says(&p, "POSIX `sh` is NOT bash"), "{p}");
+        assert!(says(&p, "must be PowerShell, not POSIX shell"), "{p}");
         assert!(says(&p, "$env:NAME"), "{p}");
 
         // No shell: no Shell section, and so no dialect note either.
         let p = render(None);
         assert!(!says(&p, "Shell:"), "{p}");
-        assert!(!says(&p, "POSIX `sh`, NOT bash"), "{p}");
+        assert!(!says(&p, "POSIX `sh` is NOT bash"), "{p}");
         assert!(!says(&p, "Windows PowerShell"), "{p}");
     }
 
@@ -2105,21 +2120,21 @@ mod tests {
         let tools = ToolRegistry::with_defaults();
         let p = render_system(&tools, false).unwrap();
 
-        let shell = tools.shell();
+        let shells = tools.shells();
         assert_eq!(
-            shell.is_some(),
+            !shells.is_empty(),
             says(&p, "Shell:"),
             "the Shell section appears exactly when a shell tool does"
         );
         assert_eq!(
-            shell.is_some_and(|s| s.needs_posix_caveat()),
-            says(&p, "POSIX `sh`, NOT bash"),
-            "the POSIX-sh note appears exactly when the shell asks for it"
+            shells.iter().any(|s| s.needs_posix_caveat()),
+            says(&p, "POSIX `sh` is NOT bash"),
+            "the POSIX-sh note appears exactly when an offered shell asks for it"
         );
         assert_eq!(
-            shell.is_some_and(|s| s.is_powershell()),
-            says(&p, "write PowerShell, not POSIX shell"),
-            "the PowerShell note appears exactly when the shell asks for it"
+            shells.iter().any(|s| s.is_powershell()),
+            says(&p, "must be PowerShell, not POSIX shell"),
+            "the PowerShell note appears exactly when an offered shell asks for it"
         );
     }
 
@@ -3469,12 +3484,21 @@ mod tests {
     #[test]
     fn the_environment_names_the_shell_only_when_there_is_one() {
         let tools = ToolRegistry::with_defaults();
-        let shell = tools.shell().expect("a dev machine has a shell");
+        let shells = tools.shells();
+        let shell = *shells.first().expect("a dev machine has a shell");
         let write = render_system(&tools, false).unwrap()
             + &environment_section(true, Path::new("/tmp/x"), &tools, test_limits());
-        // Whatever this machine resolved, the line is the shell's own label.
-        let expected = format!("- Shell: {}", shell.env_label());
+        // Whatever this machine resolved, the line leads with the default
+        // shell's own label, and names every alternative by its selector.
+        let expected = if shells.len() == 1 {
+            format!("- Shell: {}", shell.env_label())
+        } else {
+            format!("- Shells: {} (default)", shell.env_label())
+        };
         assert!(says(&write, &expected), "{write}");
+        for other in &shells[1..] {
+            assert!(says(&write, &format!("(`{}`)", other.name())), "{write}");
+        }
 
         // A read-only agent has no shell tool → no line.
         let mut ro = ToolRegistry::with_defaults();

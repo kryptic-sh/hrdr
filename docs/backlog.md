@@ -112,18 +112,12 @@ push each verified slice to `main` before proceeding to the next slice.
    host that ignores OSC titles, would produce it with hrdr working. **Question
    for the owner:** which terminal and profile showed `PowerShell`? The macOS
    and Linux pty runs are on CI only.
-6. **Multiple selectable shells.** Extend the shell tool so the LLM can select
-   an available shell per command on Windows, macOS, and Linux. Prefer Bash by
-   default on every platform: on Windows specifically resolve Git Bash ahead of
-   PowerShell, falling back to PowerShell when Git Bash is unavailable. Do not
-   mistake the WSL `bash.exe` launcher for Git Bash. Expose both Git Bash and
-   PowerShell when installed, rather than selecting one for the whole session;
-   similarly expose supported installed alternatives on macOS/Linux. Update the
-   system prompt with the available shells, their default, and shell-specific
-   syntax guidance so the model chooses the appropriate shell. Preserve
-   guardrails, quoting, timeouts, and process cleanup for each selected shell.
-   Test discovery, priority, explicit selection, missing-shell errors, and
-   prompt accuracy across the supported CI matrix.
+6. **Selectable shells — macOS/Linux and hook/verify coverage.** Shipped: Git
+   Bash first on Windows (`Shell::resolved`, `git_bash`), every installed shell
+   offered through the `shell` tool's `shell` argument, and dialect sections for
+   each offered shell. Verified locally on Windows only; macOS/Linux rely on CI.
+   Hooks, `verify`, `watch` and the TUI's `!command` still run the default shell
+   only — no per-call choice there.
 7. **TODO-to-TODO dependencies — question for the owner.** Watch-aware TODO
    nudges shipped: an item's `waits_on` names a running watch (see the
    changelog). The request's repeated "TODO item" wording could also mean one
