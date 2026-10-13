@@ -93,8 +93,17 @@ push each verified slice to `main` before proceeding to the next slice.
    LLM on its first turn. Let the agent rename the session when its direction,
    goal, or progress changes enough that the existing name no longer fits.
    Implement and test initial naming and subsequent meaningful renaming after
-   the preceding queued work. The handling of explicitly user-assigned names
-   remains a design decision to resolve before implementation.
+   the preceding queued work. **Deferred 2026-10-14 — questions for the owner
+   before implementation:** (a) Should the agent ever rename a session the user
+   named explicitly (`/new <name>`, `/rename`)? Recommended: never — a user name
+   is pinned until the user clears or changes it — with the alternative being
+   that the agent may propose a rename the user confirms. (b) How is the name
+   produced? Options: a separate small model request after the first turn (one
+   extra request per session, works with any model), or a `rename_session` tool
+   the model calls itself (no extra request, but depends on the model choosing
+   to call it). (c) Which model pays for (b)'s first option — the session's
+   model or the configured `subagent_model`? Today a session is named from the
+   first line of its first message (`session_name_from`).
 5. **Dependency updates.** Update the project's dependencies to current stable
    releases using the package manager, regenerate lockfiles, resolve API
    compatibility changes, and run the full verification and dependency checks.
