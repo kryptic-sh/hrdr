@@ -45,19 +45,20 @@ push each verified slice to `main` before proceeding to the next slice.
    in `hrdr-tui`'s `app::messaging` (start once the session has an id, refresh
    name/cwd, rotate on session replacement, wake idle agents, one peer message
    at a time on a busy agent's steering queue, report undelivered messages on
-   rotation and exit, peer inbox blocks update handoff). A brand-new session is
-   not discoverable until its first message mints an id. Remaining slices:
-   - Model-facing session discovery/send tools exposing safe session selections,
-     not endpoint-bearing internal descriptors; runtime-issued child-agent
-     identities rather than caller-supplied sender metadata.
+   rotation and exit, peer inbox blocks update handoff), and the `sessions` /
+   `message_session` tools (`hrdr-tui`'s `app::messaging_tools`; targets are
+   resolved by session id plus cwd against a fresh discovery, so no endpoint
+   reaches the model, and the sender identity is this session's registration).
+   Discovery now probes at most `PROBE_CONCURRENCY` candidates at once and skips
+   a candidate whose probe fails instead of failing the whole scan. A brand-new
+   session is not discoverable until its first message mints an id; only the
+   main agent gets the tools — sub-agents cannot message peers, so no child
+   identity is issued yet. Remaining slices:
    - Headless lifecycle integration. Keep headless commands finite after
      accepted work drains.
    - Real client-process end-to-end tests for tools, disabling, busy/idle
      delivery, session switches and shutdown on the Windows/macOS/Linux CI
      matrix.
-   - Review runtime discovery's sequential probe budget and error behavior
-     before exposing it through tools; currently `MAX_PROBES` and protocol
-     `DEADLINE` bound it, and saturation is an explicit error.
 
    Verify delivery, discovery, disabling, busy/idle behavior, and sender
    attribution before declaring this complete. Support Windows, macOS, and Linux

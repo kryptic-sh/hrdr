@@ -39,6 +39,34 @@ async fn close_waits_for_worker_destruction() {
     assert_eq!(closing.await.unwrap(), 0);
 }
 
+#[tokio::test]
+async fn an_incompatible_session_does_not_hide_the_others() {
+    use hrdr_tools::local_ipc::{Listener, Registration};
+
+    let root = root();
+    let a = runtime(root.path(), "a", "/one").await;
+    let directory = UserDirectory::open_in(root.path()).unwrap();
+    let mut listener = Listener::bind(&directory).unwrap();
+    let descriptor = SessionDescriptor {
+        endpoint: listener.endpoint().clone(),
+        session_id: "older".into(),
+        session_name: "older".into(),
+        working_directory: "/older".into(),
+    };
+    let _registration = Registration::publish(&listener, descriptor).unwrap();
+    let older = tokio::spawn(async move {
+        let mut connection = listener.accept(DEADLINE).await.unwrap();
+        connection
+            .write_frame(br#"{"version":99}"#, DEADLINE)
+            .await
+            .unwrap();
+        connection
+    });
+
+    assert_eq!(a.discover().await.unwrap(), vec![a.descriptor()]);
+    drop(older.await.unwrap());
+}
+
 fn root() -> tempfile::TempDir {
     #[cfg(unix)]
     let root = tempfile::tempdir_in("/tmp");

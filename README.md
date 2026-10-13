@@ -984,6 +984,12 @@ that exits before delivering some reports how many were dropped. The
 registration follows the session: it is renamed with the session and moves when
 you switch sessions.
 
+The agent reaches other sessions through two tools. `sessions` lists them by
+session id, name and working directory, and `message_session` sends one a
+message, naming it by id and working directory. The model never sees how a
+session is reached, and the recipient learns who sent a message from this
+session's own registration, not from anything the model writes.
+
 Turn it off with `session_messaging = false` in config or
 `$HRDR_SESSION_MESSAGING=0`. `$HRDR_IPC_DIR` replaces the parent of the
 discovery directory (`/tmp` on Unix, the local AppData folder on Windows), which

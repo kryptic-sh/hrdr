@@ -3,8 +3,10 @@
 //! in the same process, registered in the suite's private discovery directory
 //! (`HRDR_IPC_DIR`, set by `hrdr-test-support`).
 
+use super::super::messaging_tools::{MessageSessionTool, SessionsTool};
 use super::*;
 use hrdr_agent::messaging::{Messaging, SendStatus};
+use hrdr_tools::Tool;
 use hrdr_tools::local_ipc::{SessionDescriptor, UserDirectory};
 
 /// Start the app's messaging for its (freshly reserved) session.
@@ -179,4 +181,130 @@ async fn a_replaced_session_stops_publishing_the_old_one() {
         "the old session no longer accepts messages"
     );
     sender.close().await;
+}
+
+async fn call(tool: &dyn Tool, args: serde_json::Value) -> anyhow::Result<String> {
+    tool.execute(args, &hrdr_tools::ToolContext::new(".")).await
+}
+
+#[tokio::test]
+async fn the_model_lists_other_sessions_and_messages_one_as_this_session() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let id = started(&mut h, "tool sender").await;
+    let sessions = SessionsTool {
+        slot: h.app.messaging.slot(),
+    };
+    let send = MessageSessionTool {
+        slot: h.app.messaging.slot(),
+    };
+    let recipient = peer("recipient").await;
+    let recipient_id = recipient.descriptor().session_id;
+
+    let listed = call(&sessions, serde_json::json!({})).await.unwrap();
+    assert!(listed.starts_with("<untrusted-content"), "{listed}");
+    assert!(listed.contains(&recipient_id), "{listed}");
+    assert!(listed.contains("/peer/cwd"), "{listed}");
+    assert!(
+        !listed.contains(&format!("\"{id}\"")),
+        "a session does not list itself: {listed}"
+    );
+    assert!(
+        !listed.contains("endpoint"),
+        "no endpoint reaches the model"
+    );
+
+    let sent = call(
+        &send,
+        serde_json::json!({"session_id": recipient_id, "cwd": "/peer/cwd", "message": "rebase done"}),
+    )
+    .await
+    .unwrap();
+    assert!(sent.contains("\"accepted\""), "{sent}");
+    let delivered = recipient.dequeue().expect("the message was queued");
+    assert_eq!(delivered.sent, "rebase done");
+    let sender = delivered.peer.expect("peer provenance");
+    assert_eq!(sender.session_id, id, "the runtime names the sender");
+    assert_eq!(sender.cwd, h.app.dir_cwd.display().to_string());
+
+    let unknown = call(
+        &send,
+        serde_json::json!({"session_id": recipient_id, "cwd": "/elsewhere", "message": "hi"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        unknown.to_string().contains("no running session"),
+        "{unknown}"
+    );
+    recipient.close().await;
+}
+
+#[tokio::test]
+async fn two_sessions_with_one_id_and_cwd_are_not_guessed_between() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    started(&mut h, "ambiguous sender").await;
+    let id = format!("twin-{}", std::process::id());
+    let mut twins = Vec::new();
+    for _ in 0..2 {
+        twins.push(
+            Messaging::start(
+                UserDirectory::open().unwrap(),
+                id.clone(),
+                "twin".into(),
+                "/twin".into(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let send = MessageSessionTool {
+        slot: h.app.messaging.slot(),
+    };
+    let error = call(
+        &send,
+        serde_json::json!({"session_id": id, "cwd": "/twin", "message": "which?"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("more than one"), "{error}");
+    for twin in &twins {
+        assert!(twin.dequeue().is_none());
+        twin.close().await;
+    }
+}
+
+#[tokio::test]
+async fn messaging_tools_follow_the_flag_and_need_a_running_session() {
+    let _data_home = isolated_data_home();
+    let names = |enabled: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = hrdr_agent::Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            sandbox: hrdr_tools::SandboxMode::None,
+            ..Default::default()
+        })
+        .unwrap();
+        super::super::messaging::MessagingState::new(enabled).register_tools(&mut agent);
+        agent
+            .tools()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+    };
+    let on = names(true);
+    assert!(on.iter().any(|name| name == "sessions"));
+    assert!(on.iter().any(|name| name == "message_session"));
+    let off = names(false);
+    assert!(
+        !off.iter()
+            .any(|name| name == "sessions" || name == "message_session")
+    );
+
+    let idle = super::super::messaging::MessagingState::new(true);
+    let error = call(&SessionsTool { slot: idle.slot() }, serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not running"), "{error}");
 }

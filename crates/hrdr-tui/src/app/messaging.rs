@@ -6,6 +6,7 @@
 //! steering queue, the next only once the agent has read the last, so the
 //! inbox's byte and count limits still bound everything waiting for it.
 
+use super::messaging_tools::{MessageSessionTool, MessagingSlot, SessionsTool};
 use super::*;
 
 /// A started runtime and the registration it currently publishes.
@@ -22,6 +23,8 @@ pub(crate) struct ActiveMessaging {
 pub(crate) struct MessagingState {
     enabled: bool,
     active: Option<ActiveMessaging>,
+    /// The active runtime, as the model's messaging tools see it.
+    slot: MessagingSlot,
     /// The session id a start is in flight for.
     starting: Option<String>,
     /// The session id whose start failed; not retried until the session changes.
@@ -39,6 +42,35 @@ impl MessagingState {
         }
     }
 
+    /// Give the agent the tools that list and message other sessions. Only the
+    /// interactive main agent gets them (see `Agent::register_tool`).
+    pub(crate) fn register_tools(&self, agent: &mut Agent) {
+        if !self.enabled {
+            return;
+        }
+        agent.register_tool(Arc::new(SessionsTool {
+            slot: self.slot.clone(),
+        }));
+        agent.register_tool(Arc::new(MessageSessionTool {
+            slot: self.slot.clone(),
+        }));
+    }
+
+    fn set_active(&mut self, active: Option<ActiveMessaging>) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            active.as_ref().map(|active| active.runtime.clone());
+        self.active = active;
+    }
+
+    fn take_active(&mut self) -> Option<ActiveMessaging> {
+        let active = self.active.take();
+        self.set_active(None);
+        active
+    }
+
     #[cfg(test)]
     pub(crate) fn is_active(&self) -> bool {
         self.active.is_some()
@@ -47,6 +79,11 @@ impl MessagingState {
     #[cfg(test)]
     pub(crate) fn is_starting(&self) -> bool {
         self.starting.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slot(&self) -> MessagingSlot {
+        self.slot.clone()
     }
 
     /// Accepted peer messages the agent has not been handed yet.
@@ -72,7 +109,7 @@ impl App {
             .as_ref()
             .is_some_and(|active| Some(&active.session_id) != id.as_ref())
         {
-            let previous = self.messaging.active.take().expect("checked above");
+            let previous = self.messaging.take_active().expect("checked above");
             self.close_messaging(previous);
         }
         let Some(id) = id else {
@@ -148,7 +185,7 @@ impl App {
                     self.close_messaging(active);
                 } else {
                     self.forward_arrivals(active.runtime.clone());
-                    self.messaging.active = Some(active);
+                    self.messaging.set_active(Some(active));
                 }
             }
             Err(error) => {
@@ -215,7 +252,7 @@ impl App {
 
     /// Close the runtime as the app exits, counting the messages it drops.
     pub(crate) async fn shutdown_messaging(&mut self) {
-        if let Some(active) = self.messaging.active.take() {
+        if let Some(active) = self.messaging.take_active() {
             self.messaging.undelivered_on_exit += active.runtime.close().await;
         }
     }

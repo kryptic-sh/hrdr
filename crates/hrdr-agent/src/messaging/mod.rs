@@ -23,6 +23,9 @@ pub const MAX_INBOX_MESSAGES: usize = 128;
 pub const MAX_INBOX_BYTES: usize = 1024 * 1024;
 const MAX_WORKERS: usize = 16;
 const MAX_PROBES: usize = 64;
+/// Probes in flight at once during discovery. Bounds the connections it opens
+/// while keeping a full directory's worst case to a few protocol deadlines.
+const PROBE_CONCURRENCY: usize = 8;
 
 struct State {
     descriptor: SessionDescriptor,
@@ -112,25 +115,37 @@ impl Messaging {
         result.await.map_err(|_| closed())?
     }
 
-    /// Only kernel-authenticated live probes are returned. A bounded sequential
-    /// scan avoids creating a connection/task for every registry candidate.
+    /// Only kernel-authenticated live probes are returned. At most
+    /// [`PROBE_CONCURRENCY`] probes run at once, so discovery opens a bounded
+    /// number of connections rather than one per registry candidate.
+    ///
+    /// A candidate whose probe fails — unreachable, or a session speaking another
+    /// protocol version — is left out rather than failing the whole scan: one
+    /// incompatible session must not hide every other one.
     pub async fn discover(&self) -> io::Result<Vec<SessionDescriptor>> {
+        use futures_util::StreamExt;
+
         let candidates = retry(|| self.directory.list_candidates()).await?;
         if candidates.len() > MAX_PROBES {
             return Err(io::Error::other(
                 "messaging discovery probe budget exceeded",
             ));
         }
-        let mut live = Vec::new();
-        for candidate in candidates {
-            match exchange(&self.directory, &candidate, Payload::Probe).await {
-                Ok((SendStatus::Accepted, descriptor)) => live.push(descriptor),
-                Ok(_) => {}
-                Err(error) if unavailable(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(live)
+        let probes =
+            futures_util::stream::iter(candidates)
+                .map(|candidate| async move {
+                    exchange(&self.directory, &candidate, Payload::Probe).await
+                })
+                .buffered(PROBE_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+        Ok(probes
+            .into_iter()
+            .filter_map(|probe| match probe {
+                Ok((SendStatus::Accepted, descriptor)) => Some(descriptor),
+                _ => None,
+            })
+            .collect())
     }
 
     pub async fn send(&self, target: &SessionDescriptor, text: String) -> io::Result<SendStatus> {

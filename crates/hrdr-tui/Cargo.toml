@@ -32,6 +32,7 @@ chrono.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 notify.workspace = true
+async-trait = "0.1"
 
 [dev-dependencies]
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).

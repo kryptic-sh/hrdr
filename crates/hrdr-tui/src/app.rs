@@ -88,6 +88,7 @@ use completion::CompletionKind;
 mod handoff;
 pub(crate) use handoff::validate_handoff_payload;
 mod messaging;
+mod messaging_tools;
 pub use handoff::{
     AdmittedUpdate, DeferredUpdate, PreparedUpdateCoordinator, UpdateRequestReceiver,
     UpdateRequestSender, update_request_bridge,
@@ -953,12 +954,13 @@ impl App {
         // ageing itself is the agent's — hand the preference over.
         config.todo_ttl = todo_ttl;
         let cfg = config.clone();
-        let session_messaging = cfg.session_messaging;
-        let agent = if recovery.is_some() {
+        let messaging = messaging::MessagingState::new(cfg.session_messaging);
+        let mut agent = if recovery.is_some() {
             Agent::new_passive(config)?
         } else {
             Agent::new(config)?
         };
+        messaging.register_tools(&mut agent);
         let todos = agent.todos();
         let goals = agent.goals();
         let crons = agent.crons();
@@ -1109,7 +1111,7 @@ impl App {
             pending_update: None,
             update_preparing: false,
             admitted_update: None,
-            messaging: messaging::MessagingState::new(session_messaging),
+            messaging,
             popup: None,
             end_button: None,
             tool_hits: Vec::new(),
