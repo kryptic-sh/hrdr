@@ -516,41 +516,18 @@ behind a coalescer).
 frame time, and the streaming-body re-render per frame for in-flight tool calls
 (bounded by the block's size, but compounds with the walk for long streams).
 
-## Dependency upgrades held back, 2026-08-03
+## Dependency upgrades held back, 2026-10-14
 
-A `cargo update` sweep took every compatible release and the major bumps that
-were safe (`base64` 0.23, `sha2` 0.11, `similar` 3, `toml` 1, `toml_edit` 0.25,
-`which` 8). Four majors were deliberately NOT taken. Each was tried, and the
-reason below is what the attempt showed — not a guess about what it might do.
+The 2026-08-03 entries are resolved: `hjkl` is on 0.41 and `reqwest` on 0.13.
+Kept from that sweep, because it is what caught a silent failure: `toml` 1.0
+changed `Value`'s `FromStr` to parse a single VALUE rather than a document, so
+`text.parse::<toml::Value>()` fails on any real config with
+`unexpected content, expected nothing`; parse a `toml::Table` for a document.
 
-- **`hjkl` 0.33 → 0.40 is an architecture migration, not a bump.** 23 compile
-  errors in `hrdr-editor` alone, all cascading from one root cause:
-  `hjkl_buffer::Buffer` no longer implements `hjkl_engine::View`, and that trait
-  is now sealed (`View: Cursor + Query + BufferEdit + Search + sealed::Sealed`),
-  so nothing outside the engine can implement it. hjkl-buffer 0.40 has its own
-  separate `View` type (`buffer.rs`), with the viewport moved onto the engine
-  `Host` adapter — so `Editor<Buffer, HrdrHost>` is the wrong shape now, not a
-  renamed one. `BufferView` also gained `background`, `cursor_column` and
-  `search_ranges`. Doing this properly means understanding the new
-  engine/host/view split and re-verifying the whole TUI input and rendering
-  surface; it is its own task, and `hrdr-tui` was never reached because
-  `hrdr-editor` failed first.
-- **`reqwest` 0.12 → 0.13 changes where TLS roots come from.** It compiles once
-  `rustls-tls` is renamed to `rustls`, and that is the trap: 0.12's `rustls-tls`
-  resolves to `webpki-roots` (CA roots compiled INTO the binary), while 0.13's
-  `rustls` pulls `rustls-platform-verifier` → `rustls-native-certs` (the system
-  trust store). Verified both ways with `cargo tree`. hrdr ships static musl
-  tarballs and an Alpine `.apk`; in a scratch or distroless container there is
-  no system cert store, so every provider request would fail TLS while the build
-  stayed green. Take this only with a decided answer on root certs, and test it
-  in a container with no `/etc/ssl/certs`. **What the sweep did catch, worth
-  remembering:** `toml` 1.0 changed `Value`'s `FromStr` to parse a single VALUE
-  rather than a document, so `text.parse::<toml::Value>()` now fails on any real
-  config with `unexpected content, expected nothing`. Both call sites swallowed
-  it with `.ok()?` — one of them `provider_alias_collision_error`, a startup
-  refusal that would have gone on refusing nothing at all. Parse a `toml::Table`
-  for a document. Three existing tests went red and are the only reason this was
-  not shipped silently.
+A `cargo update` on 2026-10-14 took every compatible release. Still behind
+latest: the `hjkl-*` crates (0.41 → 0.42, a breaking minor below 1.0) and `zstd`
+(0.13 → 0.14). Both need the manifest bumped through the package manager and the
+API changes resolved.
 
 ## Needs a decision 2026-10-14 — replacing `serde_yaml_ng`
 
