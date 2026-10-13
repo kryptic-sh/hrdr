@@ -185,12 +185,12 @@ push each verified slice to `main` before proceeding to the next slice.
    short name (`RUNNER~1`) was looked up under a different session directory.
    The E2E fixture now launches through a junction so the alias case runs on
    every machine. Without the fix it fails locally with the CI error; with it,
-   all five E2E tests pass locally. Confirm the exact CI job is green before
-   declaring self-update complete or cutting a release. Still open: the
-   2026-10-12 local gate failed independently in
+   all five E2E tests pass locally. CI run `38478769569` (`b319222d`) passed the
+   `Windows Cargo self-update E2E` step after the install waits got their own
+   budget. The 2026-10-12 `auth.json.lock` timeout in
    `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`
-   (a writer timed out acquiring `auth.json.lock`); root-cause that contention
-   before treating a later gate as green. The ignored coordinator unit tests
+   was the lock's whole-wait budget running out behind fifteen progressing
+   writers; fixed in `StoreLock::acquire`. The ignored coordinator unit tests
    (`prepared_request_is_accepted_by_the_strict_parser` and its siblings) need
    an executable launched from `CARGO_HOME/bin` and are run by neither CI nor
    the local gate, so the junction assertion added to that test is unexecuted.

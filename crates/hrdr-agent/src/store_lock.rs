@@ -38,9 +38,12 @@
 //!   it is a property of the work done under the lock, not of this module — see
 //!   [`StoreKind`].
 //! * **Bounded retries**: acquisition spins with a short sleep up to
-//!   [`LOCK_ACQUIRE_ATTEMPTS`] times (≈ a few seconds total). If it still can't
-//!   claim the lock it returns an error rather than blocking forever — an
-//!   unwritable directory or a wedged peer surfaces cleanly instead of hanging.
+//!   [`LOCK_ACQUIRE_ATTEMPTS`] times (≈ a few seconds) **per holder** — the count
+//!   restarts each time the lock changes hands, so a waiter queued behind many
+//!   writers that are each making progress is not mistaken for one facing a
+//!   stuck peer. [`LOCK_ACQUIRE_CEILING`] caps the whole wait. Either way it
+//!   returns an error rather than blocking forever — an unwritable directory or a
+//!   wedged peer surfaces cleanly instead of hanging.
 //!
 //! ## Policy (credential store)
 //!
@@ -84,10 +87,21 @@ const SLOW_FS_BYTES_PER_SEC: u64 = 1024 * 1024;
 const BLOB_STORE_STALE_LOCK_AGE_SECS: u64 =
     2 * crate::session::MAX_SESSION_FILE_BYTES / SLOW_FS_BYTES_PER_SEC;
 
-/// How many times [`StoreLock::acquire`] retries a contended lock before giving
-/// up. With [`LOCK_RETRY_DELAY`] this bounds the wait so an unwritable directory
-/// (every attempt fails) or a wedged peer cannot hang a login forever.
+/// How many times [`StoreLock::acquire`] retries a lock held by the **same**
+/// holder before giving up. With [`LOCK_RETRY_DELAY`] this bounds the wait so an
+/// unwritable directory (every attempt fails) or a wedged peer cannot hang a
+/// login forever.
 const LOCK_ACQUIRE_ATTEMPTS: u32 = 100;
+
+/// The longest [`StoreLock::acquire`] waits in all, however often the lock
+/// changes hands: a stream of other writers that never lets this one in must
+/// still end in an error, not an unbounded wait.
+const LOCK_ACQUIRE_CEILING: Duration = Duration::from_secs(60);
+
+/// Distinguishes one acquisition from the next, including two by threads of one
+/// process within the same second, so a waiter can tell that the lock changed
+/// hands (see [`LOCK_ACQUIRE_ATTEMPTS`]).
+static ACQUISITIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Delay between acquisition attempts. Together with [`LOCK_ACQUIRE_ATTEMPTS`]
 /// it bounds the worst-case wait, which comfortably outlasts any honest
@@ -170,7 +184,13 @@ impl StoreLock {
     pub fn acquire(store_path: &Path, kind: StoreKind, unix_style_paths: bool) -> Result<Self> {
         let lock_path = hrdr_llm::sibling_with_suffix(store_path, ".lock");
         let stale_age_secs = kind.stale_age_secs();
-        for _ in 0..LOCK_ACQUIRE_ATTEMPTS {
+        let started = std::time::Instant::now();
+        // The holder seen at the last contended attempt, and how many attempts
+        // it has held the lock through.
+        let mut holder: Option<String> = None;
+        let mut attempts = 0;
+        while attempts < LOCK_ACQUIRE_ATTEMPTS && started.elapsed() < LOCK_ACQUIRE_CEILING {
+            attempts += 1;
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -180,7 +200,12 @@ impl StoreLock {
                     // Record owner PID + creation time so a concurrent process
                     // can later judge this lock's staleness. Best-effort: even
                     // an empty lock file is reap-able (aged by mtime).
-                    let content = format!("{} {}", std::process::id(), hrdr_tools::unix_now());
+                    let content = format!(
+                        "{} {} {}",
+                        std::process::id(),
+                        hrdr_tools::unix_now(),
+                        ACQUISITIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    );
                     let _ = f.write_all(content.as_bytes());
                     let _ = f.flush();
                     drop(f);
@@ -189,28 +214,33 @@ impl StoreLock {
                         pid: std::process::id(),
                     });
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Someone holds it. Reap it if stale and retry immediately;
-                    // otherwise wait a beat and try again (bounded).
+                // `AlreadyExists`: someone holds it.
+                //
+                // `PermissionDenied`, Windows only: a lock file in the "delete
+                // pending" state — a concurrent holder's `Drop` is still removing
+                // it while a handle lingers — rejects `CreateFile` with
+                // ERROR_ACCESS_DENIED (os error 5) until the last handle closes.
+                // That is transient contention, not a real permission fault, so
+                // it is treated the same way. A genuinely unwritable directory
+                // still terminates — via the timeout below rather than an
+                // immediate error.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                {
+                    // Reap it if stale and retry immediately; otherwise wait a
+                    // beat and try again (bounded).
                     if is_stale_lock(&lock_path, stale_age_secs) {
                         let _ = std::fs::remove_file(&lock_path);
                         continue;
                     }
-                    std::thread::sleep(LOCK_RETRY_DELAY);
-                }
-                Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    // Windows only: a lock file in the "delete pending" state —
-                    // a concurrent holder's `Drop` is still removing it while a
-                    // handle lingers — rejects `CreateFile` with
-                    // ERROR_ACCESS_DENIED (os error 5) until the last handle
-                    // closes. That is transient contention, not a real
-                    // permission fault, so treat it like `AlreadyExists`: reap a
-                    // stale lock, else wait and retry (bounded). A genuinely
-                    // unwritable directory still terminates — via the timeout
-                    // below rather than an immediate error.
-                    if is_stale_lock(&lock_path, stale_age_secs) {
-                        let _ = std::fs::remove_file(&lock_path);
-                        continue;
+                    // A different holder than last time means the previous one
+                    // finished: the wait is progress through a queue, not a stuck
+                    // peer, so this holder gets a fresh budget.
+                    let current = std::fs::read_to_string(&lock_path).ok();
+                    if current.is_some() && current != holder {
+                        holder = current;
+                        attempts = 0;
                     }
                     std::thread::sleep(LOCK_RETRY_DELAY);
                 }
@@ -324,6 +354,49 @@ mod tests {
             );
             assert!(!lock.exists());
         }
+    }
+
+    /// A waiter behind a queue of holders, each finishing in turn, outlasts one
+    /// holder's budget without timing out: the budget measures how long a single
+    /// holder keeps the lock, not how long the queue takes. Sixteen writers to
+    /// `auth.json` on a cold Windows filesystem took over five seconds in all,
+    /// and the last one used to time out behind the fifteen that were working.
+    #[test]
+    fn a_lock_that_changes_hands_does_not_time_out_its_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("auth.json");
+        let lock = hrdr_llm::sibling_with_suffix(&store, ".lock");
+        let budget = LOCK_RETRY_DELAY * LOCK_ACQUIRE_ATTEMPTS;
+        // Holders are this (live) process, so neither is ever reaped as stale.
+        let holder = |token: &str| {
+            std::fs::write(
+                &lock,
+                format!("{} {} {token}", std::process::id(), hrdr_tools::unix_now()),
+            )
+            .unwrap();
+        };
+        holder("first");
+        let waiter = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let acquired = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false);
+                (acquired.map(drop), started.elapsed())
+            })
+        };
+        // Each holder keeps the lock for most of a budget; together they keep
+        // the waiter out well past one.
+        std::thread::sleep(budget * 3 / 5);
+        holder("second");
+        std::thread::sleep(budget * 3 / 5);
+        std::fs::remove_file(&lock).unwrap();
+
+        let (acquired, waited) = waiter.join().unwrap();
+        acquired.expect("the waiter gets the lock once the queue clears");
+        assert!(
+            waited > budget,
+            "the test kept it out past one budget: {waited:?}"
+        );
     }
 
     #[test]

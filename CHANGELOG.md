@@ -176,6 +176,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A store lock no longer times out a writer queued behind working ones.**
+  Writers to `auth.json`, `config.toml` and the blob store waited about five
+  seconds in total before giving up, so on a slow filesystem the last of many
+  concurrent writers failed with `timed out acquiring lock` while every writer
+  ahead of it was making progress. The budget now restarts each time the lock
+  changes hands, with an overall ceiling (`crates/hrdr-agent`).
 - **TUI frame writes keep the cursor hidden until its input position is
   flushed.** Deferred visibility prevents Ratatui's show-before-position
   ordering from exposing the cursor amid transcript updates. Errors preserve the
