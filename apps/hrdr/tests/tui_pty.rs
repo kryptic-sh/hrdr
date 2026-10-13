@@ -304,7 +304,10 @@ fn an_unreachable_endpoint_does_not_take_the_tui_down() -> Result<(), String> {
 // it can be dropped to close the pty (a blocking reader on a background thread
 // can never be unblocked to release its fd, so it could not signal EOF).
 
-use common::{Chat, MockServer, stop_chunk, text_chunk};
+use common::{
+    Chat, MockServer, stop_chunk, text_chunk, tool_args_chunk, tool_calls_stop_chunk,
+    tool_start_chunk,
+};
 
 /// Spawn `hrdr` in a fresh pty against `base_url`, with HOME/XDG/cwd isolated to
 /// throwaway dirs (mirrors `run_tui`). Returns the child, the master (for resize
@@ -748,5 +751,120 @@ fn ctrl_g_returns_from_the_editor_to_a_live_tui() -> Result<(), String> {
         "clean exit after the editor. Screen:\n{}",
         s.snapshot()
     );
+    Ok(())
+}
+
+/// 12. Session messaging between a live TUI and another session, across real
+///     processes: the model lists the peer and messages it, the peer's reply
+///     wakes the idle TUI as peer input, and quitting leaves discovery.
+///
+/// The peer is a messaging runtime in this test process; both use the suite's
+/// private discovery directory (`HRDR_IPC_DIR`, inherited by the child).
+#[test]
+fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> {
+    use hrdr_agent::messaging::{Messaging, SendStatus};
+    use hrdr_tools::local_ipc::UserDirectory;
+
+    if skip_for_want_of_a_pty() {
+        return Ok(());
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let peer_id = format!("pty-peer-{}", std::process::id());
+    let peer = rt
+        .block_on(Messaging::start(
+            UserDirectory::open().unwrap(),
+            peer_id.clone(),
+            "pty peer".into(),
+            "/pty-peer".into(),
+        ))
+        .unwrap();
+    let tool = |id: &str, name: &str, args: &str| {
+        Chat::Sse(vec![
+            tool_start_chunk(id, &format!("call-{id}"), name),
+            tool_args_chunk(id, args),
+            tool_calls_stop_chunk(id),
+            "[DONE]".to_string(),
+        ])
+    };
+    let text = |id: &str, reply: &str| {
+        Chat::Sse(vec![
+            text_chunk(id, reply),
+            stop_chunk(id),
+            "[DONE]".to_string(),
+        ])
+    };
+    let send_args = serde_json::json!({
+        "session_id": peer_id,
+        "cwd": "/pty-peer",
+        "message": "PING_FROM_TUI",
+    })
+    .to_string();
+    let server = MockServer::start(vec![
+        tool("t1", "sessions", "{}"),
+        tool("t2", "message_session", &send_args),
+        text("t3", "SENT_TO_PEER"),
+        text("t4", "PEER_REPLY_SEEN"),
+    ]);
+    let mut s = Session::spawn(&server.base_url());
+    s.wait_for("mock-model", BOOT);
+    s.send("message the other session\r");
+    s.wait_for("SENT_TO_PEER", EXIT);
+    let bodies = server.chat_bodies();
+    assert!(
+        bodies[1].to_string().contains(&peer_id),
+        "the sessions tool listed the peer: {}",
+        bodies[1]
+    );
+
+    let start = Instant::now();
+    let message = loop {
+        if let Some(message) = peer.dequeue() {
+            break message;
+        }
+        assert!(
+            start.elapsed() < EXIT,
+            "the peer never received the message"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(message.sent, "PING_FROM_TUI");
+    let sender = message.peer.expect("peer provenance");
+    let target = rt
+        .block_on(peer.discover())
+        .unwrap()
+        .into_iter()
+        .find(|session| session.session_id == sender.session_id)
+        .expect("the TUI session is discoverable under the id it sent as");
+    assert_eq!(
+        rt.block_on(peer.send(&target, "PONG_FROM_PEER".into()))
+            .unwrap(),
+        SendStatus::Accepted
+    );
+    s.wait_for("PEER_REPLY_SEEN", EXIT);
+    let last = server.chat_bodies().last().unwrap().to_string();
+    assert!(last.contains("PONG_FROM_PEER"), "{last}");
+    assert!(last.contains("not human input"), "{last}");
+
+    s.send("\x11");
+    let status = s.wait_exit(EXIT);
+    assert!(status.success(), "clean exit. Screen:\n{}", s.snapshot());
+    let start = Instant::now();
+    while rt
+        .block_on(peer.discover())
+        .unwrap()
+        .iter()
+        .any(|session| session.session_id == sender.session_id)
+    {
+        assert!(
+            start.elapsed() < EXIT,
+            "the exited session is still discoverable"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    rt.block_on(peer.close());
     Ok(())
 }

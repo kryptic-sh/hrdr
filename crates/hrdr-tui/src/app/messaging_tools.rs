@@ -8,7 +8,8 @@
 //! the far side comes from this session's own registration, never from the
 //! model's arguments.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -17,20 +18,23 @@ use hrdr_tools::local_ipc::SessionDescriptor;
 use hrdr_tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 
-/// The session's running messaging runtime, shared with its tools. Empty until
-/// the session has an id, and between a session switch and the next start.
-pub(crate) type MessagingSlot = Arc<Mutex<Option<Arc<Messaging>>>>;
+/// The session's running messaging runtime, as its tools see it. Empty until the
+/// session has an id, and between a session switch and the next start.
+pub(crate) type MessagingView = tokio::sync::watch::Receiver<Option<Arc<Messaging>>>;
 
-fn running(slot: &MessagingSlot) -> Result<Arc<Messaging>> {
-    slot.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .ok_or_else(|| {
-            anyhow!(
-                "session messaging is not running for this session yet; it starts once \
-                 the session has been saved (after its first message)"
-            )
-        })
+/// How long a tool waits for a start in flight. A brand-new session gets its id
+/// as its first turn starts, so the model's first reply can race the start.
+const START_WAIT: Duration = Duration::from_secs(5);
+
+async fn running(view: &MessagingView) -> Result<Arc<Messaging>> {
+    let mut view = view.clone();
+    match tokio::time::timeout(START_WAIT, view.wait_for(Option::is_some)).await {
+        Ok(Ok(runtime)) => Ok(runtime.clone().expect("waited for a runtime")),
+        _ => Err(anyhow!(
+            "session messaging is not running for this session; it starts once the \
+             session has been saved (after its first message)"
+        )),
+    }
 }
 
 /// Every live session but this one.
@@ -45,7 +49,7 @@ async fn peers(runtime: &Messaging) -> Result<Vec<SessionDescriptor>> {
 }
 
 pub(crate) struct SessionsTool {
-    pub(crate) slot: MessagingSlot,
+    pub(crate) view: MessagingView,
 }
 
 #[async_trait]
@@ -76,7 +80,7 @@ impl Tool for SessionsTool {
         if args != json!({}) {
             bail!("sessions accepts no arguments");
         }
-        let runtime = running(&self.slot)?;
+        let runtime = running(&self.view).await?;
         let sessions: Vec<Value> = peers(&runtime)
             .await?
             .into_iter()
@@ -94,7 +98,7 @@ impl Tool for SessionsTool {
 }
 
 pub(crate) struct MessageSessionTool {
-    pub(crate) slot: MessagingSlot,
+    pub(crate) view: MessagingView,
 }
 
 #[async_trait]
@@ -135,7 +139,7 @@ impl Tool for MessageSessionTool {
         if message.len() > MAX_MESSAGE_BYTES {
             bail!("the message is over the {MAX_MESSAGE_BYTES}-byte limit");
         }
-        let runtime = running(&self.slot)?;
+        let runtime = running(&self.view).await?;
         let mut matches = peers(&runtime)
             .await?
             .into_iter()

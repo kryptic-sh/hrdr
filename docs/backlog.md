@@ -61,10 +61,15 @@ push each verified slice to `main` before proceeding to the next slice.
    the directory mutation lock is held across an fsync in `MutationGuard`, and
    the retry budget was the 2s wire deadline. Directory operations now retry for
    `DIRECTORY_DEADLINE`; one later full run passed, which does not prove the
-   flake is gone. Remaining slices:
-   - Real client-process end-to-end tests for tools, disabling, busy/idle
-     delivery, session switches and shutdown on the Windows/macOS/Linux CI
-     matrix.
+   flake is gone. Real-process coverage: `tests/tui_pty.rs`
+   (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
+   shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
+   disabling), on the CI matrix; verified locally on Windows only so far. Still
+   unexercised across processes: a TUI session switch, the exit report of
+   undelivered messages, and access-control denial for a foreign OS user.
+   Mutation check: removing the TUI's arrival wake did not fail the pty test —
+   something else woke the loop there — so the wake is guarded only by the
+   in-process test that waits for `PeerReady`.
 
    Verify delivery, discovery, disabling, busy/idle behavior, and sender
    attribution before declaring this complete. Support Windows, macOS, and Linux

@@ -6,7 +6,7 @@
 //! steering queue, the next only once the agent has read the last, so the
 //! inbox's byte and count limits still bound everything waiting for it.
 
-use super::messaging_tools::{MessageSessionTool, MessagingSlot, SessionsTool};
+use super::messaging_tools::{MessageSessionTool, SessionsTool};
 use super::*;
 
 /// A started runtime and the registration it currently publishes.
@@ -19,12 +19,11 @@ pub(crate) struct ActiveMessaging {
 }
 
 /// The messaging lifecycle for the session's main agent.
-#[derive(Default)]
 pub(crate) struct MessagingState {
     enabled: bool,
     active: Option<ActiveMessaging>,
-    /// The active runtime, as the model's messaging tools see it.
-    slot: MessagingSlot,
+    /// Publishes the active runtime to the model's messaging tools.
+    slot: tokio::sync::watch::Sender<Option<Arc<hrdr_agent::messaging::Messaging>>>,
     /// The session id a start is in flight for.
     starting: Option<String>,
     /// The session id whose start failed; not retried until the session changes.
@@ -38,7 +37,11 @@ impl MessagingState {
     pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            ..Self::default()
+            active: None,
+            slot: tokio::sync::watch::Sender::new(None),
+            starting: None,
+            failed: None,
+            undelivered_on_exit: 0,
         }
     }
 
@@ -49,19 +52,16 @@ impl MessagingState {
             return;
         }
         agent.register_tool(Arc::new(SessionsTool {
-            slot: self.slot.clone(),
+            view: self.slot.subscribe(),
         }));
         agent.register_tool(Arc::new(MessageSessionTool {
-            slot: self.slot.clone(),
+            view: self.slot.subscribe(),
         }));
     }
 
     fn set_active(&mut self, active: Option<ActiveMessaging>) {
-        *self
-            .slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            active.as_ref().map(|active| active.runtime.clone());
+        self.slot
+            .send_replace(active.as_ref().map(|active| active.runtime.clone()));
         self.active = active;
     }
 
@@ -82,8 +82,8 @@ impl MessagingState {
     }
 
     #[cfg(test)]
-    pub(crate) fn slot(&self) -> MessagingSlot {
-        self.slot.clone()
+    pub(crate) fn view(&self) -> super::messaging_tools::MessagingView {
+        self.slot.subscribe()
     }
 
     /// Accepted peer messages the agent has not been handed yet.

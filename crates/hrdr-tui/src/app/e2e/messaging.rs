@@ -193,10 +193,10 @@ async fn the_model_lists_other_sessions_and_messages_one_as_this_session() {
     let mut h = Harness::new(vec![]).await;
     let id = started(&mut h, "tool sender").await;
     let sessions = SessionsTool {
-        slot: h.app.messaging.slot(),
+        view: h.app.messaging.view(),
     };
     let send = MessageSessionTool {
-        slot: h.app.messaging.slot(),
+        view: h.app.messaging.view(),
     };
     let recipient = peer("recipient").await;
     let recipient_id = recipient.descriptor().session_id;
@@ -260,7 +260,7 @@ async fn two_sessions_with_one_id_and_cwd_are_not_guessed_between() {
         );
     }
     let send = MessageSessionTool {
-        slot: h.app.messaging.slot(),
+        view: h.app.messaging.view(),
     };
     let error = call(
         &send,
@@ -303,8 +303,32 @@ async fn messaging_tools_follow_the_flag_and_need_a_running_session() {
     );
 
     let idle = super::super::messaging::MessagingState::new(true);
-    let error = call(&SessionsTool { slot: idle.slot() }, serde_json::json!({}))
+    let error = call(&SessionsTool { view: idle.view() }, serde_json::json!({}))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("not running"), "{error}");
+}
+
+/// A brand-new session gets its id as its first turn starts, so the model's
+/// first reply can call a messaging tool before the start has landed.
+#[tokio::test]
+async fn a_tool_called_while_messaging_starts_waits_for_it() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.reserve_session_id("racing session");
+    h.app.await_saves().await;
+    h.app.sync_messaging();
+    let sessions = SessionsTool {
+        view: h.app.messaging.view(),
+    };
+    let listing = tokio::spawn(async move { call(&sessions, serde_json::json!({})).await });
+    h.wait_for("messaging start", |msg| {
+        matches!(msg, TurnMsg::MessagingStarted(..))
+    })
+    .await;
+    let listed = listing
+        .await
+        .unwrap()
+        .expect("the tool waited for the start");
+    assert!(listed.contains("\"sessions\""), "{listed}");
 }
