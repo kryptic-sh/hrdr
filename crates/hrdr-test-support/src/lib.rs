@@ -106,7 +106,9 @@ fn sandbox_user_state() {
         // LocalAppData folder on Windows, which ignores the environment). Give
         // the suite its own, so a test session is never discoverable by — and
         // never discovers — the developer's real sessions.
-        std::env::set_var("HRDR_IPC_DIR", root.join("runtime"));
+        let ipc = ipc_parent(&root);
+        std::fs::create_dir_all(&ipc).expect("a test IPC directory is creatable");
+        std::env::set_var("HRDR_IPC_DIR", &ipc);
         // No test reaches models.dev. Building an `Agent` warms the catalog in the
         // background, which is right in production and wrong in a test suite:
         // hundreds of agents would each open a network request, making the suite
@@ -124,7 +126,23 @@ fn sandbox_user_state() {
 #[dtor::dtor(unsafe)]
 fn remove_sandbox() {
     if let Some(root) = std::env::var_os(SANDBOX_ENV) {
-        let _ = std::fs::remove_dir_all(PathBuf::from(root));
+        let root = PathBuf::from(root);
+        let _ = std::fs::remove_dir_all(ipc_parent(&root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// The parent of the suite's session-messaging discovery directory.
+///
+/// Unix sockets live in it, and a socket path is capped at about a hundred
+/// bytes (`sun_path`). macOS's per-user temp dir is long enough that a socket
+/// under the sandbox would not fit, so unix uses a short per-process `/tmp`
+/// directory instead, removed at exit like the sandbox.
+fn ipc_parent(root: &Path) -> PathBuf {
+    if cfg!(unix) {
+        PathBuf::from("/tmp").join(format!("hrdr-test-ipc-{}", std::process::id()))
+    } else {
+        root.join("runtime")
     }
 }
 
