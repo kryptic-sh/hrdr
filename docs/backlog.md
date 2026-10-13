@@ -104,13 +104,7 @@ push each verified slice to `main` before proceeding to the next slice.
    to call it). (c) Which model pays for (b)'s first option — the session's
    model or the configured `subagent_model`? Today a session is named from the
    first line of its first message (`session_name_from`).
-5. **Dependency updates.** Update the project's dependencies to current stable
-   releases using the package manager, regenerate lockfiles, resolve API
-   compatibility changes, and run the full verification and dependency checks.
-   Reassess previously deferred upgrades against current upstream releases;
-   record any upgrades still blocked and why. Commit and push verified slices to
-   `main` after the preceding queued work.
-6. **Terminal titles — Windows report unresolved.** The status/cwd/name title
+5. **Terminal titles — Windows report unresolved.** The status/cwd/name title
    shipped (`hrdr-tui`'s `app::title`), and `tests/tui_pty.rs` shows on Windows
    that the OSC title reaches a ConPTY client. The reported Windows symptom (the
    tab staying `PowerShell`) was not reproduced, so its cause is unknown: a
@@ -118,7 +112,7 @@ push each verified slice to `main` before proceeding to the next slice.
    host that ignores OSC titles, would produce it with hrdr working. **Question
    for the owner:** which terminal and profile showed `PowerShell`? The macOS
    and Linux pty runs are on CI only.
-7. **Multiple selectable shells.** Extend the shell tool so the LLM can select
+6. **Multiple selectable shells.** Extend the shell tool so the LLM can select
    an available shell per command on Windows, macOS, and Linux. Prefer Bash by
    default on every platform: on Windows specifically resolve Git Bash ahead of
    PowerShell, falling back to PowerShell when Git Bash is unavailable. Do not
@@ -130,12 +124,12 @@ push each verified slice to `main` before proceeding to the next slice.
    guardrails, quoting, timeouts, and process cleanup for each selected shell.
    Test discovery, priority, explicit selection, missing-shell errors, and
    prompt accuracy across the supported CI matrix.
-8. **TODO-to-TODO dependencies — question for the owner.** Watch-aware TODO
+7. **TODO-to-TODO dependencies — question for the owner.** Watch-aware TODO
    nudges shipped: an item's `waits_on` names a running watch (see the
    changelog). The request's repeated "TODO item" wording could also mean one
    TODO item waiting on another; that was not built. Should it be, and should a
    blocked item then be exempt from the nudge the same way?
-9. **Self-update, restart, and turn continuation — requested 2026-10-09.**
+8. **Self-update, restart, and turn continuation — requested 2026-10-09.**
    Highest priority after finishing the current path-rendering slice, per the
    user's clarification; take this before the other Windows backlog items. Add a
    model tool for working on the hrdr codebase that installs hrdr through Cargo,
@@ -206,18 +200,18 @@ push each verified slice to `main` before proceeding to the next slice.
    (`prepared_request_is_accepted_by_the_strict_parser` and its siblings) need
    an executable launched from `CARGO_HOME/bin` and are run by neither CI nor
    the local gate, so the junction assertion added to that test is unexecuted.
-10. **Windows multiline-paste transport investigation — deferred branch.**
-    Pending work is preserved and pushed at `wip/windows-paste-transport` commit
-    `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY
-    LF/CRLF regressions, approved `crossterm_winapi` test-only probes, and the
-    config-test isolation fix. It intentionally fails the paste regressions: the
-    inbox `conhost.exe` loses prefixes of fragmented VT paste delimiters even
-    with VT input enabled, while complete frames survive. Test the pinned
-    Microsoft ConPTY host before choosing the conditionally approved vendored
-    Crossterm parser path; verify loaded DLL and host paths so fallback cannot
-    masquerade as a result. Do not merge this branch or release from it until
-    the regressions pass across the required matrix.
-11. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
+9. **Windows multiline-paste transport investigation — deferred branch.**
+   Pending work is preserved and pushed at `wip/windows-paste-transport` commit
+   `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY
+   LF/CRLF regressions, approved `crossterm_winapi` test-only probes, and the
+   config-test isolation fix. It intentionally fails the paste regressions: the
+   inbox `conhost.exe` loses prefixes of fragmented VT paste delimiters even
+   with VT input enabled, while complete frames survive. Test the pinned
+   Microsoft ConPTY host before choosing the conditionally approved vendored
+   Crossterm parser path; verify loaded DLL and host paths so fallback cannot
+   masquerade as a result. Do not merge this branch or release from it until the
+   regressions pass across the required matrix.
+10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
     implementation: usage accounting, request categorization, and credit usage
@@ -518,10 +512,12 @@ changed `Value`'s `FromStr` to parse a single VALUE rather than a document, so
 `text.parse::<toml::Value>()` fails on any real config with
 `unexpected content, expected nothing`; parse a `toml::Table` for a document.
 
-A `cargo update` on 2026-10-14 took every compatible release. Still behind
-latest: the `hjkl-*` crates (0.41 → 0.42, a breaking minor below 1.0) and `zstd`
-(0.13 → 0.14). Both need the manifest bumped through the package manager and the
-API changes resolved.
+On 2026-10-14 `cargo update` took every compatible release and
+`cargo upgrade --incompatible` moved the `hjkl-*` crates to 0.42 and `zstd` to
+0.14, both without source changes. `cargo update --verbose` then reports only
+`generic-array` 0.14.7 and `psm` 0.1.24 behind latest; neither appears in
+`cargo tree --target all`, so they are lockfile entries held by upstream pins
+with nothing to do here.
 
 ## Needs a decision 2026-10-14 — replacing `serde_yaml_ng`
 
