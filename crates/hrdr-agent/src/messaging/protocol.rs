@@ -70,8 +70,17 @@ pub(super) struct Reply {
 }
 
 pub(super) async fn read<T: DeserializeOwned>(connection: &mut Connection) -> io::Result<T> {
+    read_within(connection, DEADLINE).await
+}
+
+/// [`read`] with its own deadline, for a frame the peer may take longer to
+/// produce than the wire [`DEADLINE`].
+pub(super) async fn read_within<T: DeserializeOwned>(
+    connection: &mut Connection,
+    deadline: Duration,
+) -> io::Result<T> {
     Ok(serde_json::from_slice(
-        &connection.read_frame(DEADLINE).await?,
+        &connection.read_frame(deadline).await?,
     )?)
 }
 

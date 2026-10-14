@@ -33,6 +33,11 @@ const PROBE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// than the wire [`DEADLINE`]: a peer holds the lock across an fsync, which a
 /// loaded disk can stretch well past it.
 const DIRECTORY_DEADLINE: Duration = Duration::from_secs(10);
+/// How long a message exchange may take, on both ends: the wire [`DEADLINE`]
+/// plus the receiver's [`DIRECTORY_DEADLINE`] wait for the directory while it
+/// verifies the sender. A shorter bound would cut the exchange off while that
+/// wait is still allowed to run, and the sender would see a dropped pipe.
+const MESSAGE_DEADLINE: Duration = DEADLINE.saturating_add(DIRECTORY_DEADLINE);
 
 struct State {
     descriptor: SessionDescriptor,
@@ -282,7 +287,7 @@ async fn serve(
                         workers.spawn(async move {
                             #[cfg(test)]
                             let _exit = tests::WorkerExitGuard(shared.worker_exit.lock().unwrap().clone());
-                            timeout(DEADLINE, receive(connection, &directory, &shared)).await
+                            timeout(MESSAGE_DEADLINE, receive(connection, &directory, &shared)).await
                         });
                     }
                     Err(error) if unavailable(&error) => {},
@@ -381,7 +386,13 @@ async fn exchange(
     target: &SessionDescriptor,
     payload: Payload,
 ) -> io::Result<(SendStatus, SessionDescriptor)> {
-    timeout(DEADLINE, async {
+    // A probe's reply is immediate; a message's waits on the receiver checking
+    // the sender against the directory.
+    let reply_deadline = match payload {
+        Payload::Probe => DEADLINE,
+        Payload::Message { .. } => MESSAGE_DEADLINE,
+    };
+    timeout(DEADLINE.saturating_add(reply_deadline), async {
         let mut connection = match Connection::connect(directory, &target.endpoint, DEADLINE).await
         {
             Ok(connection) => connection,
@@ -404,7 +415,7 @@ async fn exchange(
             },
         )
         .await?;
-        let reply: Reply = protocol::read(&mut connection).await?;
+        let reply: Reply = protocol::read_within(&mut connection, reply_deadline).await?;
         protocol::version(reply.version)?;
         Ok((reply.status, hello.descriptor))
     })

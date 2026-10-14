@@ -414,3 +414,51 @@ async fn native_cross_process_runtime_delivery_and_pid_rejection() {
     );
     assert!(parent.dequeue().is_none());
 }
+
+/// A busy discovery directory slows a message down without dropping it: the
+/// receiver checks the sender against the directory, and while another process
+/// holds the directory's lock past the wire deadline, both ends keep waiting
+/// instead of hanging up mid-exchange.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_waits_out_a_directory_held_past_the_wire_deadline() {
+    let root = root();
+    let a = runtime(root.path(), "a", "/one").await;
+    let b = runtime(root.path(), "b", "/two").await;
+    let lock_path = find_file(root.path(), ".mutation.lock").expect("the directory's lock file");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    held.lock().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(DEADLINE + Duration::from_secs(1));
+        held.unlock().unwrap();
+    });
+
+    assert_eq!(
+        a.send(&b.descriptor(), "through a busy directory".into())
+            .await
+            .unwrap(),
+        SendStatus::Accepted
+    );
+    release.join().unwrap();
+    assert_eq!(b.dequeue().unwrap().sent, "through a busy directory");
+    a.close().await;
+    b.close().await;
+}
+
+fn find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|file| file == name) {
+            return Some(path);
+        }
+        if path.is_dir()
+            && let Some(found) = find_file(&path, name)
+        {
+            return Some(found);
+        }
+    }
+    None
+}

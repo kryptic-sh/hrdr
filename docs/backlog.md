@@ -61,7 +61,13 @@ push each verified slice to `main` before proceeding to the next slice.
    the directory mutation lock is held across an fsync in `MutationGuard`, and
    the retry budget was the 2s wire deadline. Directory operations now retry for
    `DIRECTORY_DEADLINE`; one later full run passed, which does not prove the
-   flake is gone. Real-process coverage: `tests/tui_pty.rs`
+   flake is gone. That fix left both ends of a message exchange on the 2s wire
+   deadline while the receiver's sender check could wait out the full directory
+   budget, so on Windows CI a send failed twice with `BrokenPipe`
+   (`headless_messaging`, then the pty session-switch test, never locally): the
+   receiver's worker timed out and dropped the pipe. Message exchanges now run
+   to `MESSAGE_DEADLINE` on both ends, and a test holds the directory lock past
+   the wire deadline. Real-process coverage: `tests/tui_pty.rs`
    (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
    shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
    disabling), on the CI matrix; verified locally on Windows only so far.
