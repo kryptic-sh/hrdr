@@ -3592,8 +3592,8 @@ refactor, the gate/sandbox/whitespace dedup, the TUI paste cap, and the 09-04
 OpenCode session-id fix. clippy
 `--workspace --all-targets --all-features -D warnings` is clean, so
 compiler-visible dead code is none; findings are duplication/indirection only.
-**Three new items; the 08-30 items re-confirmed open then are closed except one
-held by stated decision** (the `tool_lines` preview duplication was routed
+**Three new items; of the 08-30 items re-confirmed below, only the one held by
+stated decision remains** (the `tool_lines` preview duplication was routed
 through `preview_head`/`preview_tail` 2026-10-15). (All three new items — the
 double paste warning, the goal args wrapper, and the shared id mint — fixed and
 closed 2026-09-04.)
