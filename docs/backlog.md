@@ -3223,18 +3223,13 @@ nothing behavior-changing proposed.
    the two tail arms differ only in marker wording. Route all arms through
    shared helpers.
 2. **Test-suite dedups — the rest declined 2026-10-14.** `tui_pty.rs` now reads
-   through `common::drain_pty`. merging `chrome_line`/`chrome_fragment`
-   (`apps/hrdr/src/main.rs`) — they differ in shape (styled head plus unstyled
-   tail plus newline, versus a streamed fragment that flushes), so one function
-   would need a flag per caller; and deleting `run_hrdr_inner`
-   (`tests/headless.rs`) — a one-line forwarder whose removal only makes two
-   callers spell out `None`.
-3. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
-   `compute_wrapped_layout` (word-fits / word-onto-fresh-line / whitespace-fits
-   arms): extract a private `place()` helper; the hard-break arm is a genuine
-   variant — leave it. (The related `PlainEngine::layout` String→Vec<char>
-   round-trip is low value — flagged, not proposed.)
-4. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
+   through `common::drain_pty`. Declined: merging
+   `chrome_line`/`chrome_fragment` (`apps/hrdr/src/main.rs`) — they differ in
+   shape (styled head plus unstyled tail plus newline, versus a streamed
+   fragment that flushes), so one function would need a flag per caller; and
+   deleting `run_hrdr_inner` (`tests/headless.rs`) — a one-line forwarder whose
+   removal only makes two callers spell out `None`.
+3. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
    (`verification.rs`) are the identical Format…Test mapping in two private fns,
    but the maintainer's comment at `gate.rs` documents keeping them apart
    ("three different questions"). Merging is behavior-identical today but
@@ -3637,12 +3632,6 @@ args wrapper, and the shared id mint — fixed and closed 2026-09-04.)
   arms (3868-3878 vs 3897-3908) differ only in marker wording ("⋮ (N earlier
   line(s))" vs "⋮ (live · N earlier line(s))"). Route through the shared
   helpers.
-- **08-30 #4** — editor wrap-placement still repeats the place-loop three times:
-  `crates/hrdr-editor/src/lib.rs:268-333` (`compute_wrapped_layout`: word-fits
-  270-278, word-onto-fresh-line 279-292, whitespace-fits 318-326) and the
-  blank-`VisualLine` push at 251-254, 282-285, 301-304. Extract private
-  `place()` / `push_line()` helpers; the hard-break arm (293-314) is a genuine
-  variant, leave it.
 - **08-30 #5, by decision** — `gate_rank` (gate.rs:75-83) vs `kind_rank`
   (verification.rs:346-354): identical Format…Test mapping, still deliberately
   held apart by the comment at gate.rs:70-73 ("three different questions that

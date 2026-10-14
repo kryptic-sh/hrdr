@@ -215,6 +215,33 @@ impl WrappedLayout {
     }
 }
 
+/// Start a new, empty visual line and return its index.
+fn push_empty_line(lines: &mut Vec<VisualLine>) -> usize {
+    lines.push(VisualLine {
+        chars: vec![],
+        width: 0,
+    });
+    lines.len() - 1
+}
+
+/// Append the whole `run` (starting at source index `run_start`) to visual
+/// line `line`, recording each char's position.
+fn place_run(
+    lines: &mut [VisualLine],
+    positions: &mut [(usize, usize)],
+    line: usize,
+    run: &[char],
+    run_start: usize,
+) {
+    let mut col = lines[line].width;
+    for (j, &c) in run.iter().enumerate() {
+        positions[run_start + j] = (line, col);
+        lines[line].chars.push(c);
+        col += char_width(c);
+    }
+    lines[line].width = col;
+}
+
 /// Word-wrap `text` at `width` display columns.
 ///
 /// Wrapping rules (in order):
@@ -248,10 +275,7 @@ pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout 
         if src[i] == '\n' {
             // Record position for this newline char.
             positions[i] = (lines.len() - 1, lines[lines.len() - 1].width);
-            lines.push(VisualLine {
-                chars: vec![],
-                width: 0,
-            });
+            push_empty_line(&mut lines);
             i += 1;
             continue;
         }
@@ -269,27 +293,11 @@ pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout 
             let cur = lines.len() - 1;
             if lines[cur].width + run_width <= w {
                 // Fits on the current line.
-                let mut col = lines[cur].width;
-                for (j, &c) in run.iter().enumerate() {
-                    positions[run_start + j] = (cur, col);
-                    lines[cur].chars.push(c);
-                    col += char_width(c);
-                }
-                lines[cur].width = col;
+                place_run(&mut lines, &mut positions, cur, &run, run_start);
             } else if run_width <= w {
                 // Fits on an empty line — wrap the whole word there.
-                let new_idx = lines.len();
-                lines.push(VisualLine {
-                    chars: vec![],
-                    width: 0,
-                });
-                let mut col = 0usize;
-                for (j, &c) in run.iter().enumerate() {
-                    positions[run_start + j] = (new_idx, col);
-                    lines[new_idx].chars.push(c);
-                    col += char_width(c);
-                }
-                lines[new_idx].width = col;
+                let fresh = push_empty_line(&mut lines);
+                place_run(&mut lines, &mut positions, fresh, &run, run_start);
             } else {
                 // Word is wider than a whole row — hard-break it.
                 let mut cur = lines.len() - 1;
@@ -297,11 +305,7 @@ pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout 
                 for (j, &c) in run.iter().enumerate() {
                     let cw = char_width(c);
                     if cw > 0 && col + cw > w {
-                        cur = lines.len();
-                        lines.push(VisualLine {
-                            chars: vec![],
-                            width: 0,
-                        });
+                        cur = push_empty_line(&mut lines);
                         col = 0;
                     }
                     positions[run_start + j] = (cur, col);
@@ -317,13 +321,7 @@ pub(crate) fn compute_wrapped_layout(text: &str, width: usize) -> WrappedLayout 
             // boundary: omit it visually while retaining it in the buffer.
             let cur = lines.len() - 1;
             if lines[cur].width + run_width <= w {
-                let mut col = lines[cur].width;
-                for (j, &c) in run.iter().enumerate() {
-                    positions[run_start + j] = (cur, col);
-                    lines[cur].chars.push(c);
-                    col += char_width(c);
-                }
-                lines[cur].width = col;
+                place_run(&mut lines, &mut positions, cur, &run, run_start);
             } else {
                 let end = (cur, lines[cur].width);
                 for j in 0..run.len() {
