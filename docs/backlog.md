@@ -3222,11 +3222,13 @@ nothing behavior-changing proposed.
    — `hrdr-tui/src/ui.rs`: mutation-preview head re-implements `preview_head`;
    the two tail arms differ only in marker wording. Route all arms through
    shared helpers.
-2. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
-   reimplements `common::drain_pty` line-for-line (verified identical);
-   `chrome_line`/ `chrome_fragment` one function with two flag settings
-   (`apps/hrdr/src/main.rs`); `run_hrdr_inner` a pure middleman — delete, point
-   callers at `run_hrdr_inner_with_home`.
+2. **Test-suite dedups — the rest declined 2026-10-14.** `tui_pty.rs` now reads
+   through `common::drain_pty`. merging `chrome_line`/`chrome_fragment`
+   (`apps/hrdr/src/main.rs`) — they differ in shape (styled head plus unstyled
+   tail plus newline, versus a streamed fragment that flushes), so one function
+   would need a flag per caller; and deleting `run_hrdr_inner`
+   (`tests/headless.rs`) — a one-line forwarder whose removal only makes two
+   callers spell out `None`.
 3. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
    `compute_wrapped_layout` (word-fits / word-onto-fresh-line / whitespace-fits
    arms): extract a private `place()` helper; the hard-break arm is a genuine

@@ -366,37 +366,10 @@ impl Session {
 
     /// [`Session::spawn`] with extra environment for the child.
     fn spawn_with_env(base_url: &str, env: &[(&str, &str)]) -> Session {
-        let (child, master, mut reader, writer, home, project, runtime) = spawn_pty(base_url, env);
-        let screen = Arc::new(Mutex::new(String::new()));
+        let (child, master, reader, writer, home, project, runtime) = spawn_pty(base_url, env);
         let writer = Arc::new(Mutex::new(writer));
-        let sink = Arc::clone(&screen);
-        let responder = Arc::clone(&writer);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        // Answer the ConPTY cursor-position query (see `run_tui`).
-                        if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
-                            let mut w = grab_writer(&responder);
-                            let _ = w.write_all(b"\x1b[1;1R");
-                            let _ = w.flush();
-                        }
-                        grab(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        // Answers the ConPTY cursor-position query too (see `run_tui`).
+        let screen = common::drain_pty(reader, Arc::clone(&writer));
         Session {
             child,
             master,
