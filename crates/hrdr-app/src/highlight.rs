@@ -95,10 +95,21 @@ impl HighlightCache {
         }
     }
 
-    /// Highlight a fenced block's body, reusing all work from a previous call
-    /// whose content is a prefix of `content`. Returns spans per line,
-    /// including the partial (unterminated) tail line.
+    /// [`Self::highlight_each`], collected: an owned copy of every line.
     pub fn highlight(&mut self, lang: &str, content: &str) -> Vec<HlLine> {
+        let mut out = Vec::new();
+        self.highlight_each(lang, content, |line| out.push(line.clone()));
+        out
+    }
+
+    /// Highlight a fenced block's body, reusing all work from a previous call
+    /// whose content is a prefix of `content`, and hand `each` the spans of
+    /// every line in order — including the partial (unterminated) tail line.
+    ///
+    /// Lines are lent, not returned: a streaming block is highlighted again on
+    /// every frame, and its committed lines are already cached here, so copying
+    /// them out would double the work of a caller that builds its own rows.
+    pub fn highlight_each(&mut self, lang: &str, content: &str, mut each: impl FnMut(&HlLine)) {
         self.tick += 1;
         let ss = syntax_set();
         let mut block = match self
@@ -137,7 +148,7 @@ impl HighlightCache {
         }
         block.consumed.push_str(complete);
 
-        let mut out = block.lines.clone();
+        block.lines.iter().for_each(&mut each);
         if !partial.is_empty() {
             // Highlight the tail on cloned state — the next append re-does it.
             let mut parse = block.parse.clone();
@@ -147,7 +158,7 @@ impl HighlightCache {
                 HighlightIterator::new(&mut hstate, &ops, partial, &self.highlighter)
                     .map(|(st, t)| (st, t.to_string()))
                     .collect();
-            out.push(spans);
+            each(&spans);
         }
 
         block.tick = self.tick;
@@ -164,7 +175,6 @@ impl HighlightCache {
                 self.blocks.swap_remove(i);
             }
         }
-        out
     }
 }
 

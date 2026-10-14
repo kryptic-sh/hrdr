@@ -3056,16 +3056,6 @@ at its cited lines by the sweep lead. **Status: findings 1, 3 and 4 shipped
 2026-08-28 and are removed here; 2 and 5 remain, with the deliberate-tradeoff
 revisit — see the note after the coverage section.**
 
-2. **`HighlightCache::highlight` deep-clones the whole accumulated block on
-   every call.** `hrdr-app/src/highlight.rs:140` does
-   `let mut out = block.lines.clone()` — the entire `Vec<HlLine>` (every
-   committed line and every span string) — even though only the newly appended
-   lines were parsed. Runs per frame for a _streaming_ code block, which grows
-   each chunk and so misses the render cache (`hrdr-tui/src/ui.rs:2118-2121`):
-   O(block bytes) deep clone per redraw for the whole stream. Fix: hand out
-   `Arc<Vec<HlLine>>` (clone the `Arc`), or return a shared slice so the stable
-   committed prefix is not re-copied.
-
 3. **SSE decoder drops its line-buffer capacity on every line.**
    `hrdr-llm/src/sse.rs:141` does `std::mem::take(&mut self.line_buf)`, leaving
    a zero-capacity `Vec` that the next line grows byte-by-byte (1→2→4→…) — once
@@ -3101,15 +3091,14 @@ line-by-line — `hrdr-tools/src/sandbox.rs`, `lsp.rs`, `shell.rs`, `watch.rs`,
 `hrdr-test-support` (test-only).
 
 **Disposition (2026-08-28):** findings 1, 3 and 4 shipped. Finding 2
-(`HighlightCache`) was investigated and declined: the renderer
-(`highlight_lines` in `hrdr-tui/src/ui.rs`) has to emit owned `Span<'static>`s,
-so the committed prefix's `String`s are cloned on every render regardless — the
-proposed `Arc<Vec<HlLine>>` return only saves the inner-`Vec` allocations, and
-the dominant cost is the per-frame full re-render, which is the already-tracked
-transcript-render-walk gap. Finding 5 (SSE line-buffer capacity) is left
-unapplied: self-labelled micro, and preserving the buffer means a method
-extraction on the correctness-critical decoder for a win dwarfed by the round
-trip.
+(`HighlightCache` deep-copying the block per call) was declined here as "only
+saves the inner-`Vec` allocations", but that held for the proposed `Arc` return,
+not for lending: since 2026-10-14 `highlight_each` lends the cached lines, so a
+streaming frame copies each span string once (into its `Span`) instead of twice.
+The per-frame full re-render remains the tracked transcript-render-walk gap.
+Finding 5 (SSE line-buffer capacity) is left unapplied: self-labelled micro, and
+preserving the buffer means a method extraction on the correctness-critical
+decoder for a win dwarfed by the round trip.
 
 ---
 
@@ -3313,11 +3302,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    (only the wrapped portion after the edited line can change), or recompute
    only when buffer/width changed since the last frame — the loop's drain
    already coalesces keystrokes.
-7. **MEDIUM — `HighlightCache` clones every accumulated line on each call.**
-   `hrdr-app/src/highlight.rs`: full-output `block.lines.clone()` per call even
-   when one line is new; each streaming frame of a growing code block is O(total
-   lines). Fix: return a borrow or share lines behind an `Rc`.
-8. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
+7. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
    walkers.** The recorded fix (raw-path `secret_file_reason` first) saves
    nothing: the common file is not a secret, so it is still canonicalized. The
    one real saving — canonicalize the root once and join each entry's relative
@@ -3325,7 +3310,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    a junction directory inside the tree can be walked into; a shortcut there
    could let a junction into `~/.ssh` past the deny-list. A few syscalls per
    file are not worth weakening a secret-file check.
-9. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
+8. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
    `metadata().len()` guard and no match-count bound on memory (the read
    completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
    (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
@@ -3334,12 +3319,12 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    the fix that keeps behaviour — it needs a binary check up front
    (`read_to_string` rejects non-UTF-8 today, which streaming would only
    discover mid-file after emitting matches) and a ring buffer for `-C` context.
-10. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
-    `WindowScanner`: each page re-counts newlines from the start — O(N) per
-    page, ~O(N×pages) over a large file paged start-to-finish. Fix: let
-    `ReadRecord` carry the last-scanned byte offset and resume there (coverage
-    already guarantees contiguous-from-line-1 paging).
-11. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
+9. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
+   `WindowScanner`: each page re-counts newlines from the start — O(N) per page,
+   ~O(N×pages) over a large file paged start-to-finish. Fix: let `ReadRecord`
+   carry the last-scanned byte offset and resume there (coverage already
+   guarantees contiguous-from-line-1 paging).
+10. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
     `record` + `transcript_log.rs`: ~3-4 small allocations + 3 lock acquisitions
     per chunk (per token group). Bounded per token, the hottest loop in
     hrdr-agent; a 60k-token reply ≈ 240k small allocations. Fix: move each event
@@ -3348,7 +3333,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     (Prior `## Performance review — second pass 2026-08-04` #2 made the same
     measurement and dropped it as infeasible for the `Record::from_event` half —
     this adds the still-available `deque double-push` half.)
-12. **LOW — no-usage fallback re-estimates the whole history every round.**
+11. **LOW — no-usage fallback re-estimates the whole history every round.**
     `budget.rs`: `estimate_tokens_in_messages` per round when the server reports
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
     dropped the running-counter fix as risk > value (~µs per round) — noted, not
@@ -3722,30 +3707,26 @@ Ranked by impact, biggest first:
    frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
    static materialized prefix while resolving dynamic header, reasoning, and
    tool-group bodies per frame. Open.
-6. **MEDIUM (re-confirmed, 08-30 #8) — `HighlightCache` clones every accumulated
-   line per call.** `crates/hrdr-app/src/highlight.rs:140` `block.lines.clone()`
-   per streaming frame of a growing code block. Open.
-7. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
+6. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
    cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
    matches only after the whole read. Open.
-8. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
+7. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
    request.** `catalog.rs:219,257,318-324`; caller sites unchanged
    (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
-9. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
+8. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
    page.** `WindowScanner::new` (`read.rs:240,573`). Open.
-10. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
-    acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
-    `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
-    in the transcript projection (`transcript_log.rs:114-115`); runs per
-    streamed token on every agent, the main one included. The suggested merge
-    ("move into the deque exactly once") is now slightly harder than on 08-30:
-    `to_write` feeds both the deque and the transcript write, so
-    `Record::from_event` would need to borrow the payload from the deque entry.
-    Still available; open.
-11. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+9. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+   acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
+   `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
+   in the transcript projection (`transcript_log.rs:114-115`); runs per streamed
+   token on every agent, the main one included. The suggested merge ("move into
+   the deque exactly once") is now slightly harder than on 08-30: `to_write`
+   feeds both the deque and the transcript write, so `Record::from_event` would
+   need to borrow the payload from the deque entry. Still available; open.
+10. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
     `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
     unchanged. Open.
-12. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+11. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
     commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
     (#16 no-usage re-estimate — held open by decision) or the hrdr-tools
     dispatch (#17 args clone). Presumed open-by-construction.

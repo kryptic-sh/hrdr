@@ -2249,12 +2249,11 @@ fn assembly_entry_visits() -> usize {
 fn highlight_lines(lang: &str, content: &str, bg: Color) -> Vec<Line<'static>> {
     // Incremental: a streaming block only highlights its new lines per frame
     // (the shared cache resumes syntect state from the last call).
-    let hl_lines = INC_HL.with(|c| c.borrow_mut().highlight(lang, content));
-    hl_lines
-        .into_iter()
-        .map(|ranges| {
+    let mut lines = Vec::new();
+    INC_HL.with(|c| {
+        c.borrow_mut().highlight_each(lang, content, |ranges| {
             let spans: Vec<Span<'static>> = ranges
-                .into_iter()
+                .iter()
                 .filter_map(|(style, piece)| {
                     let piece = piece.trim_end_matches(['\n', '\r']);
                     if piece.is_empty() {
@@ -2269,9 +2268,10 @@ fn highlight_lines(lang: &str, content: &str, bg: Color) -> Vec<Line<'static>> {
                     ))
                 })
                 .collect();
-            Line::from(spans)
-        })
-        .collect()
+            lines.push(Line::from(spans));
+        });
+    });
+    lines
 }
 
 // ── Session header ─────────────────────────────────────────────────────────
