@@ -3324,15 +3324,13 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    Related to prior backlog entry `## Frame cost measured 2026-08-13` #1 (the
    "still walks every transcript entry" gap — its fix shape is the same
    `ChunkRows::Lazy` extension) — **cross-listed**.
-6. **MEDIUM — editor wrap layout recomputed over the whole buffer on every
-   keystroke.** `hrdr-editor/src/plain.rs` memo invalidates on every mutation
-   and recomputes `compute_wrapped_layout` over the whole buffer + builds a
-   fresh String per compute; typing at the end of a large buffer is O(buffer)
-   per key → O(n²) composing. VimEngine's default `desired_rows` likewise
-   rebuilds the whole buffer String per frame. Fix: line-scoped invalidation
-   (only the wrapped portion after the edited line can change), or recompute
-   only when buffer/width changed since the last frame — the loop's drain
-   already coalesces keystrokes.
+6. **Declined 2026-10-14 — editor wrap layout recomputed over the whole buffer
+   on every keystroke** (`hrdr-editor` `compute_wrapped_layout`). Measured: one
+   layout of a buffer at the 256K-character paste cap (`MAX_PASTE_CHARS`) took
+   4.0 ms in a release build on the dev machine, and keystrokes arriving
+   together are folded into one frame. A few milliseconds per frame in the worst
+   case does not justify line-scoped invalidation and the correctness risk it
+   brings; revisit if the cap grows.
 7. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
    walkers.** The recorded fix (raw-path `secret_file_reason` first) saves
    nothing: the common file is not a secret, so it is still canonicalized. The
