@@ -117,9 +117,9 @@ fn chrome_on_a_terminal_is_coloured() {
 ///
 /// This asserts the BEHAVIOUR, and two layers provide it: hrdr's own check, and
 /// crossterm, which suppresses colour under `NO_COLOR` on its own. So forcing
-/// hrdr's decision on does not turn this red — `term_dumb_turns_it_off…` is the
-/// one that guards hrdr's check. Both are kept: the user cares that the variable
-/// works, not which layer honoured it.
+/// hrdr's decision on does not turn this red; `colour_tests` in `main.rs` is
+/// what guards hrdr's own check. This one stays because the user cares that the
+/// variable works, not which layer honoured it.
 #[test]
 fn no_color_turns_it_off_on_a_terminal() {
     if skip_for_want_of_a_pty() {

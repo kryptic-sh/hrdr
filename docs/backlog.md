@@ -1561,16 +1561,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   binary. The cold path and the `ANTHROPIC_MAX_TOKENS` 8192 fallback are pinned;
   the warm resolution rules are covered separately in `catalog`'s own tests.
   Recorded so nobody "closes" it with a test that only appears to work.
-- **`no_color_turns_it_off_on_a_terminal` cannot fail on hrdr's own check.** Two
-  layers deliver the behaviour it asserts: `colour_stderr` in `apps/hrdr`, and
-  crossterm, which suppresses colour under `NO_COLOR` by itself
-  (`style/types/colored.rs`). Forcing hrdr's decision permanently on leaves the
-  test green — verified by doing it. `term_dumb_turns_it_off_on_a_terminal` is
-  the one that goes red, so the check is guarded; what is unguarded is the
-  `NO_COLOR` arm of it specifically. Both tests are kept and the limitation is
-  written on the test itself, because what the user cares about is that the
-  variable works, not which layer honoured it. Closing it means asserting on
-  `colour_stderr` directly, which is a private fn in a binary crate.
 - **`serve_once` takes `&'static str`**, so every mock SSE body must be a
   literal (the stop-reason tests `Box::leak` theirs). Fine today; it makes a
   table-driven stream test awkward. `impl Into<String>` is a one-line change

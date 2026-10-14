@@ -57,10 +57,21 @@ fn colour_stderr() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         use std::io::IsTerminal;
-        std::io::stderr().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
-            && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
+        colour_wanted(
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+            std::env::var_os("TERM").as_deref(),
+        )
     })
+}
+
+/// [`colour_stderr`]'s decision, apart from where its inputs come from.
+fn colour_wanted(
+    stderr_is_terminal: bool,
+    no_color: Option<&std::ffi::OsStr>,
+    term: Option<&std::ffi::OsStr>,
+) -> bool {
+    stderr_is_terminal && no_color.is_none_or(|v| v.is_empty()) && term.is_none_or(|t| t != "dumb")
 }
 
 /// One line of headless chrome on stderr: `styled` in `colour`, then `rest`
@@ -2139,5 +2150,31 @@ mod sanitize_tests {
     #[test]
     fn bel_and_del_are_dropped() {
         assert_eq!(sanitize_terminal_text("a\x07b\x7fc"), "abc");
+    }
+}
+
+#[cfg(test)]
+mod colour_tests {
+    use super::colour_wanted;
+    use std::ffi::OsStr;
+
+    /// hrdr's own `NO_COLOR` check, which the pty test cannot isolate:
+    /// crossterm honours the variable too, so that test stays green without it.
+    #[test]
+    fn no_color_set_and_non_empty_turns_colour_off() {
+        assert!(!colour_wanted(true, Some(OsStr::new("1")), None));
+        assert!(colour_wanted(true, Some(OsStr::new("")), None));
+        assert!(colour_wanted(true, None, None));
+    }
+
+    #[test]
+    fn a_dumb_terminal_or_a_redirect_turns_colour_off() {
+        assert!(!colour_wanted(true, None, Some(OsStr::new("dumb"))));
+        assert!(colour_wanted(
+            true,
+            None,
+            Some(OsStr::new("xterm-256color"))
+        ));
+        assert!(!colour_wanted(false, None, None));
     }
 }
