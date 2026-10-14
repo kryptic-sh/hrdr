@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,7 +7,6 @@ use hrdr_tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 
 use crate::update_check::admit;
-use crate::update_coordinator::PreparedWindowsUpdateCoordinator;
 
 pub(crate) struct UpdateTool {
     sender: hrdr_tui::UpdateRequestSender,
@@ -21,12 +18,12 @@ impl UpdateTool {
     }
 }
 
-struct PendingWindowsUpdate {
+struct PendingUpdate {
     cwd: PathBuf,
     operation_id: hrdr_agent::UpdateOperationId,
 }
 
-impl hrdr_tui::DeferredUpdate for PendingWindowsUpdate {
+impl hrdr_tui::DeferredUpdate for PendingUpdate {
     fn prepare(
         self: Box<Self>,
         session_id: &str,
@@ -36,14 +33,21 @@ impl hrdr_tui::DeferredUpdate for PendingWindowsUpdate {
         let checkout = runtime
             .block_on(admit(&self.cwd))
             .map_err(|failure| anyhow::anyhow!("update unavailable: {failure:?}"))?;
+        // Windows hands the install to a coordinator that outlives this
+        // process; unix installs here and then execs the result.
+        #[cfg(windows)]
+        let coordinator = crate::update_coordinator::PreparedWindowsUpdateCoordinator::prepare(
+            session_id,
+            &self.operation_id,
+            &checkout,
+            recovery_cwd,
+        )?;
+        #[cfg(unix)]
+        let coordinator =
+            crate::update_exec::PreparedExec::prepare(session_id, &checkout, recovery_cwd)?;
         Ok(hrdr_tui::AdmittedUpdate::new(
             self.operation_id.clone(),
-            PreparedWindowsUpdateCoordinator::prepare(
-                session_id,
-                &self.operation_id,
-                &checkout,
-                recovery_cwd,
-            )?,
+            coordinator,
         ))
     }
 }
@@ -64,7 +68,7 @@ impl Tool for UpdateTool {
             bail!("update accepts no arguments");
         }
         let operation_id = hrdr_agent::UpdateOperationId::random();
-        self.sender.send(Box::new(PendingWindowsUpdate {
+        self.sender.send(Box::new(PendingUpdate {
             cwd: ctx.cwd.clone(),
             operation_id: operation_id.clone(),
         }))?;

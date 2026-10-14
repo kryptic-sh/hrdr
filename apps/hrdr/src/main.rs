@@ -22,7 +22,8 @@ extern crate hrdr_test_support;
 mod headless_messaging;
 mod update_check;
 mod update_coordinator;
-#[cfg(windows)]
+#[cfg(unix)]
+mod update_exec;
 mod update_tool;
 
 use std::io::Write;
@@ -557,11 +558,7 @@ impl UpdateFailure {
     }
 }
 
-type HandoffRecoveryArgs = (
-    String,
-    Option<UpdateFailure>,
-    Option<hrdr_tools::ProcessLease>,
-);
+type HandoffRecoveryArgs = (String, Option<UpdateFailure>, hrdr_tui::RecoveryClaim);
 
 fn handoff_recovery_arg() -> Option<Result<HandoffRecoveryArgs>> {
     handoff_recovery_arg_from(std::env::args_os().skip(1))
@@ -581,6 +578,7 @@ fn handoff_recovery_arg_from(
             .ok_or_else(|| anyhow::anyhow!("__recover-handoff requires a session id"))?;
         let mut update_failure = None;
         let mut source = None;
+        let mut successor = false;
         while let Some(flag) = argv.next() {
             match flag.to_str() {
                 Some("--update-failure") if update_failure.is_none() => {
@@ -610,12 +608,24 @@ fn handoff_recovery_arg_from(
                         })?;
                     source = Some(hrdr_tools::ProcessLease { pid, created });
                 }
+                Some("--exec-successor") if !successor => successor = true,
                 _ => anyhow::bail!(
-                    "__recover-handoff accepts --update-failure STATUS and --source-lease PID CREATED"
+                    "__recover-handoff accepts --update-failure STATUS and either \
+                     --source-lease PID CREATED or --exec-successor"
                 ),
             }
         }
-        Ok((id, update_failure, source))
+        let claim = match (source, successor) {
+            (Some(_), true) => {
+                anyhow::bail!(
+                    "__recover-handoff takes --source-lease or --exec-successor, not both"
+                )
+            }
+            (Some(source), false) => hrdr_tui::RecoveryClaim::Source(source),
+            (None, true) => hrdr_tui::RecoveryClaim::Successor,
+            (None, false) => hrdr_tui::RecoveryClaim::Discovered,
+        };
+        Ok((id, update_failure, claim))
     })())
 }
 
@@ -655,7 +665,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(recovery) = handoff_recovery_arg() {
-        let (id, update_failure, source) = recovery?;
+        let (id, update_failure, claim) = recovery?;
         let (mut config, diagnostics) = AgentConfig::load_diagnosed();
         if let Some(message) = diagnostics.error_message() {
             anyhow::bail!(message);
@@ -668,7 +678,7 @@ async fn main() -> Result<()> {
             LOGO_ART,
             &id,
             update_failure.map(UpdateFailure::as_str),
-            source,
+            claim,
         )
         .await;
     }
@@ -997,7 +1007,15 @@ async fn main() -> Result<()> {
     if cli.command.is_none()
         && let Some(id) = hrdr_tui::discover_handoff_recovery(&config)?
     {
-        return hrdr_tui::run_handoff_recovery(config, ui, LOGO_ART, &id, None, None).await;
+        return hrdr_tui::run_handoff_recovery(
+            config,
+            ui,
+            LOGO_ART,
+            &id,
+            None,
+            hrdr_tui::RecoveryClaim::Discovered,
+        )
+        .await;
     }
 
     match cli.command {
@@ -1035,23 +1053,23 @@ async fn main() -> Result<()> {
         // `hrdr "/model gpt-5"` mean the same thing.
         None => {
             let command = (!cli.input.is_empty()).then(|| cli.input.join(" "));
-            #[cfg(windows)]
-            {
-                let (sender, receiver) = hrdr_tui::update_request_bridge();
-                hrdr_tui::run_with_update_tool(
-                    config,
-                    ui,
-                    LOGO_ART,
-                    command,
-                    receiver,
-                    update_tool::UpdateTool::new(sender),
-                )
-                .await
+            let (sender, receiver) = hrdr_tui::update_request_bridge();
+            hrdr_tui::run_with_update_tool(
+                config,
+                ui,
+                LOGO_ART,
+                command,
+                receiver,
+                update_tool::UpdateTool::new(sender),
+            )
+            .await?;
+            // A committed update handoff leaves its successor to exec now that
+            // the TUI has given the terminal back.
+            #[cfg(unix)]
+            if let Some(error) = update_exec::exec_pending() {
+                return Err(error);
             }
-            #[cfg(not(windows))]
-            {
-                hrdr_tui::run(config, ui, LOGO_ART, command).await
-            }
+            Ok(())
         }
     }
 }
@@ -2017,7 +2035,11 @@ mod cli_tests {
             handoff_recovery_arg_from(args(&["__recover-handoff", "saved-session"]))
                 .transpose()
                 .unwrap(),
-            Some(("saved-session".to_string(), None, None))
+            Some((
+                "saved-session".to_string(),
+                None,
+                hrdr_tui::RecoveryClaim::Discovered
+            ))
         );
         assert_eq!(
             handoff_recovery_arg_from(args(&[
@@ -2034,11 +2056,38 @@ mod cli_tests {
             Some((
                 "saved-session".to_string(),
                 Some(UpdateFailure::InstallFailed),
-                Some(hrdr_tools::ProcessLease {
+                hrdr_tui::RecoveryClaim::Source(hrdr_tools::ProcessLease {
                     pid: 123,
                     created: 456,
                 }),
             ))
+        );
+        assert_eq!(
+            handoff_recovery_arg_from(args(&[
+                "__recover-handoff",
+                "saved-session",
+                "--exec-successor",
+            ]))
+            .transpose()
+            .unwrap(),
+            Some((
+                "saved-session".to_string(),
+                None,
+                hrdr_tui::RecoveryClaim::Successor
+            ))
+        );
+        assert!(
+            handoff_recovery_arg_from(args(&[
+                "__recover-handoff",
+                "saved-session",
+                "--exec-successor",
+                "--source-lease",
+                "123",
+                "456",
+            ]))
+            .unwrap()
+            .is_err(),
+            "a successor claims as itself, not as a named source"
         );
         assert!(handoff_recovery_arg_from(args(&["/new"])).is_none());
         assert!(

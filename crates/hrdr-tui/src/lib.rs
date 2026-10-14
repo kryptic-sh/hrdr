@@ -198,18 +198,46 @@ fn can_retry_snapshot_io_handoff_recovery(
     })
 }
 
+/// Which process a handoff recovery claims the checkpoint as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryClaim {
+    /// The newest committed checkpoint, whose source is found dead.
+    Discovered,
+    /// The checkpoint committed by this exact source, which a coordinator saw
+    /// exit.
+    Source(hrdr_tools::ProcessLease),
+    /// The checkpoint this very process committed before `exec`ing its
+    /// successor image (unix self-update).
+    Successor,
+}
+
 pub async fn run_handoff_recovery(
     config: AgentConfig,
     mut ui: hrdr_app::UiConfig,
     logo: &'static str,
     id: &str,
     update_failure: Option<&str>,
-    source: Option<hrdr_tools::ProcessLease>,
+    claim: RecoveryClaim,
 ) -> Result<()> {
     ui.auto_resume = false;
     let cwd = config.cwd.to_string_lossy();
     let deadline = std::time::Instant::now() + HANDOFF_RECOVERY_RETRY_WINDOW;
+    let source = match claim {
+        RecoveryClaim::Source(source) => Some(source),
+        RecoveryClaim::Discovered | RecoveryClaim::Successor => None,
+    };
     let recovery = loop {
+        if claim == RecoveryClaim::Successor {
+            // The committing image released the lock before the `exec`, and
+            // nothing else can claim this checkpoint, so there is nothing to
+            // wait out.
+            break hrdr_agent::Session::recover_handoff_as_successor(
+                &cwd,
+                id,
+                config.unix_style_paths,
+                app::validate_handoff_payload,
+            )?;
+        }
         match hrdr_agent::Session::recover_handoff(
             &cwd,
             id,

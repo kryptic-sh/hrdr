@@ -7,9 +7,8 @@ extern crate hrdr_test_support;
 
 mod common;
 
-use common::{
-    Chat, MockServer, stop_chunk, tool_args_chunk, tool_calls_stop_chunk, tool_start_chunk,
-};
+use common::MockServer;
+use common::update::{clone_working_tree, copy_tree, persisted_session_state, update_conversation};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::ffi::OsString;
 use std::fs;
@@ -25,31 +24,6 @@ const WAIT: Duration = Duration::from_secs(180);
 /// Under [`WAIT`] those waits timed out on CI while the build was still running.
 const INSTALL_WAIT: Duration = Duration::from_secs(20 * 60);
 const POLL: Duration = Duration::from_millis(100);
-const REQUIRED_JOBS: &[&str] = &[
-    "rustfmt",
-    "clippy ubuntu-latest",
-    "clippy macos-latest",
-    "clippy windows-latest",
-    "cargo-machete (unused deps)",
-    "cargo-deny",
-    "cargo-audit",
-    "test ubuntu-latest",
-    "test macos-latest",
-    "test windows-latest",
-    "no test writes real user state ubuntu-latest",
-    "no test writes real user state macos-latest",
-    "no test writes real user state windows-latest",
-    "build + smoke ubuntu-latest",
-    "build + smoke macos-latest",
-    "build + smoke windows-latest",
-    "Build x86_64-unknown-linux-gnu",
-    "Build aarch64-unknown-linux-gnu",
-    "Build x86_64-unknown-linux-musl",
-    "Build aarch64-unknown-linux-musl",
-    "Build x86_64-pc-windows-msvc",
-    "Build aarch64-apple-darwin",
-    "Build x86_64-apple-darwin",
-];
 
 type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -100,57 +74,7 @@ impl Fixture {
         fs::copy(env!("CARGO_BIN_EXE_hrdr"), &installed).expect("install test binary");
         let old_binary = fs::read(&installed).expect("read installed binary");
 
-        let repository = PathBuf::from(git_output(&["rev-parse", "--show-toplevel"]));
-        let working_tree_patch = Command::new("git")
-            .args(["diff", "--binary", "HEAD"])
-            .output()
-            .expect("capture working-tree patch");
-        assert!(
-            working_tree_patch.status.success(),
-            "git diff failed: {}",
-            String::from_utf8_lossy(&working_tree_patch.stderr)
-        );
-        let head = git_output(&["rev-parse", "--verify", "HEAD^{commit}"]);
-        run_git(&[
-            "clone",
-            "--no-local",
-            "--no-checkout",
-            repository.to_str().expect("utf-8 repository path"),
-            checkout.to_str().expect("utf-8 checkout path"),
-        ]);
-        run_git_in(&checkout, &["checkout", "--detach", &head]);
-        if !working_tree_patch.stdout.is_empty() {
-            let mut apply = Command::new("git")
-                .current_dir(&checkout)
-                .args(["apply", "--whitespace=nowarn", "--binary"])
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .expect("start applying working-tree patch");
-            apply
-                .stdin
-                .take()
-                .expect("working-tree patch stdin")
-                .write_all(&working_tree_patch.stdout)
-                .expect("apply working-tree patch");
-            let status = apply.wait().expect("finish applying working-tree patch");
-            assert!(
-                status.success(),
-                "apply working-tree patch failed: {status:?}"
-            );
-            run_git_in(
-                &checkout,
-                &[
-                    "-c",
-                    "user.name=hrdr Windows update E2E",
-                    "-c",
-                    "user.email=windows-update-e2e@invalid",
-                    "commit",
-                    "--no-gpg-sign",
-                    "-am",
-                    "Windows update E2E working tree",
-                ],
-            );
-        }
+        clone_working_tree(&checkout, "Windows");
         let head = git_output_in(&checkout, &["rev-parse", "--verify", "HEAD^{commit}"]);
         run_git_in(&checkout, &["switch", "-C", "main", &head]);
         run_git_in(
@@ -535,7 +459,9 @@ fn update_installs_default_cargo_binary_and_recovers_once() {
     session.wait_for("mock-model");
     fixture.assert_checkout_clean("initial TUI startup");
     session.send("/cwd apps/hrdr\r");
-    session.wait_for("apps/hrdr");
+    // The success line; a refusal names the same path, so the path alone
+    // would not tell the two apart.
+    session.wait_for("cwd → ");
     session.send("install update\r");
     wait_until("tool-result continuation before handoff", || {
         (server.chat_bodies().len() == 5 && session.screen().contains("turn-after-update"))
@@ -837,76 +763,6 @@ fn failed_cargo_install_recovers_with_the_retained_old_binary_once() {
     );
 }
 
-fn update_conversation() -> Vec<Chat> {
-    vec![
-        Chat::Sse(vec![
-            tool_start_chunk("goal", "goal-add", "goal"),
-            tool_args_chunk("goal", r#"{"op":"add","content":"cancel after recovery"}"#),
-            tool_calls_stop_chunk("goal"),
-            "[DONE]".to_owned(),
-        ]),
-        Chat::Sse(vec![
-            tool_start_chunk("goal", "goal-cancel", "goal"),
-            tool_args_chunk("goal", r#"{"op":"cancel","id":1}"#),
-            tool_calls_stop_chunk("goal"),
-            "[DONE]".to_owned(),
-        ]),
-        Chat::Sse(vec![
-            tool_start_chunk("todo", "todo-complete", "todo"),
-            tool_args_chunk(
-                "todo",
-                r#"{"todos":[{"content":"preserve update state","status":"completed","evidence":"Windows update E2E"}]}"#,
-            ),
-            tool_calls_stop_chunk("todo"),
-            "[DONE]".to_owned(),
-        ]),
-        Chat::Sse(vec![
-            tool_start_chunk("update", "update-call", "update"),
-            tool_args_chunk("update", "{}"),
-            tool_calls_stop_chunk("update"),
-            "[DONE]".to_owned(),
-        ]),
-        Chat::Sse(vec![
-            common::text_chunk("continued", "turn-after-update"),
-            stop_chunk("continued"),
-            "[DONE]".to_owned(),
-        ]),
-        Chat::Sse(vec![
-            tool_start_chunk("shell", "recovery-cwd", "shell"),
-            tool_args_chunk(
-                "shell",
-                r#"{"command":"if (Test-Path src/main.rs) { 'recovery-cwd-preserved' } else { throw 'recovery cwd changed' }"}"#,
-            ),
-            tool_calls_stop_chunk("shell"),
-            "[DONE]".to_owned(),
-        ]),
-        Chat::Sse(vec![
-            common::text_chunk("recovered", "continued-after-update"),
-            stop_chunk("recovered"),
-            "[DONE]".to_owned(),
-        ]),
-    ]
-}
-
-fn persisted_session_state(home: &Path) -> Option<serde_json::Value> {
-    let sessions = home.join("hrdr").join("sessions");
-    let cwd = fs::read_dir(sessions)
-        .ok()?
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_dir()))?;
-    let snapshot = fs::read_dir(cwd.path())
-        .ok()?
-        .filter_map(Result::ok)
-        .find(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                == Some("json")
-        })?;
-    serde_json::from_slice(&fs::read(snapshot.path()).ok()?).ok()
-}
-
 fn session_snapshot(home: &Path) -> Option<PathBuf> {
     let sessions = home.join("hrdr").join("sessions");
     for cwd in fs::read_dir(sessions).ok()? {
@@ -1060,20 +916,6 @@ fn wait_until_within<T>(what: &str, budget: Duration, mut observe: impl FnMut() 
     }
 }
 
-fn copy_tree(source: &Path, destination: &Path) {
-    fs::create_dir_all(destination).expect("create Cargo cache directory");
-    for entry in fs::read_dir(source).expect("read Cargo cache") {
-        let entry = entry.expect("Cargo cache entry");
-        let target = destination.join(entry.file_name());
-        let file_type = entry.file_type().expect("Cargo cache entry type");
-        if file_type.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), target).expect("copy Cargo cache file");
-        }
-    }
-}
-
 fn cargo_program() -> PathBuf {
     let output = Command::new("where.exe")
         .arg("cargo.exe")
@@ -1104,20 +946,6 @@ fn git_program() -> PathBuf {
     )
 }
 
-fn git_output(args: &[&str]) -> String {
-    let output = Command::new("git").args(args).output().expect("run git");
-    assert!(
-        output.status.success(),
-        "git {:?}: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("utf-8 git output")
-        .trim()
-        .to_owned()
-}
-
 fn git_output_in(directory: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(directory)
@@ -1134,16 +962,6 @@ fn git_output_in(directory: &Path, args: &[&str]) -> String {
         .expect("utf-8 git output")
         .trim()
         .to_owned()
-}
-
-fn run_git(args: &[&str]) {
-    let output = Command::new("git").args(args).output().expect("run git");
-    assert!(
-        output.status.success(),
-        "git {:?}: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn run_git_in(directory: &Path, args: &[&str]) {
@@ -1173,28 +991,27 @@ fn single(directory: &Path, prefix: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("no {prefix} in {}", directory.display()))
 }
 
+/// Trust the checkout and the `apps/hrdr` directory the test moves into: trust
+/// is an exact match on each canonical directory, and `/cwd` refuses one that
+/// was never answered for.
 fn trust(home: &Path, project: &Path) {
     let directory = home.join("hrdr");
     fs::create_dir_all(&directory).expect("trust directory");
-    fs::write(
-        directory.join("trusted-dirs"),
-        format!(
-            "{}\n",
-            fs::canonicalize(project)
-                .expect("canonical checkout")
-                .display()
-        ),
-    )
-    .expect("trust checkout");
+    let entries: String = [project.to_path_buf(), project.join("apps").join("hrdr")]
+        .iter()
+        .map(|dir| {
+            format!(
+                "{}\n",
+                fs::canonicalize(dir)
+                    .expect("canonical trusted dir")
+                    .display()
+            )
+        })
+        .collect();
+    fs::write(directory.join("trusted-dirs"), entries).expect("trust checkout");
 }
 
 fn gh_script(head: &str) -> String {
-    let jobs = REQUIRED_JOBS
-        .iter()
-        .map(|name| format!(r#"{{"name":"{name}","status":"completed","conclusion":"success"}}"#))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "@echo off\r\nif \"%~1\"==\"api\" (echo [{{\"workflow_runs\":[{{\"name\":\"CI\",\"event\":\"push\",\"head_branch\":\"main\",\"head_sha\":\"{head}\",\"created_at\":\"2026-10-11T00:00:00Z\",\"id\":1,\"run_attempt\":1,\"status\":\"completed\",\"conclusion\":\"success\"}}]}}]& exit /b 0)\r\necho {{\"jobs\":[{jobs}]}}\r\n"
-    )
+    let (runs, jobs) = common::update::ci_responses(head);
+    format!("@echo off\r\nif \"%~1\"==\"api\" (echo {runs}& exit /b 0)\r\necho {jobs}\r\n")
 }

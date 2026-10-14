@@ -1480,7 +1480,66 @@ impl Session {
             }
         }
         .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
-        let session = match Self::load_path(&path, unix_style_paths) {
+        Self::claim_locked_handoff(
+            cwd,
+            &id,
+            &path,
+            lock,
+            unix_style_paths,
+            crate::HandoffClaimant::Recovery,
+            validate,
+        )
+    }
+
+    /// Recover the handoff this very process instance committed before replacing
+    /// its own image (unix `exec`, which keeps the PID and start time).
+    ///
+    /// The committing image released the session lock before the `exec`, so the
+    /// ordinary lock is taken. Only the process whose lease the checkpoint names
+    /// can claim it this way; any other process is refused.
+    pub fn recover_handoff_as_successor<T, F>(
+        cwd: &str,
+        id: &str,
+        unix_style_paths: bool,
+        validate: F,
+    ) -> Result<HandoffRecovery<T>, OpenError>
+    where
+        F: FnOnce(&[u8], &Session) -> Result<T>,
+    {
+        let path = session_file_path(cwd, id);
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let id = sanitize_name(id);
+        crate::HandoffJournal::claimable_source_by(cwd, &id, crate::HandoffClaimant::Successor)
+            .map_err(OpenError::Load)?
+            .ok_or_else(|| OpenError::Load(anyhow::anyhow!("no claimable committed handoff")))?;
+        let lock = acquire_open_lock_mode(dir, &id, false, None, false)
+            .map_err(|SessionBusy { pid, started }| OpenError::Busy { pid, started })?;
+        Self::claim_locked_handoff(
+            cwd,
+            &id,
+            &path,
+            lock,
+            unix_style_paths,
+            crate::HandoffClaimant::Successor,
+            validate,
+        )
+    }
+
+    /// The shared tail of handoff recovery, under the session's held lock: load
+    /// the snapshot, check it is the handoff's, and claim its journal record.
+    fn claim_locked_handoff<T, F>(
+        cwd: &str,
+        id: &str,
+        path: &Path,
+        lock: SessionLock,
+        unix_style_paths: bool,
+        claimant: crate::HandoffClaimant,
+        validate: F,
+    ) -> Result<HandoffRecovery<T>, OpenError>
+    where
+        F: FnOnce(&[u8], &Session) -> Result<T>,
+    {
+        let session = match Self::load_path(path, unix_style_paths) {
             Ok(session) => session,
             Err(error) => {
                 return Err(OpenError::Load(crate::handoff_journal::snapshot_io_error(
@@ -1488,24 +1547,25 @@ impl Session {
                 )));
             }
         };
-        if session.state.cwd != cwd || session.state.id.as_deref() != Some(id.as_str()) {
+        if session.state.cwd != cwd || session.state.id.as_deref() != Some(id) {
             return Err(OpenError::Load(anyhow::anyhow!(
                 "saved session does not match handoff"
             )));
         }
-        let journal = match crate::HandoffJournal::open_for_loaded(cwd, &id, &lock, &session) {
+        let journal = match crate::HandoffJournal::open_for_loaded(cwd, id, &lock, &session) {
             Ok(journal) => journal,
             Err(error) => return Err(OpenError::Load(error)),
         };
-        let (record, intent) = match journal.claim(|payload| validate(payload, &session)) {
-            Ok(Some(recovery)) => recovery,
-            Ok(None) => {
-                return Err(OpenError::Load(anyhow::anyhow!(
-                    "no claimable committed handoff"
-                )));
-            }
-            Err(error) => return Err(OpenError::Load(error)),
-        };
+        let (record, intent) =
+            match journal.claim_by(claimant, |payload| validate(payload, &session)) {
+                Ok(Some(recovery)) => recovery,
+                Ok(None) => {
+                    return Err(OpenError::Load(anyhow::anyhow!(
+                        "no claimable committed handoff"
+                    )));
+                }
+                Err(error) => return Err(OpenError::Load(error)),
+            };
         Ok(HandoffRecovery {
             session,
             lock,
@@ -3288,6 +3348,57 @@ mod tests {
                     .is_some(),
                 "a mismatched coordinator must not claim the checkpoint"
             );
+        });
+    }
+
+    /// A process that commits a handoff and then replaces its own image (unix
+    /// `exec`) is still the same process instance, so an ordinary recovery sees
+    /// a live source and refuses — while the successor claims it as itself. No
+    /// other process can claim a checkpoint as its successor.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn only_the_committing_process_claims_as_its_successor() {
+        with_test_env(|tmp| {
+            let project = tmp.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let cwd = project.to_str().unwrap().to_string();
+            let dir = session_dir(&cwd);
+            for id in ["mine", "theirs"] {
+                Session::new(state(id, &cwd)).save(id, true).unwrap();
+            }
+            let lock = acquire_existing_open_lock(&dir, "mine").unwrap();
+            crate::HandoffJournal::open(&cwd, "mine", &lock)
+                .unwrap()
+                .append(1, crate::HandoffState::Commit, b"{}")
+                .unwrap();
+            drop(lock);
+            let lock = acquire_existing_open_lock(&dir, "theirs").unwrap();
+            crate::HandoffJournal::open(&cwd, "theirs", &lock)
+                .unwrap()
+                .append_for_source(
+                    1,
+                    crate::HandoffState::Commit,
+                    hrdr_tools::ProcessLease {
+                        pid: u32::MAX - 3,
+                        created: 3,
+                    },
+                    b"{}",
+                )
+                .unwrap();
+            drop(lock);
+            let accept = |_: &[u8], _: &Session| Ok::<_, anyhow::Error>(());
+
+            let error = Session::recover_handoff(&cwd, "mine", true, None, accept).unwrap_err();
+            assert!(error.to_string().contains("still live"), "{error}");
+
+            let recovery = Session::recover_handoff_as_successor(&cwd, "mine", true, accept)
+                .expect("the committing process claims as its successor");
+            assert_eq!(recovery.session.state.id.as_deref(), Some("mine"));
+            drop(recovery);
+
+            let error =
+                Session::recover_handoff_as_successor(&cwd, "theirs", true, accept).unwrap_err();
+            assert!(error.to_string().contains("another process"), "{error}");
         });
     }
 

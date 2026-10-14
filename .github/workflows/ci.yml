@@ -168,6 +168,11 @@ jobs:
       - name: Windows Cargo self-update E2E
         if: matrix.os == 'windows-latest'
         run: cargo test --locked --release -p hrdr --features test-support --test windows_update_e2e -- --ignored --test-threads=1
+      # On Linux and macOS the updater installs in place and execs the result;
+      # the test runs that in a pty and checks the same process continues.
+      - name: Unix Cargo self-update E2E
+        if: matrix.os != 'windows-latest'
+        run: cargo test --locked --release -p hrdr --features test-support --test unix_update_e2e -- --ignored --test-threads=1
       - name: Completions + man page generate cleanly
         shell: bash
         run: |

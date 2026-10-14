@@ -19,6 +19,8 @@
 
 #![allow(dead_code)] // Not every test uses every helper.
 
+pub mod update;
+
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

@@ -101,6 +101,39 @@ pub enum HandoffIntent {
     UpdateContinuation,
 }
 
+/// Who claims a committed checkpoint, which decides what proves the committing
+/// process is no longer running it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffClaimant {
+    /// Another process: the committing source must be certainly dead or
+    /// replaced.
+    Recovery,
+    /// The committing process instance itself, after replacing its own image
+    /// (unix `exec`, which keeps the PID and start time): the checkpoint's source
+    /// must be this process. No other process can satisfy that.
+    Successor,
+}
+
+/// Whether `claimant` may claim a checkpoint committed by `source`.
+fn source_claimable_by(source: hrdr_tools::ProcessLease, claimant: HandoffClaimant) -> Result<()> {
+    match claimant {
+        HandoffClaimant::Recovery => match hrdr_tools::process_lease_liveness(source) {
+            hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced => Ok(()),
+            hrdr_tools::ProcessLiveness::Live => bail!("handoff source owner is still live"),
+            hrdr_tools::ProcessLiveness::Unknown => {
+                bail!("handoff source owner liveness could not be determined")
+            }
+        },
+        HandoffClaimant::Successor => {
+            if hrdr_tools::current_process_lease() == Some(source) {
+                Ok(())
+            } else {
+                bail!("the handoff was committed by another process")
+            }
+        }
+    }
+}
+
 /// Versioned, quiescent runtime state required before a handoff can be claimed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,6 +371,16 @@ impl<'a> HandoffJournal<'a> {
     /// open-lock is acquired. Only a checksum- and snapshot-bound record from a
     /// certainly dead or replaced source yields a lease.
     pub fn claimable_source(cwd: &str, id: &str) -> Result<Option<hrdr_tools::ProcessLease>> {
+        Self::claimable_source_by(cwd, id, HandoffClaimant::Recovery)
+    }
+
+    /// [`Self::claimable_source`] for a given claimant: the source of the newest
+    /// committed checkpoint, when `claimant` may claim it.
+    pub fn claimable_source_by(
+        cwd: &str,
+        id: &str,
+        claimant: HandoffClaimant,
+    ) -> Result<Option<hrdr_tools::ProcessLease>> {
         let id = sanitize_name(id);
         let session_path = session_file_path(cwd, &id);
         let session_hash = saved_session_hash(&session_path, &id)?;
@@ -354,15 +397,8 @@ impl<'a> HandoffJournal<'a> {
         if !claimable_state(record.state) {
             return Ok(None);
         }
-        match hrdr_tools::process_lease_liveness(record.source) {
-            hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced => {
-                Ok(Some(record.source))
-            }
-            hrdr_tools::ProcessLiveness::Live => bail!("handoff source owner is still live"),
-            hrdr_tools::ProcessLiveness::Unknown => {
-                bail!("handoff source owner liveness could not be determined")
-            }
-        }
+        source_claimable_by(record.source, claimant)?;
+        Ok(Some(record.source))
     }
 
     /// Inspect the journal without opening the snapshot.
@@ -485,7 +521,7 @@ impl<'a> HandoffJournal<'a> {
         Ok(())
     }
 
-    #[cfg(all(test, windows))]
+    #[cfg(test)]
     pub(crate) fn append_for_source(
         &self,
         epoch: u64,
@@ -504,11 +540,23 @@ impl<'a> HandoffJournal<'a> {
     where
         F: FnOnce(&[u8]) -> Result<T>,
     {
+        self.claim_by(HandoffClaimant::Recovery, validate)
+    }
+
+    /// [`Self::claim`] for a given claimant (see [`HandoffClaimant`]).
+    pub fn claim_by<T, F>(
+        &self,
+        claimant: HandoffClaimant,
+        validate: F,
+    ) -> Result<Option<(HandoffRecord, T)>>
+    where
+        F: FnOnce(&[u8]) -> Result<T>,
+    {
         let _append_guard = self
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("handoff journal append lock is poisoned"))?;
-        let Some(record) = self.claimable()? else {
+        let Some(record) = self.claimable_by(claimant)? else {
             return Ok(None);
         };
         let intent = validate(&record.payload)?;
@@ -543,21 +591,19 @@ impl<'a> HandoffJournal<'a> {
 
     /// Return the newest committed checkpoint if its source is certainly not live.
     pub fn claimable(&self) -> Result<Option<HandoffRecord>> {
+        self.claimable_by(HandoffClaimant::Recovery)
+    }
+
+    /// [`Self::claimable`] for a given claimant (see [`HandoffClaimant`]).
+    pub fn claimable_by(&self, claimant: HandoffClaimant) -> Result<Option<HandoffRecord>> {
         let Some(record) = self.scan()?.last else {
             return Ok(None);
         };
         if !claimable_state(record.state) {
             return Ok(None);
         }
-        match hrdr_tools::process_lease_liveness(record.source) {
-            hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced => {
-                Ok(Some(record))
-            }
-            hrdr_tools::ProcessLiveness::Live => bail!("handoff source owner is still live"),
-            hrdr_tools::ProcessLiveness::Unknown => {
-                bail!("handoff source owner liveness could not be determined")
-            }
-        }
+        source_claimable_by(record.source, claimant)?;
+        Ok(Some(record))
     }
 
     fn frame(

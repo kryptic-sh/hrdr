@@ -8,7 +8,6 @@
 #[cfg(windows)]
 use crate::update_check::AdmittedCheckout;
 use sha2::{Digest, Sha256};
-#[cfg(windows)]
 use std::process::Command;
 use std::{
     collections::BTreeSet,
@@ -409,18 +408,21 @@ fn consume_operation(staging_root: &Path, request: &Request) -> OperationMarker 
     }
 }
 
-fn default_cargo_bin() -> anyhow::Result<PathBuf> {
+/// Where `cargo install` puts hrdr by default: `$CARGO_HOME/bin`, else the
+/// user's `.cargo/bin` (`USERPROFILE` on Windows, `HOME` elsewhere).
+pub(crate) fn default_cargo_bin() -> anyhow::Result<PathBuf> {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".cargo")))
-        .ok_or_else(|| anyhow::anyhow!("CARGO_HOME and USERPROFILE are unavailable"))?;
+        .or_else(|| std::env::var_os(home_var).map(|home| PathBuf::from(home).join(".cargo")))
+        .ok_or_else(|| anyhow::anyhow!("CARGO_HOME and {home_var} are unavailable"))?;
     anyhow::ensure!(cargo_home.is_absolute(), "CARGO_HOME is not absolute");
-    canonical_absolute(&cargo_home.join("bin").join("hrdr.exe"))
-        .map_err(|_| anyhow::anyhow!("default Cargo hrdr.exe is not a canonical file"))
+    let binary = format!("hrdr{}", std::env::consts::EXE_SUFFIX);
+    canonical_absolute(&cargo_home.join("bin").join(&binary))
+        .map_err(|_| anyhow::anyhow!("default Cargo {binary} is not a canonical file"))
 }
 
-#[cfg(windows)]
-fn cargo_program() -> PathBuf {
+pub(crate) fn cargo_program() -> PathBuf {
     #[cfg(test)]
     if let Some(program) = std::env::var_os("HRDR_TEST_CARGO") {
         return PathBuf::from(program);
@@ -492,8 +494,7 @@ fn promote_prebuilt_candidate(candidate: &Path, destination: &Path) -> bool {
     }
 }
 
-#[cfg(windows)]
-fn sanitized_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn sanitized_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let program = program.as_ref();
     let program = program
         .to_str()
@@ -510,7 +511,6 @@ fn sanitized_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
-#[cfg(windows)]
 fn is_git_injection_variable(key: &str) -> bool {
     let matches = |candidate: &str| key.eq_ignore_ascii_case(candidate);
     [
@@ -535,8 +535,11 @@ fn is_git_injection_variable(key: &str) -> bool {
         || key.to_ascii_uppercase().starts_with("GIT_CONFIG_VALUE_")
 }
 
-#[cfg(windows)]
-fn clean_head(checkout_root: &Path, expected_commit: &str, deadline: std::time::Instant) -> bool {
+pub(crate) fn clean_head(
+    checkout_root: &Path,
+    expected_commit: &str,
+    deadline: std::time::Instant,
+) -> bool {
     let Ok(head) = run_command(
         sanitized_command("git")
             .current_dir(checkout_root)
@@ -593,8 +596,7 @@ fn stage_promoted_binary(
     Some((staged, guard))
 }
 
-#[cfg(windows)]
-fn prebuilt_identity(
+pub(crate) fn prebuilt_identity(
     binary: &Path,
     expected_version: &str,
     expected_commit: &str,
@@ -637,16 +639,29 @@ fn launch(
 
 /// Runs an argv command without a shell. Output is capped and every wait shares
 /// the request deadline; a timed-out child is killed before this returns.
-#[cfg(windows)]
-fn run_command(
+pub(crate) fn run_command(
     command: &mut Command,
     deadline: std::time::Instant,
     capture: bool,
 ) -> Result<Vec<u8>, ()> {
+    run_command_with_stderr(command, deadline, capture, std::process::Stdio::null())
+}
+
+/// [`run_command`] with the child's stderr sent to `stderr` — a log file, so a
+/// failure can say what the command reported.
+pub(crate) fn run_command_with_stderr(
+    command: &mut Command,
+    deadline: std::time::Instant,
+    capture: bool,
+    stderr: std::process::Stdio,
+) -> Result<Vec<u8>, ()> {
     use std::io::Read;
     use std::process::Stdio;
 
-    command.stderr(Stdio::null());
+    // Never the terminal's: a child that read it would steal keystrokes from
+    // the TUI it runs beside.
+    command.stdin(Stdio::null());
+    command.stderr(stderr);
     if capture {
         command.stdout(Stdio::piped());
     } else {

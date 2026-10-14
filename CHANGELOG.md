@@ -66,6 +66,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Recovery reopens the session under the exact working-directory spelling it was
   saved with, so a checkout reached through an 8.3 short name or a junction
   resumes instead of failing to find its session.
+- **Linux and macOS sessions can self-update too.** The `update` tool admits the
+  same checkout and CI run, then installs it into the default Cargo location
+  while the session keeps running, so a failed install or attestation leaves the
+  session as it was. Once the handoff commits, hrdr gives the terminal back and
+  `exec`s the installed binary, which keeps the process and the terminal, claims
+  the checkpoint as its own successor (`__recover-handoff --exec-successor`),
+  and continues the interrupted turn. Handoff recovery now works on Linux and
+  macOS: a process lease is the pid plus its start time (boot id and start ticks
+  on Linux, `proc_pidinfo` on macOS) (`apps/hrdr`, `crates/hrdr-agent`,
+  `crates/hrdr-tools`, `crates/hrdr-tui`).
 - **Windows path style is configurable for mutation results and tool
   headlines.** `unix_style_paths` defaults to `true`, rendering
   edit/write/replace success and refusal labels, skipped-file lists, diff paths,

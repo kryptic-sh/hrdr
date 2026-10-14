@@ -193,14 +193,17 @@ push each verified slice to `main` before proceeding to the next slice.
    budget. The 2026-10-12 `auth.json.lock` timeout in
    `hrdr-agent::auth_store::tests::concurrent_writers_different_providers_all_preserved`
    was the lock's whole-wait budget running out behind fifteen progressing
-   writers; fixed in `StoreLock::acquire`. **Remaining, 2026-10-14:** (1) Unix
-   has no self-update at all — `apps/hrdr/src/update_tool.rs` and the
-   coordinator's install/launch path are `cfg(windows)`. The request covers Unix
-   restart behaviour too: there a running binary can be replaced in place and
-   the process can `exec` its successor, so the Windows retained-binary dance is
-   unnecessary, but the admission, CI gate, journal, recovery claim and
-   continuation must be wired and tested on Linux and macOS (CI only from this
-   machine). (2) Queue persistence is not needed for today's contract: the
+   writers; fixed in `StoreLock::acquire`. **Unix self-update, 2026-10-14:**
+   `apps/hrdr`'s `update_exec` installs in place and `exec`s the installed
+   binary, which claims the checkpoint as its own successor
+   (`Session::recover_handoff_as_successor`); process leases exist on Linux and
+   macOS. `tests/unix_update_e2e.rs` passed in WSL (Linux) and fails without
+   `--exec-successor`; macOS relies on CI's `Unix Cargo self-update E2E` step.
+   Until then the Windows E2E's recovery-cwd check passed vacuously:
+   `/cwd apps/hrdr` was refused as untrusted, and PowerShell echoed the marker
+   in its own error. With both fixed it caught `/cwd` storing the verbatim
+   `\\?\` spelling, under which recovery could not find the session.
+   **Remaining:** Queue persistence is not needed for today's contract: the
    handoff waits for quiescence, and a queued steer relaunches a turn at `Done`,
    so queued messages are delivered before the handoff rather than lost. It
    becomes necessary once the contract is broadened to hand off with work
