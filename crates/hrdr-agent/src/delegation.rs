@@ -574,7 +574,7 @@ async fn spawn_background(
                 // not just the answer, exactly as a steered follow-up turn does.
                 let generation = live.begin_turn(live_key);
                 live.enqueue(live_key, opening);
-                let _run_guard = RunGuard::new(live.clone(), live_key, generation);
+                let mut run_guard = RunGuard::new(live.clone(), live_key, generation);
                 let usage_live = live.clone();
                 let mut sub = sub.lock().await;
                 loop {
@@ -628,7 +628,7 @@ async fn spawn_background(
                     if !live.continue_or_finish(live_key) {
                         break;
                     }
-                    live.begin_turn(live_key);
+                    run_guard.begin_next_turn();
                 }
                 Ok(())
             }

@@ -3139,20 +3139,16 @@ pinned `ignore-0.4.33` walker). Six findings survive; hrdr-agent came out clean
 shipped 2026-08-30 (`.git`-component skip, reserved-stem refusal, RFC-7231
 bounds in `parse_imf_fixdate`, the cancelled-shell id-marker in the `UserShell`
 handler, and the `--auto-compact` parse warning — each with a regression test
-that failed before the fix); item 6 open — recorded, not fixed.**
-
-6. **Hardening candidates from the hrdr-agent review** — one left, not a live
-   defect: a generation-invalidated `RunGuard` leak one abort-site away from
-   real. Settled: the `task_cancel`/handle-push race (fixed by
-   `BackgroundPublication`, which holds the handle lock while the row is
-   published); and three fixed 2026-10-15 — the budget wrap-up prompt counting
-   as a user turn (now a `MessageOrigin::Nudge` through `push_user_message`),
-   the registry's `events` lock silently stopping on poison (it recovers like
-   the crate's other locks), and the unjoined live-output forwarders, which
-   turned out to be a live defect: a tool's output past tokio's 128-op
-   scheduling budget was dropped from the live view whenever it was emitted just
-   before the call returned (`run_tool_batch` now drains until the forwarders
-   close).
+that failed before the fix). Item 6, five hrdr-agent hardening candidates, is
+settled: the `task_cancel`/handle race was already fixed
+(`BackgroundPublication`), and on 2026-10-15 the budget wrap-up prompt became a
+`MessageOrigin::Nudge`, the registry `events` lock recovers from poison, a batch
+drains its live-output forwarders until they close, and `RunGuard` follows a
+steered continuation (`begin_next_turn`). Two of those were live defects — live
+output cut off after 128 chunks, and a sub-agent cancelled mid-continuation left
+`running` forever. Gap: the `RunGuard` regression test pins the guard, not the
+delegation loop's call to it; no test drives a background run through a steered
+continuation and then cancels it.**
 
 **Cleared (top of the list):** sandbox escapes (`..` and dangling-symlink
 canonicalization — the dangling case is a documented accepted write-TOCTOU, and

@@ -198,6 +198,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Cancelling a sub-agent after it was steered no longer leaves it running.** A
+  background sub-agent that carried on into a steered turn and was then
+  cancelled stayed marked as running for good: its pane kept a live loader and
+  offered to take steers with nothing on the other end (`crates/hrdr-agent`).
 - **A fast tool's live output is no longer cut off after 128 lines.** When a
   tool produced its output right before finishing, the live view showed only the
   first 128 chunks of it; the rest never reached the transcript, though the

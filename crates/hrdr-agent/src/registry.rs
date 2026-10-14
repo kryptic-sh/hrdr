@@ -1033,6 +1033,14 @@ impl RunGuard {
             generation,
         }
     }
+
+    /// Start the next turn of the run this guard covers — a steer landed, so the
+    /// agent keeps going — and take ownership of it. Starting it any other way
+    /// would leave the guard holding the previous turn's generation, and an
+    /// abort during the continuation would then skip the cleanup it exists for.
+    pub fn begin_next_turn(&mut self) {
+        self.generation = self.live.begin_turn(self.key);
+    }
 }
 
 impl Drop for RunGuard {
@@ -1327,6 +1335,28 @@ mod tests {
         live.update(1, |e| e.delivered = true);
         live.prune();
         assert!(live.is_empty(), "and then it is released, not leaked");
+    }
+
+    /// A run that carried on into a steered turn is still released when it is
+    /// aborted there: the guard owns the continuation too.
+    ///
+    /// Regression: the delegation loop started the continuation with
+    /// `begin_turn` directly, so the guard kept the first turn's generation and
+    /// took itself for a superseded guard — a sub-agent cancelled mid-
+    /// continuation stayed `running` forever.
+    #[test]
+    fn a_run_aborted_in_a_steered_continuation_is_still_released() {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        {
+            let mut guard = RunGuard::new(live.clone(), 1, live.begin_turn(1));
+            // The first turn ends with a steer queued, so the run continues.
+            guard.begin_next_turn();
+            // ...and is aborted during the continuation.
+        }
+        let (running, done) = live.with(|v| (v[0].running, v[0].done));
+        assert!(!running, "the aborted continuation is not still running");
+        assert!(done, "and the sub-agent is finished, not stuck in flight");
     }
 
     /// A cancelled turn's guard does not run at `abort()` — it runs whenever the
