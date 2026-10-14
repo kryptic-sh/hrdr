@@ -3387,16 +3387,13 @@ findings below were appended after the section was written.
       Result<Option<String>, …
       > ` taking the delta by value (`std::mem::take`), caller moves the chunk in; the reasoning case extracts `reasoning_content.take()`before push.`push`is`pub`,
       > but the only production caller is that one site.
-19. **MEDIUM — catalog cross-provider re-scan every request** —
-    `hrdr-llm/src/catalog.rs`: every `chat_stream` runs
-    `input_modalities_cached(None, …)` and often `max_output_cached(None, …)`;
-    `provider=None` skips the keyed branch and falls into the full
-    cross-provider scan (measured: 207 providers, 7,483 model entries), plus a
-    `std::fs::metadata` syscall + global-Mutex lock per lookup (`cached_read`).
-    For local/llama.cpp sessions the model id never matches, so every request
-    pays the whole scan (tens of µs). Fix: memoize lookup results per
-    `(catalog mtime, provider, model)` in a static map, mirroring the existing
-    mtime-keyed `CATALOG_LOAD_CACHE`.
+19. **Declined 2026-10-14 — catalog cross-provider re-scan every request**
+    (`hrdr-llm/src/catalog.rs`, `input_modalities_cached` / `max_output_cached`
+    with `provider=None`). Each scan is one map lookup per provider (207
+    measured), tens of µs, once per request rather than per token, beside a
+    network round trip. A memo keyed by catalog mtime, provider and model would
+    add invalidation logic for a saving nobody would see. Revisit with a profile
+    showing it.
 20. **LOW — SSE decoder scans byte-at-a-time** — `hrdr-llm/src/sse.rs` `push`:
     one branch + len check per streamed byte (~1–2 MB for a 10K-token turn ≈
     1–2M iterations). Fix: find line ends with `memchr` and split chunks into
@@ -3714,12 +3711,9 @@ Ranked by impact, biggest first:
 6. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
    cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
    matches only after the whole read. Open.
-7. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
-   request.** `catalog.rs:219,257,318-324`; caller sites unchanged
-   (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
-8. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
+7. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
    page.** `WindowScanner::new` (`read.rs:240,573`). Open.
-9. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+8. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
    acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
    `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
    in the transcript projection (`transcript_log.rs:114-115`); runs per streamed
@@ -3727,10 +3721,10 @@ Ranked by impact, biggest first:
    the deque exactly once") is now slightly harder than on 08-30: `to_write`
    feeds both the deque and the transcript write, so `Record::from_event` would
    need to borrow the payload from the deque entry. Still available; open.
-10. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
-    `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
-    unchanged. Open.
-11. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+9. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+   `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
+   unchanged. Open.
+10. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
     commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
     (#16 no-usage re-estimate — held open by decision) or the hrdr-tools
     dispatch (#17 args clone). Presumed open-by-construction.
