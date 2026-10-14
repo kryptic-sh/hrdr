@@ -115,14 +115,23 @@ impl SseDecoder {
     /// [`Self::drain`] since the last successful push may be truncated and must
     /// not be processed.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), SseOverflow> {
-        for &b in bytes {
-            if b == b'\n' {
-                self.flush_line();
-            } else if self.line_buf.len() < MAX_BUFFER_BYTES {
-                self.line_buf.push(b);
-            } else {
+        // A line at a time: copy each newline-free segment in one go, keeping
+        // only what fits under the cap, then flush at its newline.
+        let mut rest = bytes;
+        loop {
+            let newline = rest.iter().position(|&b| b == b'\n');
+            let segment = &rest[..newline.unwrap_or(rest.len())];
+            let room = MAX_BUFFER_BYTES.saturating_sub(self.line_buf.len());
+            if segment.len() > room {
                 self.overflowed = true;
             }
+            self.line_buf
+                .extend_from_slice(&segment[..segment.len().min(room)]);
+            let Some(at) = newline else {
+                break;
+            };
+            self.flush_line();
+            rest = &rest[at + 1..];
         }
         if self.overflowed {
             Err(SseOverflow)

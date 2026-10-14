@@ -3405,12 +3405,7 @@ findings below were appended after the section was written.
     network round trip. A memo keyed by catalog mtime, provider and model would
     add invalidation logic for a saving nobody would see. Revisit with a profile
     showing it.
-20. **LOW — SSE decoder scans byte-at-a-time** — `hrdr-llm/src/sse.rs` `push`:
-    one branch + len check per streamed byte (~1–2 MB for a 10K-token turn ≈
-    1–2M iterations). Fix: find line ends with `memchr` and split chunks into
-    lines in one pass. (`flush_line`'s `from_utf8_lossy` is a borrow-only `Cow`
-    on valid UTF-8 — no per-line alloc on the hot path; confirmed.)
-21. **Declined 2026-10-14 — per-event `data.contains("\"error\"")` pre-scan**
+20. **Declined 2026-10-14 — per-event `data.contains("\"error\"")` pre-scan**
     (`hrdr-llm/src/client.rs`). A substring scan before the O(len) parse is far
     cheaper than the parse itself and documented in place as deliberate;
     removing it means giving the shared `ChatChunk` an `error` field for a gain
@@ -3727,10 +3722,7 @@ Ranked by impact, biggest first:
    the deque exactly once") is now slightly harder than on 08-30: `to_write`
    feeds both the deque and the transcript write, so `Record::from_event` would
    need to borrow the payload from the deque entry. Still available; open.
-7. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
-   `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
-   unchanged. Open.
-8. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+7. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
    commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
    (#16 no-usage re-estimate — held open by decision) or the hrdr-tools dispatch
    (#17 args clone). Presumed open-by-construction.
