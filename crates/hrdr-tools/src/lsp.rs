@@ -216,9 +216,7 @@ impl LspRegistry {
         // are server-dependent — some analyze, some return nothing, some
         // complain about a file "not in the workspace". Skipping is the
         // deliberate, uniform behavior.
-        if !path.starts_with(&self.root) {
-            return None;
-        }
+        let path = &within_root(&self.root, path)?;
         let ext = path.extension()?.to_string_lossy().to_lowercase();
         let config = self
             .configs
@@ -1112,6 +1110,23 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Resul
     anyhow::bail!("LSP header exceeds {MAX_LSP_HEADERS} lines")
 }
 
+/// `path` spelled under `root`, when it names a file inside the workspace. A
+/// model can spell a file differently from the root — another letter case on a
+/// case-insensitive filesystem, or through a symlink or junction — so the
+/// canonical forms decide, and the file is re-spelled from `root`, the spelling
+/// the servers were initialized with.
+fn within_root(root: &Path, path: &Path) -> Option<PathBuf> {
+    if path.starts_with(root) {
+        return Some(path.to_path_buf());
+    }
+    let canonical_root = crate::canonicalize_nearest(root);
+    let relative = crate::canonicalize_nearest(path)
+        .strip_prefix(&canonical_root)
+        .ok()?
+        .to_path_buf();
+    Some(root.join(relative))
+}
+
 /// Format the **errors** among `diags` as one tool-result note. Warnings and
 /// hints are deliberately dropped — they'd bury the signal on lint-heavy
 /// codebases; the model gets what would actually break the build. Repeats —
@@ -1459,6 +1474,41 @@ mod tests {
             registry.statuses().await[0].status,
             LspServerStatus::Running,
             "pre-warm spawned the server"
+        );
+    }
+
+    /// A file inside the workspace is recognised however it is spelled, and is
+    /// handed back spelled from the root; a file outside it is not.
+    #[test]
+    fn within_root_recognises_another_spelling_of_a_workspace_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src").join("main.xyz");
+        std::fs::write(&file, "x").unwrap();
+        let outside = dir.path().join("elsewhere.xyz");
+        std::fs::write(&outside, "x").unwrap();
+
+        assert_eq!(within_root(&root, &file), Some(file.clone()));
+        assert_eq!(within_root(&root, &outside), None);
+
+        // Windows: the same file in another letter case.
+        #[cfg(windows)]
+        let respelled = PathBuf::from(file.display().to_string().to_uppercase());
+        // Unix: the same file through a symlink to the workspace.
+        #[cfg(unix)]
+        let respelled = {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            link.join("src").join("main.xyz")
+        };
+        assert_ne!(
+            respelled, file,
+            "the spelling must differ for this to test anything"
+        );
+        assert_eq!(
+            within_root(&root, &respelled),
+            Some(root.join("src").join("main.xyz"))
         );
     }
 

@@ -329,7 +329,12 @@ the unfinished-line case has not run locally (`test_env::shell` picks Git Bash
 here). The same day, one full `hrdr-tools` run in WSL under load (a release
 build running beside it) failed
 `proc::tests::git_runner_deadline_covers_readers_after_the_leader_exits` on its
-`TimedOut` kind assertion; five isolated reruns passed. Not investigated.
+`TimedOut` kind assertion; five isolated reruns passed. A full Windows
+`hrdr-tools` run on 2026-10-14 likewise failed
+`proc::tests::git_runner_kills_an_overflowing_program_without_waiting_for_its_timeout`
+(its 2s budget for a `.cmd` printing 10,000 lines); three isolated reruns
+passed. Both are `CommandRunner` wall-clock tests failing only under suite load.
+Not investigated.
 
 ## GitHub Actions setup-zig cache verification
 
@@ -2552,16 +2557,30 @@ and **not** fixed.
   submissions, complete paste preservation within the existing paste cap, and
   ordinary explicit Enter submission afterward. Do not claim cross-platform
   correctness from Windows-only tests or synthetic `Event::Paste` tests alone.
-- **`cwd_slug` hashes the raw `current_dir()`.** Windows keeps whatever drive
-  and path case the shell was started with (VS Code's terminal uses `c:\`), so
-  one project can get two session folders and `/resume` cannot see the other's
-  sessions. Inferred.
-- **`sandbox_denial_note` only recognises EROFS wording.** A Low-integrity write
-  refusal reads "Access is denied" / "Permission denied", so Windows `read` mode
-  never gets the explanatory note. Low confidence that this is Windows-only.
-- **LSP `diagnostics_note` compares paths case-sensitively.** A model-supplied
-  path whose case differs from the workspace root gets no diagnostics on a
-  case-insensitive filesystem.
+- **`cwd_slug` keys session folders on the raw cwd string, through an unstable
+  hash — needs a decision.** Two problems in `hrdr-agent`'s `paths::cwd_slug`.
+  (1) Windows keeps whatever drive and path case the shell was started with (VS
+  Code's terminal uses `c:\`), so one project can get two session folders and
+  `/resume` cannot see the other's sessions (inferred, not reproduced). (2) The
+  16-hex suffix comes from `std::hash::DefaultHasher`, whose algorithm Rust
+  documents as unspecified and free to change between releases: a toolchain bump
+  could re-key every session folder, hiding all saved sessions and per-project
+  memory at once (verified by reading the code; no release has done it yet).
+  Fixing either changes every existing slug, so it needs a migration. **Question
+  for the owner:** switch to a specified hash (e.g. SHA-256 via the existing
+  `hrdr_llm::sha256_hex`) over a normalized cwd (case-folded drive on Windows),
+  and on lookup fall back to the legacy slug, moving the folder when found? Or
+  keep today's keys and accept both risks? The fallback costs one extra
+  directory probe per session lookup and a rename on first use.
+- **`sandbox_denial_note` only recognises EROFS wording — needs evidence.** A
+  Low-integrity write refusal on Windows reads "Access is denied", so Windows
+  `read` mode never gets the explanatory note. Not changed: the note claims the
+  failure IS the sandbox, and an existing test
+  (`sandbox_denial_note(..., "Permission denied")` is `None`) guards against
+  false positives — on Windows an ordinary ACL refusal prints the same words.
+  Before extending it, capture what a confined write actually prints under the
+  Windows sandbox and find a marker the ordinary error lacks; if there is none,
+  the note would have to hedge ("may be the sandbox").
 - **Path presentation verification follow-up.** Config-diagnostic regressions
   passed Linux/macOS CI in `37912493951`; the bounded consumer audit found no
   further active gaps, not exhaustive proof. Startup diagnostics recover a typed

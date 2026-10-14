@@ -189,6 +189,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Edits get LSP diagnostics however the file's path is spelled.** A file
+  inside the workspace was skipped when its path differed from the workspace
+  root's spelling — another letter case on Windows or macOS, or a path through a
+  symlink or junction. The paths are now compared canonically and the file is
+  checked under the root's spelling (`crates/hrdr-tools`).
 - **A session moved with `/cwd` is saved where it is working, even mid-turn.**
   While a turn held the agent, the TUI took the session's directory from the
   process, which `/cwd` and resume never move, so saves made during a turn were
