@@ -518,7 +518,7 @@ file re-verified against the strict path. Decisions worth not re-litigating:
 - **`MAX_SLUG_LEN` is 200**, chosen against the 255-byte component cap with
   headroom for the longer `<slug>.<unix_ts>-<n>.bak` names the tool derives.
 - **Not covered:** exact `recall_score` ordering among several equally-matching
-  memories. The search-ranking test discriminates the shared `relevance_score`
+  memories. The search-ranking test discriminates the shared `Lowered::score`
   path; a separate ordering test was judged redundant.
 
 ## Performance review 2026-08-06
@@ -2851,15 +2851,12 @@ offsets, and the attachment digest memo. 2 open (deferred, reasons inline).**
    bigger than the win for sub-agent snapshots; the live autosave copies are in
    `hrdr-tui` (app.rs History handler, session.rs), the payoff sites if the TUI
    gets a dedicated pass.**
-2. **Per-turn lowercase copies of every memory body**
-   (`hrdr-tools/src/ memory.rs`): `relevance_score` lowercases
-   name/description/body per needle (per recall token), and the mtime-cache hit
-   `cloned()`s the whole memory before the mtime filter. Runs once per opening
-   user message; tens of memories × a few tokens × body-size copies is
-   sub-millisecond, dwarfed by the LLM round trip. **Deferred 2026-08-14: the
-   review's own label is "borderline micro — fix while touching the code", and
-   no other item touches `memory.rs`; fix it when something else opens the file
-   (lowercase each body once, serve the cached memory by `Arc`/`Rc`).**
+2. **The memory mtime-cache hit `cloned()`s the whole memory**
+   (`hrdr-tools/src/memory.rs`) before the mtime filter, once per opening user
+   message. The other half of this item — lowercasing every body per recall
+   token — was fixed 2026-10-14 (`Lowered`). Sub-millisecond, dwarfed by the LLM
+   round trip. **Deferred 2026-08-14 as "borderline micro — fix while touching
+   the code"** (serve the cached memory by `Arc`/`Rc`).
 
 **Already optimized (traced and cleared — do not re-hunt):** session save path
 (created-cache, compact JSON, transcript in a sibling jsonl, off-thread);
@@ -3347,16 +3344,12 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
     (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
     and stop once `matches > max_matches`.
-11. **LOW — recall lowercases name/description/body once per token, per turn.**
-    `hrdr-tools/src/memory.rs` `recall_score` → `relevance_score` per query
-    token: ~100–300 lowercased copies of content per turn (both scopes). Fix:
-    lowercase the three fields once per memory outside the token loop.
-12. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
+11. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
     `WindowScanner`: each page re-counts newlines from the start — O(N) per
     page, ~O(N×pages) over a large file paged start-to-finish. Fix: let
     `ReadRecord` carry the last-scanned byte offset and resume there (coverage
     already guarantees contiguous-from-line-1 paging).
-13. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
+12. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
     `record` + `transcript_log.rs`: ~3-4 small allocations + 3 lock acquisitions
     per chunk (per token group). Bounded per token, the hottest loop in
     hrdr-agent; a 60k-token reply ≈ 240k small allocations. Fix: move each event
@@ -3365,7 +3358,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     (Prior `## Performance review — second pass 2026-08-04` #2 made the same
     measurement and dropped it as infeasible for the `Record::from_event` half —
     this adds the still-available `deque double-push` half.)
-14. **LOW — no-usage fallback re-estimates the whole history every round.**
+13. **LOW — no-usage fallback re-estimates the whole history every round.**
     `budget.rs`: `estimate_tokens_in_messages` per round when the server reports
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
     dropped the running-counter fix as risk > value (~µs per round) — noted, not
@@ -3424,16 +3417,11 @@ findings below were appended after the section was written.
     1–2M iterations). Fix: find line ends with `memchr` and split chunks into
     lines in one pass. (`flush_line`'s `from_utf8_lossy` is a borrow-only `Cow`
     on valid UTF-8 — no per-line alloc on the hot path; confirmed.)
-21. **LOW — per-event `data.contains("\"error\"")` pre-scan** —
-    `hrdr-llm/src/client.rs`: a full O(len) scan of every SSE event just to pick
-    a parse branch, immediately before an O(len) `serde_json::from_str` —
-    doubles the scan per token. Fix: parse directly and fall back to the
-    error-path only when the result is an all-defaults chunk carrying `error`.
-22. **LOW — per-fragment alloc in Codex arg streaming** —
-    `hrdr-llm/src/codex.rs`: `state.args_streamed.insert(fc_id.to_string())` per
-    `function_call_arguments.delta` fragment. Fix: insert only on the first
-    fragment (`if !contains`), or key the set by `u64` hash. Hot only during
-    tool-calling rounds.
+21. **Declined 2026-10-14 — per-event `data.contains("\"error\"")` pre-scan**
+    (`hrdr-llm/src/client.rs`). A substring scan before the O(len) parse is far
+    cheaper than the parse itself and documented in place as deliberate;
+    removing it means giving the shared `ChatChunk` an `error` field for a gain
+    nobody has measured. Revisit only with a profile showing it.
 
 **Checked, not problems (hrdr-llm):** full-history re-serialization per request
 is inherent (each backend needs the whole history; OpenAI fast path already
@@ -3783,16 +3771,10 @@ Ranked by impact, biggest first:
 13. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
     `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
     unchanged. Open.
-14. **LOW (re-confirmed, 08-30 #21) — per-event `contains("\"error\"")`
-    pre-scan.** `client.rs:1557`, immediately before the same O(len) parse.
-    Open.
-15. **LOW (re-confirmed, 08-30 #22) — codex per-fragment `fc_id.to_string()`
-    insert into `args_streamed`.** `codex.rs:450`. Open.
-16. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
-    commit since 08-30 touches `replace.rs` (#12 double-match pass), `memory.rs`
-    (#13 recall lowercasing per token), `budget.rs` (#16 no-usage re-estimate —
-    held open by decision) or the hrdr-tools dispatch (#17 args clone). Presumed
-    open-by-construction.
+14. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+    commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
+    (#16 no-usage re-estimate — held open by decision) or the hrdr-tools
+    dispatch (#17 args clone). Presumed open-by-construction.
 
 **Checked, not findings (new code since 08-30):**
 

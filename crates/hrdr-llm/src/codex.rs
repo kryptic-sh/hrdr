@@ -567,7 +567,10 @@ fn map_event(
             let Some(&slot) = state.tool_slot.get(fc_id) else {
                 return Ok(None);
             };
-            state.args_streamed.insert(fc_id.to_string());
+            // Only the first fragment allocates the id; every later one finds it.
+            if !state.args_streamed.contains(fc_id) {
+                state.args_streamed.insert(fc_id.to_string());
+            }
             Ok(Some(tool_call_chunk(
                 slot,
                 None,

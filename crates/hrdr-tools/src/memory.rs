@@ -1031,22 +1031,40 @@ fn list_scope(scope: &str, root: &Path, unix_style_paths: bool) -> String {
     out
 }
 
-/// Case-insensitive relevance of one memory to an already-lowercased `needle`:
-/// substring match against name + description (weighted high) and body (weighted
-/// low). `0` means no match. The weighting shared by `search` (whole-query
-/// substring) and `recall` (per query token).
-fn relevance_score(mem: &Memory, needle: &str) -> i32 {
-    let mut score = 0;
-    if mem.name.to_lowercase().contains(needle) {
-        score += 3;
+/// A memory's searchable fields, lowercased once so every needle scored against
+/// it reuses them instead of lowercasing the body again per token.
+struct Lowered {
+    name: String,
+    description: String,
+    body: String,
+}
+
+impl Lowered {
+    fn of(mem: &Memory) -> Self {
+        Self {
+            name: mem.name.to_lowercase(),
+            description: mem.description.to_lowercase(),
+            body: mem.body.to_lowercase(),
+        }
     }
-    if mem.description.to_lowercase().contains(needle) {
-        score += 3;
+
+    /// Case-insensitive relevance to an already-lowercased `needle`: substring
+    /// match against name + description (weighted high) and body (weighted
+    /// low). `0` means no match. The weighting shared by `search` (whole-query
+    /// substring) and `recall` (per query token).
+    fn score(&self, needle: &str) -> i32 {
+        let mut score = 0;
+        if self.name.contains(needle) {
+            score += 3;
+        }
+        if self.description.contains(needle) {
+            score += 3;
+        }
+        if self.body.contains(needle) {
+            score += 1;
+        }
+        score
     }
-    if mem.body.to_lowercase().contains(needle) {
-        score += 1;
-    }
-    score
 }
 
 /// Rank memories by case-insensitive substring match of `query` against name +
@@ -1061,7 +1079,7 @@ fn search(root: &Path, query: &str) -> String {
     let skipped = store.skipped_note();
     let mut hits: Vec<(i32, String, String, String)> = Vec::new(); // (score, name, description, stem)
     for (stem, mem) in store.memories {
-        let score = relevance_score(&mem, &q);
+        let score = Lowered::of(&mem).score(&q);
         if score > 0 {
             hits.push((score, mem.name, mem.description, stem));
         }
@@ -1140,7 +1158,8 @@ fn recall_tokens(query: &str) -> Vec<String> {
 /// name/description/body weighting over each token — so a full-sentence message
 /// matches memories that share its meaningful words. `0` means no token hit.
 fn recall_score(mem: &Memory, tokens: &[String]) -> i32 {
-    tokens.iter().map(|t| relevance_score(mem, t)).sum()
+    let lowered = Lowered::of(mem);
+    tokens.iter().map(|t| lowered.score(t)).sum()
 }
 
 /// Rank the project + global memories by relevance to `query` and return the
