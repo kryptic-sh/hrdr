@@ -213,10 +213,7 @@ push each verified slice to `main` before proceeding to the next slice.
    handoff waits for quiescence, and a queued steer relaunches a turn at `Done`,
    so queued messages are delivered before the handoff rather than lost. It
    becomes necessary once the contract is broadened to hand off with work
-   outstanding. The ignored coordinator unit tests
-   (`prepared_request_is_accepted_by_the_strict_parser` and its siblings) need
-   an executable launched from `CARGO_HOME/bin` and are run by neither CI nor
-   the local gate, so the junction assertion added to that test is unexecuted.
+   outstanding.
 9. **Windows multiline-paste transport investigation — deferred branch.**
    Pending work is preserved and pushed at `wip/windows-paste-transport` commit
    `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY

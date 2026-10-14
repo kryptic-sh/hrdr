@@ -927,6 +927,41 @@ mod tests {
     #[cfg(windows)]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The tests that call `prepare` check it against the running executable,
+    /// so they only pass as `$CARGO_HOME/bin/hrdr.exe`: ignored on their own,
+    /// and run here from a copy of this test binary placed there. "1 passed"
+    /// proves each one ran rather than matching nothing.
+    #[cfg(windows)]
+    #[test]
+    fn prepare_tests_pass_when_launched_from_cargo_home_bin() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("hrdr.exe");
+        fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        for name in [
+            "prepared_request_is_accepted_by_the_strict_parser",
+            "prepared_coordinator_reports_spawn_failure",
+            "coordinator_staging_does_not_dirty_the_admitted_checkout",
+            "offroot_candidate_is_rejected_before_git",
+        ] {
+            let output = Command::new(&exe)
+                .args(["--ignored", "--exact"])
+                .arg(format!("update_coordinator::tests::{name}"))
+                .env("CARGO_HOME", home.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{name}:
+{stdout}
+{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "requires an executable launched from CARGO_HOME/bin"]
@@ -979,7 +1014,13 @@ mod tests {
         assert_eq!(request.source_pid, lease.pid);
         assert_eq!(request.source_created, lease.created);
         assert_eq!(request.candidate_binary, prepared.candidate_binary);
-        assert_eq!(fs::read_to_string(cargo_args).unwrap(), "");
+        // The fake cargo logs every call but `--build-info`: preparing builds
+        // nothing, so it never ran.
+        assert!(
+            !cargo_args.exists(),
+            "preparing ran cargo: {:?}",
+            fs::read_to_string(&cargo_args)
+        );
         assert_eq!(
             request.intended_cargo_bin,
             canonical_absolute(&std::env::current_exe().unwrap()).unwrap()
@@ -1347,196 +1388,6 @@ mod tests {
         fs::remove_file(staged).unwrap();
     }
 
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "superseded by Cargo-install coordinator E2E"]
-    fn git_config_parameters_worktree_redirect_is_removed_and_promotion_never_runs_cargo() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        assert!(
-            Command::new("git")
-                .args(["init", "--quiet"])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        fs::write(
-            root.join(".gitignore"),
-            "fake-bin/\ncargo-home/\ncargo-args.txt\nlaunches.txt\nredirected-worktree/\n",
-        )
-        .unwrap();
-        assert!(
-            Command::new("git")
-                .args(["add", ".gitignore"])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=test",
-                    "-c",
-                    "user.email=test@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test"
-                ])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let commit = String::from_utf8(
-            Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(root)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_owned();
-        let bin = root.join("fake-bin");
-        fs::create_dir_all(&bin).unwrap();
-        let cargo_args = root.join("cargo-args.txt");
-        fs::write(
-            bin.join("cargo.cmd"),
-            format!(
-                "@echo off\r\nif defined GIT_DIR exit /b 2\r\nif defined GIT_CONFIG_PARAMETERS exit /b 3\r\nif \"%1\"==\"metadata\" (\r\necho {{\"packages\":[{{\"name\":\"hrdr\",\"version\":\"{}\"}}]}}\r\nexit /b 0\r\n)\r\necho %*>>\"{}\"\r\nexit /b 0\r\n",
-                env!("CARGO_PKG_VERSION"),
-                cargo_args.display()
-            ),
-        )
-        .unwrap();
-        let cargo_home = root.join("cargo-home");
-        let installed = cargo_home.join("bin/hrdr.cmd");
-        fs::create_dir_all(installed.parent().unwrap()).unwrap();
-        let marker = root.join("launches.txt");
-        fs::write(
-            &installed,
-            format!(
-                "@echo off\r\nif \"%1\"==\"--build-info\" (\r\necho version: {}\r\necho commit: {commit}\r\necho target: {}\r\necho source: clean\r\nexit /b 0\r\n)\r\necho %1^|%2>>\"{}\"\r\n",
-                env!("CARGO_PKG_VERSION"),
-                env!("HRDR_BUILD_TARGET"),
-                marker.display(),
-            ),
-        ).unwrap();
-        let operation_hash = sha256_hex(b"operation");
-        let staging = installed
-            .parent()
-            .unwrap()
-            .join(format!(".hrdr-update-{operation_hash}"));
-        fs::create_dir(&staging).unwrap();
-        let candidate = staging.join(format!("coordinator-{operation_hash}.cmd"));
-        fs::write(&candidate, b"candidate").unwrap();
-        let prebuilt = staging
-            .join("target")
-            .join(env!("HRDR_BUILD_TARGET"))
-            .join("release")
-            .join(if cfg!(test) { "hrdr.cmd" } else { "hrdr.exe" });
-        fs::create_dir_all(prebuilt.parent().unwrap()).unwrap();
-        fs::write(
-            &prebuilt,
-            format!(
-                "@echo off\r\nif \"%1\"==\"--build-info\" (\r\necho version: {}\r\necho commit: {commit}\r\necho target: {}\r\necho source: clean\r\nexit /b 0\r\n)\r\necho %1^|%2>>\"{}\"\r\n",
-                env!("CARGO_PKG_VERSION"),
-                env!("HRDR_BUILD_TARGET"),
-                marker.display(),
-            ),
-        )
-        .unwrap();
-        let previous_test_cargo = std::env::var_os("HRDR_TEST_CARGO");
-        let previous_cargo_home = std::env::var_os("CARGO_HOME");
-        let previous_git_dir = std::env::var_os("GIT_DIR");
-        let previous_git_config_parameters = std::env::var_os("GIT_CONFIG_PARAMETERS");
-        let redirected_worktree = root.join("redirected-worktree");
-        fs::create_dir_all(&redirected_worktree).unwrap();
-        fs::write(redirected_worktree.join("tampered"), b"tampered").unwrap();
-        unsafe {
-            std::env::set_var("HRDR_TEST_CARGO", bin.join("cargo.cmd"));
-            std::env::set_var("CARGO_HOME", &cargo_home);
-            std::env::set_var("GIT_DIR", root.join("redirected-git-dir"));
-            std::env::set_var(
-                "GIT_CONFIG_PARAMETERS",
-                format!(
-                    "'core.worktree={}'",
-                    redirected_worktree.to_string_lossy().replace('\\', "/")
-                ),
-            );
-        }
-        let configured_worktree = Command::new("git")
-            .env_remove("GIT_DIR")
-            .args(["config", "--get", "core.worktree"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        assert!(configured_worktree.status.success());
-        assert_eq!(
-            String::from_utf8(configured_worktree.stdout)
-                .unwrap()
-                .trim(),
-            redirected_worktree.to_string_lossy().replace('\\', "/"),
-        );
-        let request_path = staging.join(format!("request-{operation_hash}.json"));
-        let mut signed = request(root, candidate);
-        signed.expected_commit = commit;
-        signed.intended_cargo_bin = installed;
-        signed.prebuilt_binary = prebuilt;
-        signed.prebuilt_checksum = sha256_hex(&fs::read(&signed.prebuilt_binary).unwrap());
-        signed.source_pid = u32::MAX;
-        signed.source_created = 1;
-        write_request(&request_path, &mut signed);
-        assert!(clean_head(
-            root,
-            &signed.expected_commit,
-            std::time::Instant::now() + std::time::Duration::from_secs(2)
-        ));
-        let result = run(request_path);
-        unsafe {
-            match previous_test_cargo {
-                Some(value) => std::env::set_var("HRDR_TEST_CARGO", value),
-                None => std::env::remove_var("HRDR_TEST_CARGO"),
-            }
-            match previous_cargo_home {
-                Some(value) => std::env::set_var("CARGO_HOME", value),
-                None => std::env::remove_var("CARGO_HOME"),
-            }
-            match previous_git_dir {
-                Some(value) => std::env::set_var("GIT_DIR", value),
-                None => std::env::remove_var("GIT_DIR"),
-            }
-            match previous_git_config_parameters {
-                Some(value) => std::env::set_var("GIT_CONFIG_PARAMETERS", value),
-                None => std::env::remove_var("GIT_CONFIG_PARAMETERS"),
-            }
-        }
-        assert_eq!(result, Status::Launched);
-        assert!(
-            Command::new("git")
-                .args(["status", "--porcelain=v1", "--untracked-files=normal"])
-                .current_dir(root)
-                .output()
-                .unwrap()
-                .stdout
-                .is_empty()
-        );
-        assert!(!cargo_args.exists());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !marker.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(
-            fs::read_to_string(marker).unwrap(),
-            "__recover-handoff|session\r\n"
-        );
-    }
     #[test]
     fn operation_marker_consumes_byte_identical_requests_once() {
         let temp = tempfile::tempdir().unwrap();
