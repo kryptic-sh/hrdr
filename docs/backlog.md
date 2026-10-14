@@ -1391,7 +1391,16 @@ Opened by the redesign:
   (`background_subagent_persists_its_own_session_state`). Deleting it removes a
   per-turn-boundary write; keeping it keeps a crash-durable record of what a
   sub-agent actually said. Decide, rather than leaving a file nobody loads — and
-  note that the panes read the sibling `.jsonl`, not this.
+  note that the panes read the sibling `.jsonl`, not this. **This decision also
+  settles the two HIGH perf entries on the same write** (a deep copy of the
+  whole history plus a two-fsync rewrite, inline on a tokio worker, every tool
+  round of every background sub-agent). Options, as of 2026-10-14: (a) delete
+  the snapshot — the cost goes with it; (b) keep it but write it once, at the
+  end of the run (the final save already exists after the loop) — a crash
+  mid-run then loses it, while the jsonl survives; (c) keep per-round writes and
+  pay for a coalescing background writer, or change `SessionState.messages` to
+  share the history, either a sizeable change on the persistence path for a file
+  nothing reads. Recommended: (b), or (a) if no reader is planned.
 - **`--sandbox jail` cannot apply to a write-capable session**, so it floors at
   `write` and emits a notice pointing at the `prisoner` agent. That is honest
   but it is not what the word means. A jailed _main_ agent is coherent (five
@@ -3329,11 +3338,12 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    the fix that keeps behaviour — it needs a binary check up front
    (`read_to_string` rejects non-UTF-8 today, which streaming would only
    discover mid-file after emitting matches) and a ring buffer for `-C` context.
-9. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
-   `WindowScanner`: each page re-counts newlines from the start — O(N) per page,
-   ~O(N×pages) over a large file paged start-to-finish. Fix: let `ReadRecord`
-   carry the last-scanned byte offset and resume there (coverage already
-   guarantees contiguous-from-line-1 paging).
+9. **Declined 2026-10-14 — paged reads re-scan the file from byte 0 on every
+   page** (`read.rs` `WindowScanner`). The pass also counts the file's total
+   lines for the page header, so resuming the window still needs a full count
+   unless line totals are cached per file with change detection — staleness risk
+   traded for a millisecond-scale scan of a file already capped at
+   `MAX_READ_BYTES`.
 10. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
     `record` + `transcript_log.rs`: ~3-4 small allocations + 3 lock acquisitions
     per chunk (per token group). Bounded per token, the hottest loop in
@@ -3711,9 +3721,7 @@ Ranked by impact, biggest first:
 6. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
    cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
    matches only after the whole read. Open.
-7. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
-   page.** `WindowScanner::new` (`read.rs:240,573`). Open.
-8. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+7. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
    acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
    `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
    in the transcript projection (`transcript_log.rs:114-115`); runs per streamed
@@ -3721,13 +3729,13 @@ Ranked by impact, biggest first:
    the deque exactly once") is now slightly harder than on 08-30: `to_write`
    feeds both the deque and the transcript write, so `Record::from_event` would
    need to borrow the payload from the deque entry. Still available; open.
-9. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+8. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
    `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
    unchanged. Open.
-10. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
-    commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
-    (#16 no-usage re-estimate — held open by decision) or the hrdr-tools
-    dispatch (#17 args clone). Presumed open-by-construction.
+9. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+   commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
+   (#16 no-usage re-estimate — held open by decision) or the hrdr-tools dispatch
+   (#17 args clone). Presumed open-by-construction.
 
 **Checked, not findings (new code since 08-30):**
 
