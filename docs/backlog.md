@@ -374,7 +374,7 @@ public repository on GitHub-hosted runners with a literal Zig version and pins
 the action to its audited commit. Revisit this dependency when `mlugg/setup-zig`
 ships a Node.js 24 release or the replacement verifies cache hits.
 
-## Frame cost measured 2026-08-13 — one fix shipped, one left open
+## Frame cost measured 2026-08-13 — one fix shipped, one declined
 
 Prompted by "lag as the context gets bigger". Measured with a throwaway probe
 driving the real `Harness` in `--release`, against a synthetic transcript and
@@ -387,20 +387,19 @@ screenful of rows instead of every row of the blocks the viewport overlaps. A
 20,000-row tool result on screen went 38.8ms → 0.23ms a frame. See the changelog
 entry.
 
-1. **The frame still walks every transcript entry, on-screen or not.** **[open —
-   real but small; unbounded]** `transcript_chunks` builds a `Chunk` for every
-   entry each frame (cache-key hash, two `HashMap` lookups, an `Rc` bump, a
-   `Vec` push), and only then does the viewport slice. Cost measured at a
-   constant tail viewport with the transcript behind it varied: 50 entries
-   160µs, 500 entries 222µs, 2000 entries 465µs, 4800 entries 946µs — ~0.17µs
-   per off-screen entry per frame, linear and unbounded. At today's sizes it is
-   under a millisecond, so it is NOT what makes a session feel slow; it is worth
-   doing only when something else needs that code opened. Fix shape: extend the
-   existing `ChunkRows::Lazy` (which the session header already uses to keep its
-   height while deferring its rows) to every cached block, so an off-screen
-   entry costs a height lookup and nothing else. The risk is the scroll and
-   hit-testing maths, which is all keyed off `cum` — the same 120 e2e tests that
-   caught a one-row window shift would catch a height regression.
+1. **An unchanged frame still materializes every assembled block — declined
+   2026-10-15, measured.** Since this was first measured, transcript assembly is
+   cached per pane and rebuilt only from the first dirty entry
+   (`cached_assembly`, `suffix_restart`), and a running tool's static rows are
+   cached with only its spinner swapped (`ChunkRows::AnimatedChrome`). What is
+   left is `materialize_transcript` calling `flush` on every assembled block
+   each frame. Re-measured in `--release` on Windows with a throwaway probe
+   (deleted) over alternating user/assistant entries at width 100: 500 entries
+   30 µs, 2000 entries 124 µs, 4800 entries 329 µs per unchanged frame — about
+   0.07 µs per entry, a third of the 2026-08-13 figure. Caching the materialized
+   prefix would touch the scroll and hit-testing maths keyed off `cum` for a
+   fraction of a millisecond; revisit only with a much larger transcript or a
+   felt-lag report.
 
 **Measured and cleared — do not re-investigate without new evidence.** Each of
 these was a plausible theory that the numbers killed:
@@ -3266,7 +3265,9 @@ hrdr-test-support + apps full incl. all test binaries.
 
 `:perf` over the whole tree (clean), split across four sub-agents; findings
 re-verified at cited lines (top items by the sweep lead). Two prior backlog
-items re-found (see cross-list). **Status: all open — recorded, not fixed.**
+items re-found (see cross-list). **Status 2026-10-15: 1 and 2 open (1 waits on
+the sub-agent snapshot decision); 3 declined; 4 merged; the running-tool
+re-render finding shipped (`ChunkRows::AnimatedChrome`) and is removed.**
 
 1. **HIGH — every round of every background sub-agent deep-clones its whole
    history and rewrites the snapshot file with 2 fsyncs inline on the tokio
@@ -3289,17 +3290,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    snapshot+journal like the transcript fold. This is backlog item
    `## Performance review — second pass 2026-08-04` #1 (still open, needing the
    crash-durability decision) re-found with specifics — **cross-listed**.
-3. **HIGH — running-tool bodies re-render in full on every frame, off-screen
-   included.** `hrdr-tui/src/ui.rs`: the body cache key folds in `frame_idx + 1`
-   for every `done: false` tool, so a running tool's key misses every frame
-   (ticker redraw at 8.3 Hz while any agent runs) regardless of content change;
-   the miss re-parses the args JSON, clones content, re-highlights with syntect
-   and re-wraps every line, and the viewport clip happens _after_ the walk — a
-   running block scrolled off-screen is paid in full. Fix: move the spinner to a
-   one-cell chrome span advanced per frame and key the body on content hash
-   alone; route running blocks through `ChunkRows::Lazy` so off-screen blocks
-   aren't built.
-4. **Streaming markdown re-rendered in full per frame — declined 2026-10-15,
+3. **Streaming markdown re-rendered in full per frame — declined 2026-10-15,
    measured.** The body key is the `content_hash`, which changes per delta, so a
    streaming reply re-runs `markdown_lines` once per frame (paced by
    `tui::defer_message_frame`). Measured in `--release` on Windows against
@@ -3310,25 +3301,17 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    (loose lists span blank lines, fences hold them, link definitions resolve
    backwards), so the risk is a reply that renders differently while streaming
    than once finished. Revisit only with a felt-lag report on a long reply.
-5. **MEDIUM-HIGH — O(n) full-transcript walk per frame, unbounded.** `ui.rs`
-   `draw_chunks`: every frame iterates every transcript entry — 3-4 thread-local
-   `RefCell` lookups + `Rc` clones (`cached_body`/`cached_block`/`chrome_hash`)
-   — then rebuilds the `cum` vector and hit maps; panes retain the whole run
-   (pinned/visible, and finished sub-agents pruned at turn end). A 10k-entry
-   pane pays ~40k map ops + Vec rebuilds per frame at 8.3 Hz. Fix: cache the
-   assembled layout per pane, invalidated from the first changed entry —
-   transcript mutations append at the tail, so normally only the tail rebuilds.
-   Related to prior backlog entry `## Frame cost measured 2026-08-13` #1 (the
-   "still walks every transcript entry" gap — its fix shape is the same
-   `ChunkRows::Lazy` extension) — **cross-listed**.
-6. **Declined 2026-10-14 — editor wrap layout recomputed over the whole buffer
+4. **O(n) transcript walk per frame** — merged into
+   `## Frame cost measured 2026-08-13` #1, which holds the 2026-10-15
+   measurement.
+5. **Declined 2026-10-14 — editor wrap layout recomputed over the whole buffer
    on every keystroke** (`hrdr-editor` `compute_wrapped_layout`). Measured: one
    layout of a buffer at the 256K-character paste cap (`MAX_PASTE_CHARS`) took
    4.0 ms in a release build on the dev machine, and keystrokes arriving
    together are folded into one frame. A few milliseconds per frame in the worst
    case does not justify line-scoped invalidation and the correctness risk it
    brings; revisit if the cap grows.
-7. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
+6. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
    walkers.** The recorded fix (raw-path `secret_file_reason` first) saves
    nothing: the common file is not a secret, so it is still canonicalized. The
    one real saving — canonicalize the root once and join each entry's relative
@@ -3336,7 +3319,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    a junction directory inside the tree can be walked into; a shortcut there
    could let a junction into `~/.ssh` past the deny-list. A few syscalls per
    file are not worth weakening a secret-file check.
-8. **LOW — grep still loads each searched file whole** (`grep.rs`). Since
+7. **LOW — grep still loads each searched file whole** (`grep.rs`). Since
    2026-10-14 a file over `MAX_READ_BYTES` is not loaded: it is named in the
    result ("not searched — … search them with `rg` through `shell`"), so memory
    is bounded and "no matches" never stands alone over an unread file. Left:
@@ -3344,22 +3327,22 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    pattern can span lines). Streaming the single-line walk would need a binary
    check up front (`read_to_string` rejects non-UTF-8 today) and a ring buffer
    for `-C`; worth it only if large-but-under-cap files show up in profiles.
-9. **Declined 2026-10-14 — paged reads re-scan the file from byte 0 on every
+8. **Declined 2026-10-14 — paged reads re-scan the file from byte 0 on every
    page** (`read.rs` `WindowScanner`). The pass also counts the file's total
    lines for the page header, so resuming the window still needs a full count
    unless line totals are cached per file with change detection — staleness risk
    traded for a millisecond-scale scan of a file already capped at
    `MAX_READ_BYTES`.
-10. **Declined 2026-10-14 — per-chunk event clones on the streamed-delta path**
-    (`registry.rs` `record`). Each event is copied into `to_write` and again
-    into the event log, because `to_write` also feeds the transcript write that
-    runs after the registry lock is released. Every way to drop a copy costs
-    more than it saves: writing the transcript from the log entry holds the
-    log's lock across file I/O; building the `Record`s under the registry lock
-    lengthens a lock every UI frame takes; storing `Arc<AgentEvent>` in the log
-    changes its type for every pane that reads it. One small allocation per
-    token does not justify any of those.
-11. **LOW — no-usage fallback re-estimates the whole history every round.**
+9. **Declined 2026-10-14 — per-chunk event clones on the streamed-delta path**
+   (`registry.rs` `record`). Each event is copied into `to_write` and again into
+   the event log, because `to_write` also feeds the transcript write that runs
+   after the registry lock is released. Every way to drop a copy costs more than
+   it saves: writing the transcript from the log entry holds the log's lock
+   across file I/O; building the `Record`s under the registry lock lengthens a
+   lock every UI frame takes; storing `Arc<AgentEvent>` in the log changes its
+   type for every pane that reads it. One small allocation per token does not
+   justify any of those.
+10. **LOW — no-usage fallback re-estimates the whole history every round.**
     `budget.rs`: `estimate_tokens_in_messages` per round when the server reports
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
     dropped the running-counter fix as risk > value (~µs per round) — noted, not
@@ -3689,12 +3672,8 @@ Ranked by impact, biggest first:
    on every tool round"); save still whole-body `write_atomic`
    (`session.rs:880`). TUI coalesces; each landed save is still O(history). Open
    — the delta-journal fix from 08-30 stands.
-3. **MEDIUM — unchanged frames still materialize every assembled block.**
-   `materialize_transcript` walks all finalized blocks, clones each descriptor
-   and shared row pointer, and rebuilds chunks and message positions every
-   frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
-   static materialized prefix while resolving dynamic header, reasoning, and
-   tool-group bodies per frame. Open.
+3. **Unchanged frames still materialize every assembled block** — merged into
+   `## Frame cost measured 2026-08-13` #1.
 4. **08-30 #12/#13/#16/#17 (LOW), settled 2026-10-14.** #12 (`replace`'s literal
    path counts matches before replacing) is declined: the count is what bounds
    the output size before the replacement allocates. #13 shipped (`memory.rs`
