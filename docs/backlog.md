@@ -3220,20 +3220,17 @@ nothing behavior-changing proposed.
    — `hrdr-tui/src/ui.rs`: mutation-preview head re-implements `preview_head`;
    the two tail arms differ only in marker wording. Route all arms through
    shared helpers.
-2. **`cached_body`/`cached_block` same cache helper, different maps** —
-   `hrdr-tui/src/ui.rs`: identical lookup-filter-else-render-insert shape. One
-   generic `cached<C,K>`; `cached_block` a thin wrapper.
-3. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
+2. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
    reimplements `common::drain_pty` line-for-line (verified identical);
    `chrome_line`/ `chrome_fragment` one function with two flag settings
    (`apps/hrdr/src/main.rs`); `run_hrdr_inner` a pure middleman — delete, point
    callers at `run_hrdr_inner_with_home`.
-4. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
+3. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
    `compute_wrapped_layout` (word-fits / word-onto-fresh-line / whitespace-fits
    arms): extract a private `place()` helper; the hard-break arm is a genuine
    variant — leave it. (The related `PlainEngine::layout` String→Vec<char>
    round-trip is low value — flagged, not proposed.)
-5. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
+4. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
    (`verification.rs`) are the identical Format…Test mapping in two private fns,
    but the maintainer's comment at `gate.rs` documents keeping them apart
    ("three different questions"). Merging is behavior-identical today but
@@ -3640,9 +3637,6 @@ args wrapper, and the shared id mint — fixed and closed 2026-09-04.)
   arms (3868-3878 vs 3897-3908) differ only in marker wording ("⋮ (N earlier
   line(s))" vs "⋮ (live · N earlier line(s))"). Route through the shared
   helpers.
-- **08-30 #2** — `cached_body` (ui.rs:2540) / `cached_block` (ui.rs:2559) are
-  still the same lookup-filter-else-render-insert shape over two TLS caches; one
-  generic `cached<C, K>`. Open.
 - **08-30 #4** — editor wrap-placement still repeats the place-loop three times:
   `crates/hrdr-editor/src/lib.rs:268-333` (`compute_wrapped_layout`: word-fits
   270-278, word-onto-fresh-line 279-292, whitespace-fits 318-326) and the

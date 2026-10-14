@@ -2664,6 +2664,29 @@ fn header_hash(app: &App) -> u64 {
     h.finish()
 }
 
+/// The rows cached in `cache` for entry `idx` when `key` still matches the
+/// slot, otherwise `render()`'s, stored under `key` for the next frame.
+fn cached<K: PartialEq>(
+    cache: &'static std::thread::LocalKey<SlotCache<K>>,
+    cache_id: u64,
+    idx: usize,
+    key: K,
+    render: impl FnOnce() -> Rows,
+) -> Rows {
+    let slot = (cache_id, idx);
+    if let Some(hit) = cache.with(|c| {
+        c.borrow()
+            .get(&slot)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, rows)| Rc::clone(rows))
+    }) {
+        return hit;
+    }
+    let rows = render();
+    cache.with(|c| c.borrow_mut().insert(slot, (key, Rc::clone(&rows))));
+    rows
+}
+
 /// The rendered body of entry `idx`, from [`BODY_CACHE`] when `key` still
 /// matches the slot, otherwise from `render()`.
 ///
@@ -2673,18 +2696,7 @@ fn cached_body<F>(cache_id: u64, idx: usize, key: BodyKey, render: F) -> Rows
 where
     F: FnOnce() -> Vec<Line<'static>>,
 {
-    let slot = (cache_id, idx);
-    if let Some(hit) = BODY_CACHE.with(|c| {
-        c.borrow()
-            .get(&slot)
-            .filter(|(k, _)| *k == key)
-            .map(|(_, rows)| Rc::clone(rows))
-    }) {
-        return hit;
-    }
-    let rows = Rc::new(render());
-    BODY_CACHE.with(|c| c.borrow_mut().insert(slot, (key, Rc::clone(&rows))));
-    rows
+    cached(&BODY_CACHE, cache_id, idx, key, || Rc::new(render()))
 }
 
 /// The finished rows of entry `idx`'s block, from [`BLOCK_CACHE`] when `key`
@@ -2693,18 +2705,7 @@ fn cached_block<F>(cache_id: u64, idx: usize, key: BlockKey, render: F) -> Rows
 where
     F: FnOnce() -> Rows,
 {
-    let slot = (cache_id, idx);
-    if let Some(hit) = BLOCK_CACHE.with(|c| {
-        c.borrow()
-            .get(&slot)
-            .filter(|(k, _)| *k == key)
-            .map(|(_, rows)| Rc::clone(rows))
-    }) {
-        return hit;
-    }
-    let rows = render();
-    BLOCK_CACHE.with(|c| c.borrow_mut().insert(slot, (key, Rc::clone(&rows))));
-    rows
+    cached(&BLOCK_CACHE, cache_id, idx, key, render)
 }
 
 /// How tall the block under `key` came out the last time it was built, for the
