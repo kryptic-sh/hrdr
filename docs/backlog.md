@@ -2650,8 +2650,11 @@ and **not** fixed.
   `helpers.rs`'s reload test only read the path; no `spawn_blocking` work writes
   config; leftover async tasks are dropped unpolled with each current-thread
   `#[tokio::test]` runtime; nothing in `hrdr-app` sets env vars, and
-  `with_test_env` moves only `XDG_DATA_HOME`. Not yet checked: writers reached
-  through `hrdr-agent` (agent construction, `TestHost::new`).
+  `with_test_env` moves only `XDG_DATA_HOME`. `hrdr-agent` writes `config.toml`
+  only through `persist_setting`/`remove_setting`, so agent construction
+  (`TestHost::new`) is out too. Still unexplained; the next step is evidence,
+  not reading — e.g. have the test record the file's contents just before
+  `persist_setting` when it fails.
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
