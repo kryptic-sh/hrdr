@@ -47,6 +47,12 @@ pub(crate) fn checkpoint_warning_round(max_steps: usize) -> Option<usize> {
 /// known follow-up (bound/coalesce that queue), not covered here.
 const UI_STREAM_CAP: usize = 1024;
 
+/// How long a finished tool batch waits for its live-output forwarders to close
+/// before dropping what they still hold (see `run_tool_batch`). They close as
+/// soon as every tool's context is dropped, so this is reached only if a tool
+/// detaches a clone of its stream — a bug the batch's `debug_assert` reports.
+const STREAM_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Consecutive identical failures after which the exact same call is refused
 /// without executing (small models loop on verbatim retries).
 const REPEAT_REFUSE_AFTER: u32 = 2;
@@ -1319,10 +1325,24 @@ impl Agent {
                 }
             }
         };
-        // Drain chunks buffered between the last poll and completion.
-        while let Ok((id, chunk)) = shared_rx.try_recv() {
-            on_event(AgentEvent::ToolOutput { id, chunk });
-        }
+        // Drain until the forwarders close, not just what is already queued: a
+        // forwarder still holds whatever its tool emitted right before
+        // returning, and it moves only a scheduler budget's worth of chunks
+        // before yielding — a fast command's tail would otherwise be lost. The
+        // channel closes once every tool's context is dropped; the grace bounds
+        // the wait should a tool ever detach a clone of its stream (`watch` and
+        // `cron` clear theirs for exactly this reason).
+        let closed = tokio::time::timeout(STREAM_DRAIN_GRACE, async {
+            while let Some((id, chunk)) = shared_rx.recv().await {
+                on_event(AgentEvent::ToolOutput { id, chunk });
+            }
+        })
+        .await
+        .is_ok();
+        debug_assert!(
+            closed,
+            "a tool kept a clone of its live-output stream past its own run"
+        );
         // A panicking tool no longer unwinds the turn task directly: `spawn`
         // captures the panic into the handle, and `join_all` hands it back as a
         // `JoinError`. Resume it here so it propagates exactly as before —

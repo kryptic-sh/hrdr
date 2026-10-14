@@ -198,6 +198,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A fast tool's live output is no longer cut off after 128 lines.** When a
+  tool produced its output right before finishing, the live view showed only the
+  first 128 chunks of it; the rest never reached the transcript, though the
+  model still saw the full result. The batch now waits for every chunk
+  (`crates/hrdr-agent`).
 - **Compaction no longer counts the tool-budget wrap-up as a user turn.** When a
   turn ran out of tool rounds, the "summarize and stop" prompt hrdr sends the
   model went into history as if the user had said it, so compaction treated it

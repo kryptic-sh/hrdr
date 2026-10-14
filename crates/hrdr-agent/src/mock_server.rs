@@ -1889,6 +1889,76 @@ async fn agent_run_no_nudge_while_a_background_subagent_is_running() {
     assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnDone)));
 }
 
+/// A tool whose whole live output is emitted just before it returns — the
+/// shape a fast command has, where the forwarder has not run yet when the call
+/// completes.
+struct BurstTool;
+
+/// How many chunks [`BurstTool`] emits: well under the live channels' cap, so
+/// every one is owed to the frontend and none is a by-design flood drop.
+const BURST_CHUNKS: usize = 600;
+
+#[async_trait::async_trait]
+impl hrdr_tools::Tool for BurstTool {
+    fn name(&self) -> &'static str {
+        "burst"
+    }
+    fn description(&self) -> &'static str {
+        "emit a burst of live output, then return"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}})
+    }
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        ctx: &hrdr_tools::ToolContext,
+    ) -> anyhow::Result<String> {
+        for i in 0..BURST_CHUNKS {
+            ctx.emit(format!("line {i}\n"));
+        }
+        Ok("done".to_string())
+    }
+}
+
+/// Live output a tool emitted right before it returned reaches the frontend in
+/// full and in order: the batch drains the forwarders until they close rather
+/// than taking only what was already queued when the call finished.
+#[tokio::test]
+async fn a_tool_s_last_live_output_is_not_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start(vec![
+        MockResp::Sse(vec![
+            tool_start_chunk("c1", "call_1", "burst"),
+            tool_args_chunk("c1", "{}"),
+            tool_calls_stop_chunk("c1"),
+            "[DONE]".to_string(),
+        ]),
+        MockResp::Sse(vec![
+            text_chunk("c2", "ok"),
+            stop_chunk("c2"),
+            "[DONE]".to_string(),
+        ]),
+    ])
+    .await;
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    assert!(agent.register_tool(Arc::new(BurstTool)));
+
+    let mut chunks: Vec<String> = Vec::new();
+    agent
+        .run_input("go", |ev| {
+            if let AgentEvent::ToolOutput { chunk, .. } = ev {
+                chunks.push(chunk);
+            }
+        })
+        .await
+        .unwrap();
+
+    let expected: Vec<String> = (0..BURST_CHUNKS).map(|i| format!("line {i}\n")).collect();
+    assert_eq!(chunks.len(), BURST_CHUNKS);
+    assert_eq!(chunks, expected);
+}
+
 /// The max-steps wrap-up round — the final, tools-stripped round the
 /// harness itself forces once the tool-round budget is exhausted — must
 /// never be mistaken for the promise-then-stop failure mode: it is
