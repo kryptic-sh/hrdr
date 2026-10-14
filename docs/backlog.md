@@ -1501,14 +1501,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   closure that returns `false`. Deleting the defaults would force the test hosts
   to spell out the no-ops; keeping them keeps a documented seam. Worth a
   decision either way rather than drifting.
-- **A disarmed process group leaks one Windows job handle — and its kill still
-  fires at exit.** Recorded on `GroupKill::disarm`: the forgotten handle is
-  closed when hrdr exits, and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` then kills
-  whatever a _successful_ command deliberately left running in the background
-  (`npm run dev &`). On unix that child survives hrdr. Clearing the limit with
-  `SetInformationJobObject` before closing the handle fixes both; it needs a
-  Windows CI round trip to verify, and the survive-a-successful-run test only
-  checks while hrdr is still running.
 
 ---
 

@@ -129,7 +129,7 @@ enum HookRun {
 /// Spawn `cmd` as a process group, feed `stdin` if given, race it against
 /// `timeout`, and classify the run. When the timer wins the whole tree is
 /// killed (a hook that shelled out to something goes with it); a run that
-/// completed successfully disarms the group guard so a deliberately
+/// completed successfully releases the group guard so a deliberately
 /// backgrounded descendant survives — failure and timeout keep the armed
 /// guard, whose drop-kill is the backstop there. Group setup is best-effort:
 /// a hook whose group couldn't be set up still runs.
@@ -159,7 +159,7 @@ async fn run_hook(
             if let Ok(Ok(o)) = &ran
                 && o.status.success()
             {
-                group.disarm();
+                group.release();
             }
             match ran {
                 Ok(Ok(out)) => HookRun::Done(out),

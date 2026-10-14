@@ -988,10 +988,10 @@ pub(crate) async fn run_streamed_command(
     // A successful exit owns its descendants: the command may have backgrounded
     // a child on purpose (stdio redirected away from our pipes — a `dev/null`
     // daemon), and the guard's drop-kill must not SIGKILL it milliseconds after
-    // the leader exits. Disarm on success only; the guard stays armed on
+    // the leader exits. Release on success only; the guard stays armed on
     // timeout/cancel/error, where the whole tree must still die.
     if status.is_some_and(|s| s.success()) {
-        group.disarm();
+        group.release();
     }
     // `None` only ever means the deadline fired — every other path waits for an
     // exit status. Kept as its own flag because it decides `Ok` vs `Err` below,
@@ -1877,7 +1877,7 @@ mod tests {
         assert!(
             test_env::grandchild_finished(&marker, started).await,
             "the backgrounded child was killed by the guard's drop after its \
-             leader's run finished normally — disarm-on-success is missing"
+             leader's run finished normally — release-on-success is missing"
         );
     }
 

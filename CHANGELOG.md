@@ -189,6 +189,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **On Windows, a process a successful command starts in the background outlives
+  hrdr.** A `shell` command or hook that exited cleanly left its job handle open
+  so the job would not kill what it started (`npm run dev &`) — but closing that
+  handle at hrdr's exit killed it anyway, and each such command leaked a handle.
+  The job's kill-on-close is now cleared and the handle closed
+  (`crates/hrdr-tools`).
 - **Edits get LSP diagnostics however the file's path is spelled.** A file
   inside the workspace was skipped when its path differed from the workspace
   root's spelling — another letter case on Windows or macOS, or a path through a

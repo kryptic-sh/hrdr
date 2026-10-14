@@ -653,7 +653,7 @@ pub(crate) fn configure(cmd: &mut tokio::process::Command) {
 /// written; call [`GroupKill::kill`] on whatever path decides to stop the child
 /// early (a timeout elapsing, an output cap overflowing). The
 /// dropped-future path needs no call — the guard's `Drop` covers it. A path
-/// that completes *normally* must [`disarm`](GroupKill::disarm) the guard
+/// that completes *normally* must [`release`](GroupKill::release) the guard
 /// first: the drop SIGKILLs the whole group, and a descendant the command
 /// backgrounded on purpose (stdio redirected away from the caller's pipes)
 /// legitimately outlives the leader.
@@ -721,28 +721,18 @@ impl GroupKill {
         }
     }
 
-    /// Disarm the guard: from here on both [`kill`](GroupKill::kill) and the
-    /// guard's `Drop` are no-ops. A caller that completed *normally* must call
-    /// this before the guard drops — a command can background a child on
-    /// purpose (stdio redirected away from the caller's pipes), and the
-    /// drop's group-kill would SIGKILL it milliseconds after the leader exits.
+    /// Release a normally completed group: from here on both
+    /// [`kill`](GroupKill::kill) and the guard's `Drop` are no-ops. A caller
+    /// that completed *normally* must call this before the guard drops — a
+    /// command can background a child on purpose (stdio redirected away from
+    /// the caller's pipes), and the drop's group-kill would kill it the moment
+    /// the leader exits.
     ///
-    /// The group is taken out and forgotten rather than set to `None`: the
-    /// guard's own `Drop` IS the kill, so dropping it here would fire exactly
-    /// the signal this is meant to prevent. On unix the forgotten value is a
-    /// bare pgid — nothing leaks. On windows it is the job handle, left open
-    /// deliberately so the kill-on-close never fires (one leaked handle per
-    /// disarmed command — the price of not killing).
-    pub(crate) fn disarm(&mut self) {
-        if let Some(group) = self.group.take() {
-            std::mem::forget(group);
-        }
-        self.pid = None;
-    }
-
-    /// Release a normally completed group without leaving the Windows job handle
-    /// open. Unlike [`Self::disarm`], this closes the underlying OS resource
-    /// after making its drop harmless.
+    /// The OS resource is closed after making its drop harmless: on windows
+    /// the job's kill-on-close limit is cleared first, so closing the handle
+    /// neither leaks it nor kills the child at hrdr's exit. If clearing fails,
+    /// the group is forgotten instead, leaving the handle open rather than
+    /// killing descendants after a success.
     pub(crate) fn release(&mut self) {
         if let Some(mut group) = self.group.take()
             && group.release().is_err()
@@ -837,7 +827,7 @@ impl Drop for ProcessGroup {
         // leader (a child the command backgrounded with stdio redirected away
         // from the caller's pipes) is still in the group and is SIGKILLed
         // here. A caller that completed normally MUST call
-        // [`GroupKill::disarm`] before dropping the guard so such a child
+        // [`GroupKill::release`] before dropping the guard so such a child
         // survives; this drop is the cancellation backstop, for the paths
         // where the task was torn down without an explicit `kill()`.
         if let Some(pgid) = self.pgid {
@@ -945,7 +935,7 @@ mod windows_job {
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             // SAFETY: `handle` is valid and `info` is the documented structure
             // for this information class. A failure leaves kill-on-close armed;
-            // the caller then preserves the existing disarmed semantics.
+            // the caller then forgets the group, leaving the handle open.
             let ok = unsafe {
                 SetInformationJobObject(
                     self.handle,
