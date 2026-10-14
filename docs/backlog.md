@@ -3331,15 +3331,14 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    a junction directory inside the tree can be walked into; a shortcut there
    could let a junction into `~/.ssh` past the deny-list. A few syscalls per
    file are not worth weakening a secret-file check.
-8. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
-   `metadata().len()` guard and no match-count bound on memory (the read
-   completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
-   (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
-   and stop once `matches > max_matches`. Note 2026-10-14: a size skip would
-   silently drop large files from results (`rg` searches them), so streaming is
-   the fix that keeps behaviour — it needs a binary check up front
-   (`read_to_string` rejects non-UTF-8 today, which streaming would only
-   discover mid-file after emitting matches) and a ring buffer for `-C` context.
+8. **LOW — grep still loads each searched file whole** (`grep.rs`). Since
+   2026-10-14 a file over `MAX_READ_BYTES` is not loaded: it is named in the
+   result ("not searched — … search them with `rg` through `shell`"), so memory
+   is bounded and "no matches" never stands alone over an unread file. Left:
+   files under the cap are still read whole, and the multiline walk must be (its
+   pattern can span lines). Streaming the single-line walk would need a binary
+   check up front (`read_to_string` rejects non-UTF-8 today) and a ring buffer
+   for `-C`; worth it only if large-but-under-cap files show up in profiles.
 9. **Declined 2026-10-14 — paged reads re-scan the file from byte 0 on every
    page** (`read.rs` `WindowScanner`). The pass also counts the file's total
    lines for the page header, so resuming the window still needs a full count
@@ -3720,10 +3719,7 @@ Ranked by impact, biggest first:
    frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
    static materialized prefix while resolving dynamic header, reasoning, and
    tool-group bodies per frame. Open.
-6. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
-   cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
-   matches only after the whole read. Open.
-7. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+6. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
    acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
    `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
    in the transcript projection (`transcript_log.rs:114-115`); runs per streamed
@@ -3731,10 +3727,10 @@ Ranked by impact, biggest first:
    the deque exactly once") is now slightly harder than on 08-30: `to_write`
    feeds both the deque and the transcript write, so `Record::from_event` would
    need to borrow the payload from the deque entry. Still available; open.
-8. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+7. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
    `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
    unchanged. Open.
-9. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+8. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
    commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
    (#16 no-usage re-estimate — held open by decision) or the hrdr-tools dispatch
    (#17 args clone). Presumed open-by-construction.

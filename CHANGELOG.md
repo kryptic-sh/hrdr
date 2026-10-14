@@ -189,6 +189,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`grep` no longer loads a huge file whole.** A file over the read tool's size
+  cap is skipped and named in the result, with a pointer to `rg` through
+  `shell`, instead of being read into memory — so a multi-gigabyte log can no
+  longer exhaust memory, and "no matches" is never claimed over a file that was
+  not searched (`crates/hrdr-tools`).
 - **On Windows, a process a successful command starts in the background outlives
   hrdr.** A `shell` command or hook that exited cleanly left its job handle open
   so the job would not kill what it started (`npm run dev &`) — but closing that

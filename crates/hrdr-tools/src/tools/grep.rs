@@ -226,6 +226,7 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
     tokio::task::spawn_blocking(move || {
         let mut out = String::new();
         let mut matches = 0usize;
+        let mut oversized: Vec<String> = Vec::new();
         let walker = super::ignore_walker(&root, hidden, no_ignore);
         'walk: for entry in walker.flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -242,6 +243,15 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
                 if !hit {
                     continue;
                 }
+            }
+            // Searching means loading the file whole; one too large for that
+            // is named in the result rather than read or silently passed over.
+            if entry.metadata().is_ok_and(|m| m.len() > super::MAX_READ_BYTES) {
+                oversized.push(crate::display_path(
+                    path.strip_prefix(&cwd).unwrap_or(path),
+                    unix_style_paths,
+                ));
+                continue;
             }
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue; // skip binary / non-UTF-8 files
@@ -290,18 +300,13 @@ pub(crate) async fn grep_builtin(a: &GrepArgs, ctx: &ToolContext) -> Result<Stri
                 break 'walk;
             }
         }
-        if out.is_empty() {
-            Ok(super::NO_MATCHES.to_string())
-        } else {
-            Ok(truncate_saved(
-                out.trim_end(),
-                max_output,
-                max_output_lines,
-                TruncateSide::Head,
-                "grep",
-                unix_style_paths,
-            ))
-        }
+        Ok(walk_result(
+            &out,
+            &oversized,
+            max_output,
+            max_output_lines,
+            unix_style_paths,
+        ))
     })
     .await?
 }
@@ -334,6 +339,7 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
     tokio::task::spawn_blocking(move || {
         let mut out = String::new();
         let mut matches = 0usize;
+        let mut oversized: Vec<String> = Vec::new();
 
         'walk: for entry in super::ignore_walker(&root, hidden, no_ignore).flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -349,6 +355,18 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
                 if !name.as_deref().is_some_and(|n| gp.matches(n)) && !gp.matches_path(rel) {
                     continue;
                 }
+            }
+            // Searching means loading the file whole; one too large for that
+            // is named in the result rather than read or silently passed over.
+            if entry
+                .metadata()
+                .is_ok_and(|m| m.len() > super::MAX_READ_BYTES)
+            {
+                oversized.push(crate::display_path(
+                    path.strip_prefix(&cwd).unwrap_or(path),
+                    unix_style_paths,
+                ));
+                continue;
             }
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue;
@@ -403,20 +421,54 @@ async fn grep_builtin_multiline(a: &GrepArgs, ctx: &ToolContext) -> Result<Strin
                 break 'walk;
             }
         }
-        if out.is_empty() {
-            Ok(super::NO_MATCHES.to_string())
-        } else {
-            Ok(truncate_saved(
-                out.trim_end(),
-                max_output,
-                max_output_lines,
-                TruncateSide::Head,
-                "grep",
-                unix_style_paths,
-            ))
-        }
+        Ok(walk_result(
+            &out,
+            &oversized,
+            max_output,
+            max_output_lines,
+            unix_style_paths,
+        ))
     })
     .await?
+}
+
+/// How many files too large to search a result names before summarising.
+const OVERSIZED_NAMED: usize = 20;
+
+/// A walk's result: its matches (cut to the output budget) or the no-match
+/// line, then the files too large to search. They are named because a "no
+/// matches" would otherwise be a claim about files nothing read.
+fn walk_result(
+    out: &str,
+    oversized: &[String],
+    max_output: usize,
+    max_output_lines: usize,
+    unix_style_paths: bool,
+) -> String {
+    let mut result = if out.is_empty() {
+        super::NO_MATCHES.to_string()
+    } else {
+        truncate_saved(
+            out.trim_end(),
+            max_output,
+            max_output_lines,
+            TruncateSide::Head,
+            "grep",
+            unix_style_paths,
+        )
+    };
+    if !oversized.is_empty() {
+        let mut named = oversized[..oversized.len().min(OVERSIZED_NAMED)].join(", ");
+        if oversized.len() > OVERSIZED_NAMED {
+            named.push_str(&format!(", and {} more", oversized.len() - OVERSIZED_NAMED));
+        }
+        result.push_str(&format!(
+            "\n[not searched — over this tool's {}-byte file cap; search them with `rg` \
+             through `shell`: {named}]",
+            super::MAX_READ_BYTES
+        ));
+    }
+    result
 }
 
 /// Append merged ±`n_ctx` windows around `hits` (0-based line indexes) in
@@ -575,6 +627,39 @@ mod tests {
         assert!(out.contains("sample.txt-1-before"), "{out}");
         assert!(out.contains("sample.txt-4-after"), "{out}");
         assert!(!out.contains("sample.rs"), "{out}");
+    }
+
+    /// A file too large to load whole is named in the result, not read — and
+    /// "no matches" never stands alone over a file nothing searched. Both walks
+    /// (single-line and multiline) take the same guard.
+    #[tokio::test]
+    async fn an_oversized_file_is_named_not_searched() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("small.txt"), "needle here\n").unwrap();
+        // Sparse: the length is past the cap without writing the bytes.
+        let big = std::fs::File::create(cwd.path().join("huge.log")).unwrap();
+        big.set_len(crate::tools::MAX_READ_BYTES + 1).unwrap();
+        drop(big);
+        let ctx = ToolContext::new(cwd.path());
+
+        for multiline in [false, true] {
+            let out = GrepTool
+                .execute(json!({ "pattern": "needle", "multiline": multiline }), &ctx)
+                .await
+                .unwrap();
+            assert!(out.contains("small.txt"), "{out}");
+            assert!(
+                out.contains("not searched") && out.contains("huge.log"),
+                "{out}"
+            );
+
+            let out = GrepTool
+                .execute(json!({ "pattern": "absent", "multiline": multiline }), &ctx)
+                .await
+                .unwrap();
+            assert!(out.starts_with(crate::tools::NO_MATCHES), "{out}");
+            assert!(out.contains("huge.log"), "{out}");
+        }
     }
 
     /// A search scoped at an explicit path outside the project is refused
