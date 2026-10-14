@@ -3000,10 +3000,11 @@ single-flight coordinator (cancel-safe `RefresherGuard`).
   platform-gated, so not compiled locally. Worth fixing only if a real user-path
   caller appears.
 
-The pre-existing `session.rs:867` lost-update, `remove_lock_file_if_owned`
-TOCTOU, and the `is_blocked_ip` v6-encoding / write-path-TOCTOU / MCP
-`Box::leak` / `untrusted_nonce` `DefaultHasher` notes are already recorded and
-were re-confirmed, not re-filed.
+The pre-existing `session.rs` reservation-lock lost-update (since fixed,
+`40bdb6f8`: `Reservation::drop` is the only release),
+`remove_lock_file_if_owned` TOCTOU, and the `is_blocked_ip` v6-encoding /
+write-path-TOCTOU / MCP `Box::leak` / `untrusted_nonce` `DefaultHasher` notes
+are already recorded and were re-confirmed, not re-filed.
 
 **Coverage:** walked line-by-line — hrdr-agent `trust.rs`, `auth.rs`,
 `auth_store.rs`, `oauth.rs`, `session.rs` lock/reserve/save/load/sweep core,
@@ -3030,9 +3031,8 @@ covered by the 2026-08-14 audit; their cleared items were not re-derived.
 **Summary:** 1 low, 0 critical/high/medium. Overall risk unchanged and low — the
 surfaces that would carry a real bug (SSRF, command/hook injection, file-tool
 traversal/TOCTOU, SSE/JSON caps, secret exfiltration, terminal injection) were
-re-verified as guarded. Fix first: the `read_blob` `is_blob_name` check (this
-finding), then the already-recorded `session.rs:867` reservation-lock
-lost-update (the correctness medium).
+re-verified as guarded. Both fixes it named first have shipped: `read_blob` is
+gated on `is_blob_name`, and the reservation-lock lost-update (`40bdb6f8`).
 
 ## Tidy review 2026-08-28
 
