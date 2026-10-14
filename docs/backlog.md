@@ -3345,15 +3345,15 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    unless line totals are cached per file with change detection — staleness risk
    traded for a millisecond-scale scan of a file already capped at
    `MAX_READ_BYTES`.
-10. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
-    `record` + `transcript_log.rs`: ~3-4 small allocations + 3 lock acquisitions
-    per chunk (per token group). Bounded per token, the hottest loop in
-    hrdr-agent; a 60k-token reply ≈ 240k small allocations. Fix: move each event
-    into the deque exactly once (drop `log.push(w.clone())` after the `to_write`
-    push) and write the transcript record by reference from the deque entry.
-    (Prior `## Performance review — second pass 2026-08-04` #2 made the same
-    measurement and dropped it as infeasible for the `Record::from_event` half —
-    this adds the still-available `deque double-push` half.)
+10. **Declined 2026-10-14 — per-chunk event clones on the streamed-delta path**
+    (`registry.rs` `record`). Each event is copied into `to_write` and again
+    into the event log, because `to_write` also feeds the transcript write that
+    runs after the registry lock is released. Every way to drop a copy costs
+    more than it saves: writing the transcript from the log entry holds the
+    log's lock across file I/O; building the `Record`s under the registry lock
+    lengthens a lock every UI frame takes; storing `Arc<AgentEvent>` in the log
+    changes its type for every pane that reads it. One small allocation per
+    token does not justify any of those.
 11. **LOW — no-usage fallback re-estimates the whole history every round.**
     `budget.rs`: `estimate_tokens_in_messages` per round when the server reports
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
@@ -3714,15 +3714,7 @@ Ranked by impact, biggest first:
    frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
    static materialized prefix while resolving dynamic header, reasoning, and
    tool-group bodies per frame. Open.
-6. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
-   acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
-   `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
-   in the transcript projection (`transcript_log.rs:114-115`); runs per streamed
-   token on every agent, the main one included. The suggested merge ("move into
-   the deque exactly once") is now slightly harder than on 08-30: `to_write`
-   feeds both the deque and the transcript write, so `Record::from_event` would
-   need to borrow the payload from the deque entry. Still available; open.
-7. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+6. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
    commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
    (#16 no-usage re-estimate — held open by decision) or the hrdr-tools dispatch
    (#17 args clone). Presumed open-by-construction.
