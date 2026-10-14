@@ -62,6 +62,19 @@ fn assert_git(directory: &Path, args: &[&str]) {
     );
 }
 
+/// Cargo for an isolated build project, building into the project's own
+/// `target`. Every project shares a package name, so a target directory
+/// inherited from the environment would let one test's build make another's
+/// look fresh, and its build script would never run.
+fn isolated_cargo(project: &Path) -> Command {
+    let mut cargo = Command::new("cargo");
+    cargo
+        .current_dir(project)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR");
+    cargo
+}
+
 fn isolated_build_project() -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("src")).unwrap();
@@ -82,9 +95,8 @@ fn isolated_build_project() -> tempfile::TempDir {
     .unwrap();
     fs::write(project.path().join(".gitignore"), "target/\n").unwrap();
     assert_git(project.path(), &["init", "--quiet"]);
-    let lockfile = Command::new("cargo")
+    let lockfile = isolated_cargo(project.path())
         .arg("generate-lockfile")
-        .current_dir(project.path())
         .output()
         .unwrap();
     assert!(
@@ -110,9 +122,8 @@ fn isolated_build_project() -> tempfile::TempDir {
 }
 
 fn isolated_build(project: &Path) {
-    let out = Command::new("cargo")
+    let out = isolated_cargo(project)
         .args(["build", "--quiet"])
-        .current_dir(project)
         .output()
         .unwrap();
     assert!(
@@ -137,9 +148,8 @@ fn instrument_build_script(project: &Path, counter: &Path) {
 }
 
 fn isolated_build_info(project: &Path) -> String {
-    let out = Command::new("cargo")
+    let out = isolated_cargo(project)
         .args(["run", "--quiet"])
-        .current_dir(project)
         .output()
         .unwrap();
     assert!(
