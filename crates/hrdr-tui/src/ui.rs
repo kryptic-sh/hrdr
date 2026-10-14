@@ -4235,17 +4235,41 @@ fn is_mutation_tool(name: &str) -> bool {
 }
 
 /// The head of a mutation's preview: the first [`TOOL_RESULT_PREVIEW_LINES`]
-/// rows, plus a dim `⋮ (N more)` marker when any were cut.
-fn preview_head(rows: Vec<Line<'static>>, dim_bg: Style) -> Vec<Line<'static>> {
+/// rows, plus a dim `⋮ (N more)` marker when any were cut. Only the kept rows
+/// are pulled from `rows`, so a lazily styled result is styled only that far.
+fn preview_head(
+    rows: impl ExactSizeIterator<Item = Line<'static>>,
+    dim_bg: Style,
+) -> Vec<Line<'static>> {
     let total = rows.len();
-    if total <= TOOL_RESULT_PREVIEW_LINES {
-        return rows;
+    let mut out: Vec<Line<'static>> = rows.take(TOOL_RESULT_PREVIEW_LINES).collect();
+    if total > TOOL_RESULT_PREVIEW_LINES {
+        out.push(Line::from(Span::styled(
+            format!("⋮ ({} more line(s))", total - TOOL_RESULT_PREVIEW_LINES),
+            dim_bg,
+        )));
     }
-    let mut out: Vec<Line<'static>> = rows.into_iter().take(TOOL_RESULT_PREVIEW_LINES).collect();
-    out.push(Line::from(Span::styled(
-        format!("⋮ ({} more line(s))", total - TOOL_RESULT_PREVIEW_LINES),
-        dim_bg,
-    )));
+    out
+}
+
+/// The tail of a tool's output: the last [`TOOL_RESULT_PREVIEW_LINES`] lines,
+/// behind a dim `⋮ (N earlier)` marker when any were cut — `live` while the
+/// call is still running, so the tail reads as one that is still moving.
+fn preview_tail(lines: &[&str], live: bool, dim_bg: Style) -> Vec<Line<'static>> {
+    let start = lines.len().saturating_sub(TOOL_RESULT_PREVIEW_LINES);
+    let mut out = Vec::with_capacity(lines.len() - start + 1);
+    if start > 0 {
+        let live = if live { "live · " } else { "" };
+        out.push(Line::from(Span::styled(
+            format!("⋮ ({live}{start} earlier line(s))"),
+            dim_bg,
+        )));
+    }
+    out.extend(
+        lines[start..]
+            .iter()
+            .map(|line| Line::from(Span::styled(expand_tabs(line), dim_bg))),
+    );
     out
 }
 
@@ -4321,7 +4345,7 @@ fn tool_lines(
         // A preview of a mutation shows the head of the written content — the
         // change is at the front — with a marker where it was cut.
         let code = if st.preview && is_mutation_tool(name) {
-            preview_head(highlight_lines(lang, content, bg), dim_bg)
+            preview_head(highlight_lines(lang, content, bg).into_iter(), dim_bg)
         } else {
             highlight_lines(lang, content, bg)
         };
@@ -4379,30 +4403,14 @@ fn tool_lines(
         // same shape as a running call's live tail), the head for a mutation —
         // the change is at the front of the diff.
         if is_mutation_tool(name) {
-            let keep = lines.len().min(TOOL_RESULT_PREVIEW_LINES);
-            for line in &lines[..keep] {
-                out.push(Line::from(Span::styled(
-                    expand_tabs(line),
-                    Style::default().fg(theme.dim).bg(bg),
-                )));
-            }
-            if keep < lines.len() {
-                out.push(Line::from(Span::styled(
-                    format!("⋮ ({} more line(s))", lines.len() - keep),
-                    dim_bg,
-                )));
-            }
+            out.extend(preview_head(
+                lines
+                    .iter()
+                    .map(|line| Line::from(Span::styled(expand_tabs(line), dim_bg))),
+                dim_bg,
+            ));
         } else {
-            let start = lines.len().saturating_sub(TOOL_RESULT_PREVIEW_LINES);
-            if start > 0 {
-                out.push(Line::from(Span::styled(
-                    format!("⋮ ({} earlier line(s))", start),
-                    dim_bg,
-                )));
-            }
-            for line in &lines[start..] {
-                out.push(Line::from(Span::styled(expand_tabs(line), dim_bg)));
-            }
+            out.extend(preview_tail(&lines, false, dim_bg));
         }
     } else if st.done {
         // Finished, in full: a tool call is either its group's summary (when
@@ -4423,16 +4431,7 @@ fn tool_lines(
         }
     } else {
         // Still running: show the live tail so the newest output is visible.
-        let start = lines.len().saturating_sub(TOOL_RESULT_PREVIEW_LINES);
-        if start > 0 {
-            out.push(Line::from(Span::styled(
-                format!("⋮ (live · {start} earlier line(s))"),
-                dim_bg,
-            )));
-        }
-        for line in &lines[start..] {
-            out.push(Line::from(Span::styled(expand_tabs(line), dim_bg)));
-        }
+        out.extend(preview_tail(&lines, true, dim_bg));
     }
     out
 }
@@ -6283,6 +6282,49 @@ mod block_tests {
         assert!(
             !rows.iter().any(|r| r.contains("+++ b/a.rs")),
             "the result diff is not repeated: {rows:?}"
+        );
+    }
+
+    /// A settled `edit`'s preview shows the head of its result — the diff's
+    /// first hunk is the change — with the count of what was cut.
+    #[test]
+    fn an_edit_preview_shows_the_head_of_its_result() {
+        let t = Theme::default();
+        let result: String = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rows: Vec<String> = tool_lines(
+            &t,
+            true,
+            "edit",
+            r#"{"path":"a.rs"}"#,
+            &result,
+            ToolState {
+                ok: true,
+                done: true,
+                preview: true,
+                frame: "",
+            },
+        )
+        .iter()
+        .map(text)
+        .collect();
+        let kept = TOOL_RESULT_PREVIEW_LINES;
+        assert!(rows.iter().any(|r| r.contains("line 0")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(&format!("line {}", kept - 1))),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains(&format!("line {kept}"))),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(&format!("⋮ ({} more line(s))", 20 - kept))),
+            "{rows:?}"
         );
     }
 

@@ -3592,18 +3592,14 @@ refactor, the gate/sandbox/whitespace dedup, the TUI paste cap, and the 09-04
 OpenCode session-id fix. clippy
 `--workspace --all-targets --all-features -D warnings` is clean, so
 compiler-visible dead code is none; findings are duplication/indirection only.
-**Three new items; four 08-30 items still open (re-confirmed); one open by
-stated decision.** (All three new items — the double paste warning, the goal
-args wrapper, and the shared id mint — fixed and closed 2026-09-04.)
+**Three new items; the 08-30 items re-confirmed open then are closed except one
+held by stated decision** (the `tool_lines` preview duplication was routed
+through `preview_head`/`preview_tail` 2026-10-15). (All three new items — the
+double paste warning, the goal args wrapper, and the shared id mint — fixed and
+closed 2026-09-04.)
 
 **Re-confirmed open from 2026-08-30:**
 
-- **08-30 #1** — `tool_lines` preview head/tail still duplicated inside the
-  settled-preview arms (`crates/hrdr-tui/src/ui.rs:3850-3879`): the
-  mutation-head arm re-derives `preview_head` (3716) inline, and the two tail
-  arms (3868-3878 vs 3897-3908) differ only in marker wording ("⋮ (N earlier
-  line(s))" vs "⋮ (live · N earlier line(s))"). Route through the shared
-  helpers.
 - **08-30 #5, by decision** — `gate_rank` (gate.rs:75-83) vs `kind_rank`
   (verification.rs:346-354): identical Format…Test mapping, still deliberately
   held apart by the comment at gate.rs:70-73 ("three different questions that
