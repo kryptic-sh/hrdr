@@ -2650,15 +2650,17 @@ and **not** fixed.
   Windows equivalent exists, see Hardening notes) and the Landlock backend.
   **Not unix by nature, still gated:** the symlink tests
   (`guard_not_swapped_rejects_a_path_repointed_after_open`,
-  `a_secret_line_memo_is_a_per_run_snapshot`, `canonicalize_nearest_*`,
+  `a_secret_line_memo_is_a_per_run_snapshot`,
   `atomic_write_writes_through_a_symlink`, the commands/skills/trust discovery
   symlink tests, `confinement_resolves_a_symlinked_workspace_root`). The guards
-  they cover do run on Windows. A portable test helper (`symlink_file` /
-  `symlink_dir` by target kind, skipping locally without the privilege and never
-  on CI, where runners have it) would un-gate them; expect `\\?\` canonical
-  prefixes and file-URI formatting in the tests themselves to need fixing.
-  `a_bang_command_runs_unsandboxed` stays unix-only on purpose (its doc says
-  why).
+  they cover do run on Windows. `hrdr_test_support::symlink_or_skip`
+  (2026-10-14) is the portable helper — file or directory link by target kind,
+  skipping locally without the privilege and failing on CI — and the two
+  `canonicalize_nearest` symlink tests now use it; the rest can follow, but
+  expect `\\?\` canonical prefixes and file-URI formatting in their assertions
+  to need fixing, and only CI can run them from a machine without Developer
+  Mode. `a_bang_command_runs_unsandboxed` stays unix-only on purpose (its doc
+  says why).
 - **The Windows leak guard sees less than the others.** `dirs::home_dir()`
   ignores `HOME`/`USERPROFILE` there, so a test that writes through a `dirs`
   fallback lands in the runner's real profile, not the sentinel. Its temp-dir

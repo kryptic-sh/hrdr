@@ -4044,9 +4044,8 @@ b:2:y"
     /// A dangling symlink must resolve to its target: a write through it lands
     /// at the target, so the confinement guard has to see the target, not the
     /// lexical link path inside the root. A relative target with `..` (the
-    /// classic escape) is resolved against the link's parent. Unix-only —
-    /// creating symlinks on Windows needs privileges.
-    #[cfg(unix)]
+    /// classic escape) is resolved against the link's parent. Skips on a
+    /// Windows machine that may not create symlinks (never on CI).
     #[test]
     fn canonicalize_nearest_resolves_a_dangling_symlink_to_its_target() {
         let dir = tempfile::tempdir().unwrap();
@@ -4058,7 +4057,9 @@ b:2:y"
         std::fs::create_dir_all(&tmp).unwrap();
         // `tmp/link -> tmp/../outside.txt`: parent exists, target does not.
         let link = tmp.join("link");
-        std::os::unix::fs::symlink("../outside.txt", &link).unwrap();
+        if !hrdr_test_support::symlink_or_skip(std::path::Path::new("../outside.txt"), &link) {
+            return;
+        }
 
         let canon = canonicalize_nearest(&link);
         assert!(
@@ -4074,12 +4075,13 @@ b:2:y"
     /// A symlink loop must terminate — the hop budget caps the recursion —
     /// rather than hang forever. A write through the loop would fail with
     /// ELOOP anyway, so falling back to the lexical path is safe.
-    #[cfg(unix)]
     #[test]
     fn canonicalize_nearest_terminates_on_a_symlink_loop() {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("a");
-        std::os::unix::fs::symlink("a", &link).unwrap();
+        if !hrdr_test_support::symlink_or_skip(std::path::Path::new("a"), &link) {
+            return;
+        }
 
         // Returns *some* path — the point is it doesn't hang.
         let canon = canonicalize_nearest(&link);

@@ -355,6 +355,43 @@ pub fn skip_for_want_of(what: &str, present: bool) -> bool {
     true
 }
 
+/// Create a symlink at `link` pointing at `target` — relative targets resolve
+/// against `link`'s directory, as the OS resolves them — and return whether it
+/// was created. Windows makes a directory or a file link by the target's kind
+/// (a missing target gets a file link) and refuses both without Developer Mode
+/// or the create-symlink privilege; that refusal skips through
+/// [`skip_for_want_of`], so a runner that ought to have the privilege fails
+/// instead of passing having tested nothing.
+///
+/// Call it as `if !symlink_or_skip(target, &link) { return; }`.
+pub fn symlink_or_skip(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).expect("create symlink");
+        true
+    }
+    #[cfg(windows)]
+    {
+        /// `ERROR_PRIVILEGE_NOT_HELD`: no Developer Mode, no privilege.
+        const PRIVILEGE_NOT_HELD: i32 = 1314;
+        let resolved = link
+            .parent()
+            .map_or_else(|| target.to_path_buf(), |dir| dir.join(target));
+        let created = if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+        match created {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+                !skip_for_want_of("the privilege to create symlinks", false)
+            }
+            Err(error) => panic!("create symlink {}: {error}", link.display()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The sandbox's data root survives a private swap: after `with_test_env` the
