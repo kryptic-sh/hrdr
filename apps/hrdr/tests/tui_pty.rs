@@ -938,10 +938,19 @@ fn a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages(
         Box::new(|| server.chat_bodies().len() == 2),
     );
     for text in ["QUEUED_BEHIND_THE_TURN", "LEFT_IN_THE_INBOX"] {
-        assert_eq!(
-            rt.block_on(peer.send(&second, text.into())).unwrap(),
-            SendStatus::Accepted
-        );
+        match rt.block_on(peer.send(&second, text.into())) {
+            Ok(status) => assert_eq!(status, SendStatus::Accepted),
+            // Whether the target still publishes itself tells a receiver
+            // that stopped serving from one that dropped this one exchange.
+            Err(error) => panic!(
+                "sending {text:?} failed: {error}\nthis project's sessions afterwards: {:?}\nscreen:\n{}",
+                published(&peer)
+                    .iter()
+                    .map(|session| &session.session_id)
+                    .collect::<Vec<_>>(),
+                s.snapshot()
+            ),
+        }
     }
 
     // The turn is still held at the model, so neither message runs.

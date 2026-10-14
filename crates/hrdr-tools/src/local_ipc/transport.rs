@@ -203,6 +203,17 @@ fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "IPC connection closed")
 }
 
+/// A connection the listener accepted but could not authenticate. That is the
+/// one client's failure — it may be another user, or a process already gone
+/// by the time its identity is looked up — so it surfaces as the connection
+/// aborting, which a server skips, never as a fault of the listener itself.
+fn rejected_peer(error: io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        format!("rejected IPC peer: {error}"),
+    )
+}
+
 fn verify_pid(pid: u32, expected: Option<u32>) -> io::Result<u32> {
     if pid == 0 || expected.is_some_and(|expected| expected != pid) {
         return Err(super::insecure());

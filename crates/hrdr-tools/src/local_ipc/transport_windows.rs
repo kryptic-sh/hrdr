@@ -133,7 +133,7 @@ impl Listener {
         // Every replacement instance receives the same explicit private DACL.
         let next = instance(&self.name, &self.sddl, false)?;
         let stream = std::mem::replace(&mut self.pending, next);
-        let pid = authenticate(&stream, &self.user)?;
+        let pid = authenticate(&stream, &self.user).map_err(super::rejected_peer)?;
         Ok(Connection::new(Pipe(stream), pid))
     }
 }

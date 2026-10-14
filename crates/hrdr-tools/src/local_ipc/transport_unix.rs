@@ -62,7 +62,7 @@ impl Listener {
         revalidate(&self.directory, &self.directory_path)?;
         let (stream, _) = self.socket.accept().await?;
         revalidate(&self.directory, &self.directory_path)?;
-        let pid = authenticate(&stream, None)?;
+        let pid = authenticate(&stream, None).map_err(super::rejected_peer)?;
         Ok(Connection::new(stream, pid))
     }
 }

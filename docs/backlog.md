@@ -67,10 +67,23 @@ push each verified slice to `main` before proceeding to the next slice.
    (`headless_messaging`, then the pty session-switch test, never locally): the
    receiver's worker timed out and dropped the pipe. Message exchanges now run
    to `MESSAGE_DEADLINE` on both ends, and a test holds the directory lock past
-   the wire deadline. Real-process coverage: `tests/tui_pty.rs`
-   (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
-   shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
-   disabling), on the CI matrix; verified locally on Windows only so far.
+   the wire deadline. **Not the whole story:** the pty send failed with
+   `BrokenPipe` once more on Windows CI afterwards (leak-guard job, run for
+   `dc022eca`). The next suspect, hardened but unproven: `serve` ended the whole
+   server on any accept error outside `unavailable`, and a Windows accept
+   authenticates each client (`OpenProcess` on a client already exiting can fail
+   access-denied), so one vanishing discovery probe could stop a session
+   serving. Per-client authentication failures now surface as
+   `ConnectionAborted` (`local_ipc::transport::rejected_peer`), which `serve`
+   skips. No test can provoke that failure deterministically; the pty test now
+   reports, on a failed send, whether the target was still published, so a
+   recurrence names the mechanism. Same day, one parallel `local_ipc` run failed
+   `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
+   stalling for 43s; four reruns passed in ~5s. Real-process coverage:
+   `tests/tui_pty.rs` (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`:
+   tools, peer wake, shutdown leaves discovery) and
+   `tests/headless_messaging.rs` (busy delivery, disabling), on the CI matrix;
+   verified locally on Windows only so far.
    `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
    covers `/new` rotation and the exit report across processes. Still
    unexercised across processes: access-control denial for a foreign OS user.
