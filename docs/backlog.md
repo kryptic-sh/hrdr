@@ -1808,10 +1808,9 @@ property of code that still exists. Read before "simplifying" any of them.
 `ProcessLease`, and `is_stale_lock` reaps a lock whose pid now belongs to a
 different process. What is left: a lock written by an older hrdr (no lease), or
 one whose owner cannot be probed (`ProcessLiveness::Unknown`), still falls back
-to the pid alone; `openai_refresh` requires `refresh_token` in the response
-(`oauth.rs:361`) — a spec-minimal server forces a re-login; the wrap-up round
-shares `overflow_compacted` (`turn_loop.rs:524, 842`) — a second overflow on the
-forced wrap-up errors the turn.
+to the pid alone; the wrap-up round shares `overflow_compacted`
+(`turn_loop.rs:524, 842`) — a second overflow on the forced wrap-up errors the
+turn.
 
 **From the 2026-08-05 correctness pass:** `fetch`'s `is_blocked_host` is
 advisory — correctness rests on the connect-time `SsrfGuardResolver`, one

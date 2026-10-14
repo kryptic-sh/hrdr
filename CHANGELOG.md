@@ -198,6 +198,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A ChatGPT login refresh no longer fails when the server keeps the refresh
+  token.** OAuth lets a token refresh leave out a new refresh token, meaning the
+  current one stays valid; hrdr rejected such a response and forced a fresh
+  login. It now keeps the token it already had (`crates/hrdr-agent`).
 - **A crashed hrdr's lock no longer blocks a session or store for good.** A lock
   left behind by a crash was cleared once its owner's process was gone, judged
   by process id alone. When the system reused that id for an unrelated process —

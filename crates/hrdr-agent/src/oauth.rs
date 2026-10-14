@@ -422,16 +422,44 @@ pub async fn openai_exchange(code: &str, redirect: &str, verifier: &str) -> Resu
 
 /// Refresh an OpenAI access token using a stored `refresh_token`.
 pub async fn openai_refresh(refresh_token: &str) -> Result<OpenAiTokens> {
-    post_token(&[
+    let refreshed: RefreshedTokens = post_token(&[
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", OPENAI_CLIENT_ID),
     ])
-    .await
+    .await?;
+    Ok(refreshed.keeping(refresh_token))
+}
+
+/// A refresh-grant response. Unlike the code exchange, it may leave out
+/// `refresh_token` — RFC 6749 §6 makes issuing a new one the server's choice,
+/// and without one the token that was just used stays valid.
+#[derive(Deserialize)]
+struct RefreshedTokens {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+impl RefreshedTokens {
+    /// The tokens to store: the response's, with `used` as the refresh token
+    /// when the server did not rotate it.
+    fn keeping(self, used: &str) -> OpenAiTokens {
+        OpenAiTokens {
+            access_token: self.access_token,
+            refresh_token: self.refresh_token.unwrap_or_else(|| used.to_string()),
+            id_token: self.id_token,
+            expires_in: self.expires_in,
+        }
+    }
 }
 
 /// POST a form-encoded body to the OpenAI token endpoint and parse the tokens.
-async fn post_token(params: &[(&str, &str)]) -> Result<OpenAiTokens> {
+async fn post_token<T: serde::de::DeserializeOwned>(params: &[(&str, &str)]) -> Result<T> {
     let url = format!("{OPENAI_ISSUER}/oauth/token");
     let resp = oauth_http_client()?
         .post(&url)
@@ -929,6 +957,26 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── refresh ─────────────────────────────────────────────────────────────
+
+    /// A refresh response that does not rotate the refresh token keeps the one
+    /// that was used — RFC 6749 §6 — instead of failing to parse and forcing a
+    /// re-login. A rotated one replaces it.
+    #[test]
+    fn a_refresh_without_a_new_refresh_token_keeps_the_old_one() {
+        let kept: RefreshedTokens =
+            serde_json::from_str(r#"{"access_token":"new-access","expires_in":3600}"#).unwrap();
+        let tokens = kept.keeping("old-refresh");
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token, "old-refresh");
+        assert_eq!(tokens.expires_in, Some(3600));
+
+        let rotated: RefreshedTokens =
+            serde_json::from_str(r#"{"access_token":"new-access","refresh_token":"new-refresh"}"#)
+                .unwrap();
+        assert_eq!(rotated.keeping("old-refresh").refresh_token, "new-refresh");
+    }
 
     // ── PKCE ────────────────────────────────────────────────────────────────
 
