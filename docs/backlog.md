@@ -95,11 +95,11 @@ push each verified slice to `main` before proceeding to the next slice.
    attribution before declaring this complete. Support Windows, macOS, and Linux
    with equivalent discovery and delivery behavior. Run native cross-process
    messaging and access-control tests on each supported platform through the CI
-   matrix. Local native Windows and Linux (WSL) runs provide faster feedback,
-   not replacements for any CI matrix job. macOS runtime verification relies on
-   CI. A Windows-only pass or cross-compilation alone does not establish
-   macOS/Linux runtime correctness. Record any missing platform verification
-   explicitly rather than treating it as passed.
+   matrix. Local verification is native Windows only (no WSL, by the owner's
+   call 2026-10-14); Linux and macOS runtime verification comes from the CI
+   matrix every push to `main` runs. A Windows-only pass or cross-compilation
+   alone does not establish macOS/Linux runtime correctness. Record any missing
+   platform verification explicitly rather than treating it as passed.
 
 2. **Remaining actionable backlog.** After messaging is finished and fully
    tested, reassess the entries against current code and implement actionable
@@ -288,11 +288,11 @@ statements say only that no general headless display exists there.
 
 **Resume/verification gaps — 2026-10-09:** Work after the current messaging
 runtime slice was deferred at the user's wrap-up request. The queue above stays
-open. Local Linux execution needs a Rust toolchain in WSL; macOS execution
-relies on CI. Native foreign-account access-denial and remote-machine pipe
-rejection were not exercised; retain those as security coverage gaps. Transport
-CI run `37799426844` passed after rerunning its unprovisioned macOS Clippy job;
-that result does not cover later registration/runtime changes.
+open. Linux and macOS execution relies on CI (local testing is native Windows
+only). Native foreign-account access-denial and remote-machine pipe rejection
+were not exercised; retain those as security coverage gaps. Transport CI run
+`37799426844` passed after rerunning its unprovisioned macOS Clippy job; that
+result does not cover later registration/runtime changes.
 
 CI run `37922581404` (`82f51778`) passed Windows/Linux/macOS nextest, ordinary
 tests under leak guards, Clippy, build/smoke, dependency checks, and
