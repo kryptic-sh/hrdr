@@ -189,6 +189,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A session moved with `/cwd` is saved where it is working, even mid-turn.**
+  While a turn held the agent, the TUI took the session's directory from the
+  process, which `/cwd` and resume never move, so saves made during a turn were
+  filed under the directory hrdr was started in. A resumed or recovered session
+  could then find an older snapshot, and an update's handoff could not be
+  claimed (`crates/hrdr-tui`).
 - **`fetch` and `search` refuse internal IPv4 addresses spelled as IPv6.** The
   SSRF guard caught the `::ffff:` mapped form but not the IPv4-compatible
   `::a.b.c.d`, NAT64 `64:ff9b::/96` or 6to4 `2002::/16` spellings, so a loopback

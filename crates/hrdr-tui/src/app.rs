@@ -2888,15 +2888,16 @@ impl App {
         crate::ui::clear_transcript_cache();
     }
 
-    /// The tools' current working directory (agent's, or the process cwd while
-    /// a turn holds the agent lock).
+    /// The tools' current working directory: the agent's, or — while a turn
+    /// holds the agent lock — the copy every cwd change keeps in `dir_cwd`. Not
+    /// the process cwd: `/cwd` and resume move the tools without moving the
+    /// process, and a session is filed by this string, so a save mid-turn would
+    /// land in the directory hrdr was started from.
     fn current_cwd(&self) -> String {
-        if let Some(cwd) = self.with_agent(|a| a.cwd()) {
-            return cwd.display().to_string();
-        }
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
+        self.with_agent(|a| a.cwd())
+            .unwrap_or_else(|| self.dir_cwd.clone())
+            .display()
+            .to_string()
     }
 
     /// Switch the tools' working directory: update the agent and the status bar.

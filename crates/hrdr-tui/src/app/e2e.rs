@@ -11518,6 +11518,35 @@ async fn cwd_changes_rediscover_skills_for_the_new_directory() {
     );
 }
 
+/// A turn holds the agent lock, and a session saved then is filed by
+/// `current_cwd` — which must still be the directory `/cwd` moved to, not the
+/// process's own, or the session lands in the directory hrdr started in.
+#[tokio::test]
+async fn the_session_cwd_follows_cwd_while_a_turn_holds_the_agent() {
+    let mut h = Harness::new(vec![]).await;
+    let new = tempfile::tempdir().unwrap();
+    let new_path = hrdr_tools::canonical_cwd(new.path()).unwrap();
+    assert_ne!(
+        std::env::current_dir().unwrap(),
+        new_path,
+        "the process must start elsewhere for this to tell anything"
+    );
+    hrdr_agent::trust::trust(&new_path, true).expect("record the trust answer");
+    h.submit(&format!("/cwd {}", new_path.display())).await;
+    // `/cwd` hands the agent its new directory on a spawned task.
+    let start = std::time::Instant::now();
+    while h.app.current_cwd() != new_path.display().to_string() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the agent never took the new cwd"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let _turn = h.app.agent.clone().lock_owned().await;
+    assert_eq!(h.app.current_cwd(), new_path.display().to_string());
+}
+
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn indexed_completion_accepts_platform_path_identity() {

@@ -120,13 +120,16 @@ pub fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
-pub fn persisted_session_state(home: &Path) -> Option<serde_json::Value> {
-    let sessions = home.join("hrdr").join("sessions");
-    let cwd = fs::read_dir(sessions)
-        .ok()?
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_dir()))?;
-    let snapshot = fs::read_dir(cwd.path())
+/// The session snapshot saved for `cwd` under `home`: sessions are filed by
+/// cwd, so this also checks the session was saved where it was working — a
+/// save filed under another directory leaves this `None`.
+pub fn persisted_session_state(home: &Path, cwd: &Path) -> Option<serde_json::Value> {
+    let cwd = hrdr_tools::canonical_cwd(cwd).ok()?;
+    let directory = home
+        .join("hrdr")
+        .join("sessions")
+        .join(hrdr_agent::cwd_slug(&cwd.display().to_string()));
+    let snapshot = fs::read_dir(directory)
         .ok()?
         .filter_map(Result::ok)
         .find(|entry| {

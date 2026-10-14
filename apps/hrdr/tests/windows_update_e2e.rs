@@ -507,7 +507,8 @@ fn update_installs_default_cargo_binary_and_recovers_once() {
         "the persisted update turn and one recovered shell continuation must run"
     );
     let persisted = wait_until("persisted recovered state", || {
-        let state = persisted_session_state(&fixture.home)?;
+        let state =
+            persisted_session_state(&fixture.home, &fixture.checkout.join("apps").join("hrdr"))?;
         let messages = state["messages"].as_array()?;
         let todos = state["todos"].as_array()?;
         let goals = state["goals"].as_array()?;

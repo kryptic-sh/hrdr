@@ -302,7 +302,8 @@ fn update_installs_and_execs_a_successor_that_continues_the_turn() {
             .is_some_and(|body| body.to_string().contains("recovery-cwd-preserved")),
         "the successor's shell ran in the session's own directory"
     );
-    let state = persisted_session_state(&fixture.home).expect("the session was saved");
+    let state = persisted_session_state(&fixture.home, &fixture.checkout.join("apps").join("hrdr"))
+        .expect("the session was saved under the directory it moved to");
     assert!(
         state["todos"].as_array().is_some_and(|todos| todos
             .iter()
