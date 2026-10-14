@@ -791,7 +791,19 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
             .unwrap(),
         SendStatus::Accepted
     );
-    s.wait_for("PEER_REPLY_SEEN", EXIT);
+    // The wake is the TUI's fourth model request, carrying the reply. Polled
+    // on the server, not read off the screen: `visible` strips escapes rather
+    // than emulating a terminal, so text the renderer writes around cells
+    // it skips as unchanged need not appear whole in the stream.
+    let start = Instant::now();
+    while server.chat_bodies().len() < 4 {
+        assert!(
+            start.elapsed() < EXIT,
+            "the peer's reply never woke the TUI. Screen:\n{}",
+            s.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let last = server.chat_bodies().last().unwrap().to_string();
     assert!(last.contains("PONG_FROM_PEER"), "{last}");
     assert!(last.contains("not human input"), "{last}");

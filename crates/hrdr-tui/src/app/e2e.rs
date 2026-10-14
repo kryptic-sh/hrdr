@@ -11547,6 +11547,28 @@ async fn the_session_cwd_follows_cwd_while_a_turn_holds_the_agent() {
     assert_eq!(h.app.current_cwd(), new_path.display().to_string());
 }
 
+/// A frame held back by message pacing is not lost: the wait wakes when it is
+/// due even with no input, message or animation to wake it.
+#[tokio::test]
+async fn a_deferred_frame_wakes_the_event_wait_when_due() {
+    use std::time::{Duration, Instant};
+    let mut h = Harness::new(vec![]).await;
+    let mut events = futures_util::stream::pending();
+    // An hour-long ticker, its immediate first tick consumed: only the deferred
+    // frame can end this wait.
+    let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+    ticker.tick().await;
+    let due = Instant::now() + Duration::from_millis(50);
+    let wake = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::tui::wait_for_event_until(&h.app, &mut events, &mut h.rx, &mut ticker, Some(due)),
+    )
+    .await
+    .expect("the deferred frame must wake the wait");
+    assert!(matches!(wake, crate::tui::Wake::Animation));
+    assert!(Instant::now() >= due, "woke before the frame was due");
+}
+
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn indexed_completion_accepts_platform_path_identity() {

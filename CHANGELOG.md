@@ -163,6 +163,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A streaming reply redraws at most once per frame.** The TUI drew a full
+  frame after every burst of tokens, so a fast endpoint re-rendered the whole
+  growing reply dozens of times a second. Frames woken only by the agent now
+  wait for the frame interval (the spinner's 120 ms); keys and mouse input still
+  draw at once (`crates/hrdr-tui`).
 - **`bash` is the default shell everywhere, and every installed shell is
   selectable.** On Windows the default is now Git Bash — found on `PATH` or next
   to the installed Git, never the WSL `bash.exe` launcher — with Windows

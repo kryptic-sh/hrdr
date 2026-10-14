@@ -4,7 +4,7 @@
 //! I/O or renderer types, so another frontend can drive the same `App` with its
 //! own loop + renderer.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
@@ -56,6 +56,33 @@ fn sync_title<W: std::io::Write>(
 
 #[cfg(test)]
 mod tests {
+    /// A frame woken only by agent messages waits out the rest of the frame
+    /// interval since the last draw; the first frame, input and animation
+    /// never wait, and a message after the interval draws at once.
+    #[test]
+    fn message_frames_are_paced_to_the_frame_interval() {
+        use super::{Duration, Instant, defer_message_frame};
+        let interval = Duration::from_millis(crate::ui::SPINNER_FRAME_MS);
+        let drawn = Instant::now();
+        let soon = drawn + interval / 4;
+        assert_eq!(
+            defer_message_frame(true, None, soon),
+            None,
+            "the first frame"
+        );
+        assert_eq!(defer_message_frame(false, Some(drawn), soon), None, "input");
+        assert_eq!(
+            defer_message_frame(true, Some(drawn), soon),
+            Some(drawn + interval),
+            "a message burst inside the interval"
+        );
+        assert_eq!(
+            defer_message_frame(true, Some(drawn), drawn + interval),
+            None,
+            "a message burst once the interval has passed"
+        );
+    }
+
     use super::{App, edited_file_message, handle_recovery_event};
 
     #[test]
@@ -114,19 +141,54 @@ pub(crate) enum Wake {
     Animation,
 }
 
-/// The event wait shared by the terminal driver and headless rendering tests.
+/// The event wait the headless rendering tests drive: the terminal driver's,
+/// without frame pacing.
+#[cfg(test)]
 pub(crate) async fn wait_for_event(
     app: &App,
     events: &mut (impl futures_util::Stream<Item = std::io::Result<Event>> + Unpin),
     rx: &mut tokio::sync::mpsc::Receiver<crate::app::TurnMsg>,
     ticker: &mut tokio::time::Interval,
 ) -> Wake {
+    wait_for_event_until(app, events, rx, ticker, None).await
+}
+
+/// [`wait_for_event`], also waking at `deferred_frame`: the moment a frame
+/// [`defer_message_frame`] held back is due.
+pub(crate) async fn wait_for_event_until(
+    app: &App,
+    events: &mut (impl futures_util::Stream<Item = std::io::Result<Event>> + Unpin),
+    rx: &mut tokio::sync::mpsc::Receiver<crate::app::TurnMsg>,
+    ticker: &mut tokio::time::Interval,
+    deferred_frame: Option<Instant>,
+) -> Wake {
+    let deferred = async {
+        match deferred_frame {
+            Some(at) => tokio::time::sleep_until(at.into()).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         event = events.next() => Wake::Input(event),
         Some(msg) = rx.recv() => Wake::Message(msg),
         // An offscreen logo must not keep an idle transcript redrawing.
         _ = ticker.tick(), if app.spinner_live() => Wake::Animation,
+        () = deferred => Wake::Animation,
     }
+}
+
+/// When a frame woken only by agent messages may be drawn: `None` now, or the
+/// moment one frame interval after the last draw. A fast endpoint delivers a
+/// burst every few milliseconds, and drawing after each one re-renders the
+/// whole growing reply far more often than anyone can see; input and
+/// animation still draw at once.
+fn defer_message_frame(
+    woken_by_messages: bool,
+    last_draw: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    let due = last_draw? + Duration::from_millis(ui::SPINNER_FRAME_MS);
+    (woken_by_messages && now < due).then_some(due)
 }
 
 fn handle_recovery_event(app: &mut App, event: Event) {
@@ -193,6 +255,9 @@ pub(crate) async fn run_loop(
     // `None` forces the first frame to emit it.
     let mut cursor_insert: Option<bool> = None;
     let mut terminal_title_sent: Option<String> = None;
+    // Frame pacing for message-only wakes — see `defer_message_frame`.
+    let mut last_draw: Option<Instant> = None;
+    let mut woken_by_messages = false;
 
     // A command handed to hrdr on the command line (`hrdr /new`, `hrdr /model`,
     // `hrdr '!git status'`) runs here — after the session is up and any auto-resume
@@ -229,17 +294,23 @@ pub(crate) async fn run_loop(
             terminal.clear()?;
             terminal_title_sent = None;
         }
-        crate::cursor_backend::draw_frame(terminal, |f| ui::draw(f, app))?;
-        sync_title(
-            terminal.backend_mut(),
-            app.terminal_title(),
-            &mut terminal_title_sent,
-        )?;
-        sync_cursor(
-            terminal.backend_mut(),
-            app.editor.is_insert(),
-            &mut cursor_insert,
-        )?;
+        let now = Instant::now();
+        let deferred_frame =
+            defer_message_frame(woken_by_messages && !app.should_quit, last_draw, now);
+        if deferred_frame.is_none() {
+            crate::cursor_backend::draw_frame(terminal, |f| ui::draw(f, app))?;
+            last_draw = Some(now);
+            sync_title(
+                terminal.backend_mut(),
+                app.terminal_title(),
+                &mut terminal_title_sent,
+            )?;
+            sync_cursor(
+                terminal.backend_mut(),
+                app.editor.is_insert(),
+                &mut cursor_insert,
+            )?;
+        }
         if app.should_quit {
             app.shutdown_messaging().await;
             if app.handoff_exit {
@@ -265,7 +336,10 @@ pub(crate) async fn run_loop(
             break;
         }
 
-        match wait_for_event(app, &mut events, &mut rx, &mut ticker).await {
+        let wake =
+            wait_for_event_until(app, &mut events, &mut rx, &mut ticker, deferred_frame).await;
+        woken_by_messages = matches!(wake, Wake::Message(_));
+        match wake {
             Wake::Input(maybe_ev) => match maybe_ev {
                 Some(Ok(Event::Key(key))) => match app.on_key(key) {
                     // Leaving the alt screen for `$EDITOR` resets the cursor

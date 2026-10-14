@@ -332,6 +332,17 @@ root-caused:
 `transcript_log::tests::a_coalesced_transcript_folds_exactly_like_the_event_stream`
 (`took_ms` mismatch), watch-delivery timing, and session-save timing.
 
+**The pty tests read the screen by stripping escapes — needs a decision.**
+`apps/hrdr/tests/common` `visible` removes escape sequences instead of emulating
+a terminal, so text the renderer writes around cells it skips as unchanged
+(`P<skip>ER<skip>REPLY` for `PEER_REPLY_SEEN` over an earlier `SENT_TO_PEER`)
+never appears whole, and a substring assertion fails while the screen is right.
+Frame pacing (2026-10-14) made one test hit it; that test now waits on the
+server's request instead. **Question for the owner:** take `termwiz` (already in
+the tree via `portable-pty`) as a dev-dependency of `apps/hrdr` and render each
+test's stream into a real screen? Every screen assertion would then mean what it
+says; the alternative is checking non-screen evidence test by test.
+
 **Shell timeout tests, 2026-10-14.** The missing-prefix failures in
 `tools::shell::tests::a_timeout_fails_the_call_but_a_non_zero_exit_does_not` and
 `tools::tests::bash_timeout_kills_process_and_keeps_partial_output` had two
@@ -3294,15 +3305,14 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    one-cell chrome span advanced per frame and key the body on content hash
    alone; route running blocks through `ChunkRows::Lazy` so off-screen blocks
    aren't built.
-4. **HIGH — streaming markdown re-parsed and re-wrapped in full on every
-   token.** `hrdr-tui/src/ui.rs`: the body key is the precomputed
-   `content_hash`, which changes per delta, so a streaming message misses the
-   cache on every frame a token arrived — N tokens → N full `markdown_lines`
-   re-renders of the growing text → O(n²) per response, on the exact path the
-   user watches. Fix: coalesce re-renders to the ticker rate (a frame whose only
-   change is the tail draws the stale cached body — visually identical at 120
-   ms), or render append-only from the last cached line when the delta is a pure
-   append.
+4. **MEDIUM — streaming markdown re-parsed and re-wrapped in full per frame.**
+   `hrdr-tui/src/ui.rs`: the body key is the precomputed `content_hash`, which
+   changes per delta, so a streaming message misses the cache on every frame.
+   Since 2026-10-14 frames woken only by agent messages are paced to the frame
+   interval (`tui::defer_message_frame`, `SPINNER_FRAME_MS`), so this costs one
+   full re-render per frame instead of one per token burst — still O(n) per
+   frame, O(n²) over a long reply at ~8 frames a second. Left: render
+   append-only from the last cached line when the delta is a pure append.
 5. **MEDIUM-HIGH — O(n) full-transcript walk per frame, unbounded.** `ui.rs`
    `draw_chunks`: every frame iterates every transcript entry — 3-4 thread-local
    `RefCell` lookups + `Rc` clones (`cached_body`/`cached_block`/`chrome_hash`)
@@ -3684,19 +3694,13 @@ Ranked by impact, biggest first:
    on every tool round"); save still whole-body `write_atomic`
    (`session.rs:880`). TUI coalesces; each landed save is still O(history). Open
    — the delta-journal fix from 08-30 stands.
-3. **MEDIUM-HIGH (partially fixed, 08-30 #3/#4) — streamed content re-renders
-   its body on every delta.** Streaming assistant, reasoning, and tool content
-   changes `content_hash` on each delta, so the TUI reparses and re-wraps the
-   growing body each time. Running tools now keep unchanged static rows across
-   spinner-only ticks, measured by `tool_lines` invocation count rather than
-   wall time; per-delta coalescing or incremental rendering remains open.
-4. **MEDIUM — unchanged frames still materialize every assembled block.**
+3. **MEDIUM — unchanged frames still materialize every assembled block.**
    `materialize_transcript` walks all finalized blocks, clones each descriptor
    and shared row pointer, and rebuilds chunks and message positions every
    frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
    static materialized prefix while resolving dynamic header, reasoning, and
    tool-group bodies per frame. Open.
-5. **08-30 #12/#13/#16/#17 (LOW), settled 2026-10-14.** #12 (`replace`'s literal
+4. **08-30 #12/#13/#16/#17 (LOW), settled 2026-10-14.** #12 (`replace`'s literal
    path counts matches before replacing) is declined: the count is what bounds
    the output size before the replacement allocates. #13 shipped (`memory.rs`
    `Lowered`). #16 stays held by decision. #17's original entry (a dispatch args
