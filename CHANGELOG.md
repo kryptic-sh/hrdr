@@ -198,6 +198,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A crashed hrdr's lock no longer blocks a session or store for good.** A lock
+  left behind by a crash was cleared once its owner's process was gone, judged
+  by process id alone. When the system reused that id for an unrelated process —
+  routine on Windows — the lock looked held forever, and opening the session or
+  saving credentials failed until the file was deleted by hand. Locks now also
+  record when their owner started, so a reused id is recognised
+  (`crates/hrdr-agent`).
 - **Cancelling a sub-agent after it was steered no longer leaves it running.** A
   background sub-agent that carried on into a steered turn and was then
   cancelled stayed marked as running for good: its pane kept a live loader and

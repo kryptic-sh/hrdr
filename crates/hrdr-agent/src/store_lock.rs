@@ -200,12 +200,16 @@ impl StoreLock {
                     // Record owner PID + creation time so a concurrent process
                     // can later judge this lock's staleness. Best-effort: even
                     // an empty lock file is reap-able (aged by mtime).
-                    let content = format!(
+                    let mut content = format!(
                         "{} {} {}",
                         std::process::id(),
                         hrdr_tools::unix_now(),
                         ACQUISITIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     );
+                    // The owner's process lease, at `STORE_LOCK_LEASE_FIELD`.
+                    if let Some(lease) = hrdr_tools::current_process_lease() {
+                        content.push_str(&format!(" {}", lease.created));
+                    }
                     let _ = f.write_all(content.as_bytes());
                     let _ = f.flush();
                     drop(f);
@@ -230,7 +234,7 @@ impl StoreLock {
                 {
                     // Reap it if stale and retry immediately; otherwise wait a
                     // beat and try again (bounded).
-                    if is_stale_lock(&lock_path, stale_age_secs) {
+                    if is_stale_lock(&lock_path, stale_age_secs, STORE_LOCK_LEASE_FIELD) {
                         let _ = std::fs::remove_file(&lock_path);
                         continue;
                     }
@@ -261,8 +265,20 @@ impl StoreLock {
     }
 }
 
+/// Where a [`StoreLock`] file records its owner's process-lease creation time:
+/// after the pid, the timestamp and the acquisition counter.
+const STORE_LOCK_LEASE_FIELD: usize = 3;
+
 /// Whether the lock file at `path` is stale — owned by a dead process and older
 /// than `stale_age_secs`, or unparseable and that old by mtime.
+///
+/// `lease_field` is the whitespace-separated field holding the owner's
+/// [`hrdr_tools::ProcessLease`] creation time, for the lock formats that write
+/// one. With it, an owner whose pid now belongs to a different process reads as
+/// gone — without it a crashed holder's lock outlives it for as long as the
+/// recycled pid stays alive, and every later acquire times out. A lock with no
+/// lease (an older hrdr wrote it) or a lease that cannot be probed falls back to
+/// the pid alone.
 ///
 /// `stale_age_secs` comes from the holder's [`StoreKind`], since how long a lock
 /// may honestly be held is decided by the work under it. The session store's
@@ -272,7 +288,7 @@ impl StoreLock {
 /// Parses `PID TIMESTAMP`; if the content doesn't parse (empty/truncated lock)
 /// it falls back to the file's mtime so an unparseable lock can still be aged
 /// out rather than wedging the store forever.
-pub(crate) fn is_stale_lock(path: &Path, stale_age_secs: u64) -> bool {
+pub(crate) fn is_stale_lock(path: &Path, stale_age_secs: u64, lease_field: usize) -> bool {
     let Ok(content) = std::fs::read_to_string(path) else {
         // The lock vanished between the failed create and this read — treat it
         // as not-stale; the next acquire attempt will re-race the create.
@@ -297,10 +313,20 @@ pub(crate) fn is_stale_lock(path: &Path, stale_age_secs: u64) -> bool {
         return false;
     }
     // Old enough: reap only if the owning process is really gone.
-    if process_alive(pid) {
-        return false;
+    let created = content
+        .split_whitespace()
+        .nth(lease_field)
+        .and_then(|field| field.parse().ok());
+    if let Some(created) = created {
+        match hrdr_tools::process_lease_liveness(hrdr_tools::ProcessLease { pid, created }) {
+            hrdr_tools::ProcessLiveness::Dead | hrdr_tools::ProcessLiveness::Replaced => {
+                return true;
+            }
+            hrdr_tools::ProcessLiveness::Live => return false,
+            hrdr_tools::ProcessLiveness::Unknown => {}
+        }
     }
-    true
+    !process_alive(pid)
 }
 
 /// Remove the lock file at `lock_path` — but only if it still names `pid` as
@@ -545,12 +571,76 @@ mod tests {
         std::fs::write(&lock, format!("4294967294 {ts}")).unwrap();
 
         assert!(
-            is_stale_lock(&lock, StoreKind::SmallFileRewrite.stale_age_secs()),
+            is_stale_lock(
+                &lock,
+                StoreKind::SmallFileRewrite.stale_age_secs(),
+                STORE_LOCK_LEASE_FIELD
+            ),
             "a credential lock this old is abandoned"
         );
         assert!(
-            !is_stale_lock(&lock, StoreKind::BlobStore.stale_age_secs()),
+            !is_stale_lock(
+                &lock,
+                StoreKind::BlobStore.stale_age_secs(),
+                STORE_LOCK_LEASE_FIELD
+            ),
             "the same age is a save still writing its blobs"
+        );
+    }
+
+    /// A crashed holder whose pid now belongs to another live process: the pid
+    /// alone says "alive", so without the lease its lock blocks the store until
+    /// someone deletes it by hand. Simulated with this process's own pid — alive
+    /// for certain — and a creation time it does not have.
+    #[test]
+    fn a_lock_whose_pid_was_recycled_is_stale() {
+        let Some(lease) = hrdr_tools::current_process_lease() else {
+            // No lease on this platform: the pid is all there is to go on.
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("auth.toml.lock");
+        let ts = hrdr_tools::unix_now().saturating_sub(SMALL_FILE_STALE_LOCK_AGE_SECS + 60);
+        let age = StoreKind::SmallFileRewrite.stale_age_secs();
+
+        std::fs::write(
+            &lock,
+            format!("{} {ts} 0 {}", lease.pid, lease.created.wrapping_add(1)),
+        )
+        .unwrap();
+        assert!(
+            is_stale_lock(&lock, age, STORE_LOCK_LEASE_FIELD),
+            "the pid is alive, but not as the process that took the lock"
+        );
+
+        std::fs::write(&lock, format!("{} {ts} 0 {}", lease.pid, lease.created)).unwrap();
+        assert!(
+            !is_stale_lock(&lock, age, STORE_LOCK_LEASE_FIELD),
+            "the holder itself is alive, however old its lock"
+        );
+
+        std::fs::write(&lock, format!("{} {ts} 0", lease.pid)).unwrap();
+        assert!(
+            !is_stale_lock(&lock, age, STORE_LOCK_LEASE_FIELD),
+            "a lock with no lease falls back to the pid, which is alive"
+        );
+    }
+
+    /// Every lock format hrdr writes carries the owner's lease at the field its
+    /// staleness check reads — a lease written anywhere else is never consulted.
+    #[test]
+    fn store_locks_record_the_owner_lease_where_it_is_read() {
+        let Some(lease) = hrdr_tools::current_process_lease() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("auth.toml");
+        let _guard = StoreLock::acquire(&store, StoreKind::SmallFileRewrite, false).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("auth.toml.lock")).unwrap();
+        assert_eq!(
+            content.split_whitespace().nth(STORE_LOCK_LEASE_FIELD),
+            Some(lease.created.to_string().as_str()),
+            "{content}"
         );
     }
 

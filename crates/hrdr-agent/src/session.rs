@@ -24,6 +24,11 @@ use serde::{Deserialize, Serialize};
 /// deadlock while avoiding false reaping of a lock that a slow filesystem or
 /// a concurrent process legitimately holds.
 const STALE_LOCK_AGE_SECS: u64 = 60;
+
+/// Where the session open-lock and id-reservation files record their owner's
+/// process-lease creation time: after the pid and the timestamp.
+const SESSION_LOCK_LEASE_FIELD: usize = 2;
+
 /// Retry a coordinator-attested source lock while Windows drains a delete-pending
 /// handle. The bounded window leaves room for delayed handle cleanup (including
 /// security scanners) without turning an access failure into permission to claim
@@ -600,7 +605,11 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
             Ok(f) => {
                 // Write owner PID + creation timestamp into the lock so
                 // a concurrent (or future) process can detect staleness.
-                let content = format!("{} {}", std::process::id(), hrdr_tools::unix_now());
+                let mut content = format!("{} {}", std::process::id(), hrdr_tools::unix_now());
+                // The owner's process lease, at `SESSION_LOCK_LEASE_FIELD`.
+                if let Some(lease) = hrdr_tools::current_process_lease() {
+                    content.push_str(&format!(" {}", lease.created));
+                }
                 let mut f = f;
                 let _ = f.write_all(content.as_bytes());
                 let _ = f.flush();
@@ -611,7 +620,11 @@ fn try_reserve(dir: &Path, cand: &str) -> Result<Reservation, ()> {
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS) {
+                if crate::store_lock::is_stale_lock(
+                    &lock_path,
+                    STALE_LOCK_AGE_SECS,
+                    SESSION_LOCK_LEASE_FIELD,
+                ) {
                     // Reap the stale lock and retry O_EXCL.
                     let _ = std::fs::remove_file(&lock_path);
                     continue;
@@ -829,7 +842,11 @@ fn acquire_open_lock_mode(
                     continue;
                 }
                 if !require_exact_handoff_lock
-                    && crate::store_lock::is_stale_lock(&lock_path, STALE_LOCK_AGE_SECS)
+                    && crate::store_lock::is_stale_lock(
+                        &lock_path,
+                        STALE_LOCK_AGE_SECS,
+                        SESSION_LOCK_LEASE_FIELD,
+                    )
                 {
                     // A dead abandoned lock: reap it and retry the O_EXCL create.
                     let _ = std::fs::remove_file(&lock_path);
@@ -3528,6 +3545,31 @@ mod tests {
             let (id2, _r2) = t2.join().unwrap();
             assert_ne!(id1, id2, "concurrent reservations get different ids");
         });
+    }
+
+    /// Both session lock files carry their owner's process lease at the field
+    /// the staleness check reads, so a crashed holder's lock is not kept alive
+    /// by whatever process inherits its pid.
+    #[test]
+    fn session_locks_record_the_owner_lease_where_it_is_read() {
+        let Some(lease) = hrdr_tools::current_process_lease() else {
+            return;
+        };
+        let lease_at = |path: &Path| {
+            let content = std::fs::read_to_string(path).unwrap();
+            content
+                .split_whitespace()
+                .nth(SESSION_LOCK_LEASE_FIELD)
+                .map(str::to_owned)
+        };
+        let created = Some(lease.created.to_string());
+
+        let dir = tempfile::tempdir().unwrap();
+        let _open = acquire_open_lock(dir.path(), "chat").expect("fresh id acquires");
+        assert_eq!(lease_at(&dir.path().join(".chat.open.lock")), created);
+
+        let reservation = try_reserve(dir.path(), "reserved").expect("fresh id reserves");
+        assert_eq!(lease_at(&reservation.lock_path), created);
     }
 
     // ── open lock (per-session ownership) ──────────────────────────────────────
