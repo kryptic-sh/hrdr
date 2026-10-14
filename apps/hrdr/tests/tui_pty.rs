@@ -988,8 +988,30 @@ fn a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages(
 
     // The turn is still held at the model, so neither message runs.
     s.send("\x11");
-    s.wait_for("2 peer message(s) were not delivered before exit", EXIT);
     assert!(s.wait_exit(EXIT).success(), "clean exit");
+    // The report is the last thing written before exit, and the terminal
+    // relays it after the process is gone (ConPTY renders asynchronously), so
+    // it gets the whole budget rather than `wait_for`'s post-exit drain.
+    let report = "2 peer message(s) were not delivered before exit";
+    let start = Instant::now();
+    while !s.snapshot().contains(report) {
+        if start.elapsed() > EXIT {
+            let raw = grab(&s.screen).clone();
+            let tail: String = raw
+                .chars()
+                .rev()
+                .take(1500)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            panic!(
+                "no exit report. Screen:\n{}\nraw tail: {tail:?}",
+                s.snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     drop(release);
     assert_eq!(server.chat_bodies().len(), 2, "no turn ran for a peer");
     rt.block_on(peer.close());
