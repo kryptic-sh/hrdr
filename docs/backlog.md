@@ -3386,18 +3386,6 @@ findings below were appended after the section was written.
 
 ### hrdr-llm (appended 2026-08-30)
 
-18. **HIGH — per-token String clone in `Accumulator::push`** —
-    `hrdr-llm/src/types.rs` `push`: `choice.delta.content.clone()` (a heap alloc
-    - memcpy per streamed token) is only returned so the caller can render the
-      delta; the chunk is owned and dropped right after (`hrdr-agent`
-      `turn_loop` `drain_stream`). The matching reasoning clone lives in the
-      caller (`turn_loop.rs` `on_event(AgentEvent::Reasoning(r.clone()))` per
-      thinking token; `types.rs` then `push_str`s the same text again). ~2
-      removable allocations per token on the hottest loop in the crate; a
-      10K-token turn is 10–20K fewer allocs. Fix: `push(chunk: ChatChunk) ->
-      Result<Option<String>, …
-      > ` taking the delta by value (`std::mem::take`), caller moves the chunk in; the reasoning case extracts `reasoning_content.take()`before push.`push`is`pub`,
-      > but the only production caller is that one site.
 19. **Declined 2026-10-14 — catalog cross-provider re-scan every request**
     (`hrdr-llm/src/catalog.rs`, `input_modalities_cached` / `max_output_cached`
     with `provider=None`). Each scan is one map lookup per provider (207
@@ -3696,28 +3684,23 @@ Ranked by impact, biggest first:
    on every tool round"); save still whole-body `write_atomic`
    (`session.rs:880`). TUI coalesces; each landed save is still O(history). Open
    — the delta-journal fix from 08-30 stands.
-3. **HIGH (re-confirmed, 08-30 #18) — per-token String clones on the
-   streamed-delta path.** `Accumulator::push(&chunk)` still clones
-   `choice.delta.content` at `crates/hrdr-llm/src/types.rs:961` (returned only
-   so `drain_stream` can render it), and the caller re-clones the reasoning
-   delta per thinking token (`crates/hrdr-agent/src/turn_loop.rs:225`). ~2
-   removable allocations per token on the hottest loop in the crate. Open.
-4. **MEDIUM-HIGH (partially fixed, 08-30 #3/#4) — streamed content re-renders
+3. **MEDIUM-HIGH (partially fixed, 08-30 #3/#4) — streamed content re-renders
    its body on every delta.** Streaming assistant, reasoning, and tool content
    changes `content_hash` on each delta, so the TUI reparses and re-wraps the
    growing body each time. Running tools now keep unchanged static rows across
    spinner-only ticks, measured by `tool_lines` invocation count rather than
    wall time; per-delta coalescing or incremental rendering remains open.
-5. **MEDIUM — unchanged frames still materialize every assembled block.**
+4. **MEDIUM — unchanged frames still materialize every assembled block.**
    `materialize_transcript` walks all finalized blocks, clones each descriptor
    and shared row pointer, and rebuilds chunks and message positions every
    frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
    static materialized prefix while resolving dynamic header, reasoning, and
    tool-group bodies per frame. Open.
-6. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
-   commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
-   (#16 no-usage re-estimate — held open by decision) or the hrdr-tools dispatch
-   (#17 args clone). Presumed open-by-construction.
+5. **08-30 #12/#13/#16/#17 (LOW), settled 2026-10-14.** #12 (`replace`'s literal
+   path counts matches before replacing) is declined: the count is what bounds
+   the output size before the replacement allocates. #13 shipped (`memory.rs`
+   `Lowered`). #16 stays held by decision. #17's original entry (a dispatch args
+   clone) no longer exists to re-check; re-measure before acting on it.
 
 **Checked, not findings (new code since 08-30):**
 

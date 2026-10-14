@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`hrdr_llm::Accumulator::absorb`** merges a stream chunk like `push` without
+  copying its text delta back out, for a caller that owns the chunk and can move
+  the delta itself. hrdr's own turn loop now uses it, saving two allocations per
+  streamed token (`crates/hrdr-llm`, `crates/hrdr-agent`).
 - **A TODO item can wait on a running watch.** The `todo` tool accepts
   `waits_on: <watch id>` on a pending or in-progress item and rejects a link to
   anything but a running watch. While the watch runs, the turn-end nudge leaves

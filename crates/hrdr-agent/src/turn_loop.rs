@@ -218,17 +218,20 @@ pub(crate) async fn drain_stream<F: FnMut(AgentEvent)>(
         // and tool-call fragments; only the *event* is suppressed. Its error
         // (the accumulated reply past the byte budget) ends the stream exactly
         // like the SSE-overflow error would.
-        if let Some(choice) = chunk.choices.first()
-            && let Some(r) = &choice.delta.reasoning_content
-            && !r.is_empty()
-        {
-            on_event(AgentEvent::Reasoning(r.clone()));
-        }
-        let delta = acc.push(&chunk)?;
-        if let Some(text) = delta
-            && !text.is_empty()
-        {
-            on_event(AgentEvent::Text(text));
+        acc.absorb(&chunk)?;
+        // The chunk is ours: its deltas move into the events rather than being
+        // copied once more per token. Reasoning first, as it streams first.
+        if let Some(choice) = chunk.choices.into_iter().next() {
+            if let Some(reasoning) = choice.delta.reasoning_content
+                && !reasoning.is_empty()
+            {
+                on_event(AgentEvent::Reasoning(reasoning));
+            }
+            if let Some(text) = choice.delta.content
+                && !text.is_empty()
+            {
+                on_event(AgentEvent::Text(text));
+            }
         }
     }
     Ok(Drained {

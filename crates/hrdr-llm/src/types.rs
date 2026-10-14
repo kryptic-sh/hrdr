@@ -879,10 +879,23 @@ impl Accumulator {
     }
 
     /// Merge one chunk. Returns the freshly-appended text delta (for live
-    /// rendering), if any. Errors once the accumulated reply exceeds the byte
-    /// budget — a flooding endpoint must not grow memory for the whole request
-    /// timeout (mirrors the SSE-overflow handling).
+    /// rendering), if any — a copy; a caller that owns the chunk can
+    /// [`absorb`](Self::absorb) it and move the delta out instead. Errors once
+    /// the accumulated reply exceeds the byte budget — a flooding endpoint must
+    /// not grow memory for the whole request timeout (mirrors the SSE-overflow
+    /// handling).
     pub fn push(&mut self, chunk: &ChatChunk) -> Result<Option<String>, ChatError> {
+        self.absorb(chunk)?;
+        Ok(chunk
+            .choices
+            .first()
+            .and_then(|choice| choice.delta.content.clone()))
+    }
+
+    /// [`push`](Self::push) without handing the text delta back: for the
+    /// streaming loop, which owns each chunk and moves the delta out of it
+    /// rather than paying a copy per token.
+    pub fn absorb(&mut self, chunk: &ChatChunk) -> Result<(), ChatError> {
         // The usage chunk arrives with empty `choices`, so capture it before
         // the early return below.
         if let Some(new) = &chunk.usage {
@@ -941,7 +954,7 @@ impl Accumulator {
             return Err(stream_overflow_error());
         }
         let Some(choice) = chunk.choices.first() else {
-            return Ok(None);
+            return Ok(());
         };
         if let Some(fr) = &choice.finish_reason {
             self.finish_reason = Some(fr.clone());
@@ -987,15 +1000,14 @@ impl Accumulator {
                 }
             }
         }
-        let delta = choice.delta.content.clone();
-        if let Some(text) = &delta {
+        if let Some(text) = &choice.delta.content {
             self.bytes += text.len();
             self.content.push_str(text);
         }
         if self.bytes > self.budget {
             return Err(stream_overflow_error());
         }
-        Ok(delta)
+        Ok(())
     }
 
     /// A rough token count for the tool calls streamed so far — the same
