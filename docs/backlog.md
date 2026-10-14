@@ -227,23 +227,18 @@ push each verified slice to `main` before proceeding to the next slice.
    so queued messages are delivered before the handoff rather than lost. It
    becomes necessary once the contract is broadened to hand off with work
    outstanding.
-9. **Windows multiline paste — fix on `wip/windows-paste-transport-rebased`,
-   pending CI.** crossterm's Windows backend reads console input records, never
-   enables `ENABLE_VIRTUAL_TERMINAL_INPUT` and never yields `Event::Paste`, so
-   each newline of a paste submitted. The owner chose (2026-10-15) a fix for
-   modern hosts only: `hrdr-tui`'s `vt_input` enables VT input and parses it
-   with crossterm 0.29.0's unix parser, vendored, when the console host is
-   `OpenConsole.exe` (found with `NtQueryInformationProcess` class 49 — under
-   ConPTY the console window belongs to the client, not the host); the inbox
-   `conhost.exe`, which loses prefixes of fragmented sequences, keeps
-   crossterm's reader. Verified natively on Windows: with Microsoft's
-   `Microsoft.Windows.Console.ConPTY` 1.25.260930003 side-loaded
-   (`scripts/pin-conpty.ps1`, pinned by SHA-256) all pty tests pass, the paste
-   regressions included; with the inbox host only those four fail, as before.
-   CI's Windows jobs pin that host, so every Windows pty test now runs the VT
-   reader — crossterm's reader no longer has pty coverage on Windows CI. Not
-   verified: typing in a real Windows Terminal or classic console window by
-   hand. Merge to `main` once the branch passes the CI matrix.
+9. **Windows multiline paste — shipped 2026-10-15 (`58b2c631`); gaps left.** Not
+   verified by hand: pasting and typing in a real Windows Terminal and in a
+   classic console window (the pty tests run under ConPTY only). CI's Windows
+   jobs pin Microsoft's ConPTY host (`scripts/pin-conpty.ps1`), so crossterm's
+   Windows reader — still used under the inbox `conhost.exe` — no longer has pty
+   coverage there. The release `Package` steps name archives after the ref, so a
+   `workflow_dispatch` run on a branch whose name holds `/` fails them
+   (`hrdr-wip/…tar.gz`: no such directory); main and tags are unaffected. The
+   superseded branches `wip/windows-paste-transport` (the original probes) and
+   `wip/windows-paste-transport-rebased` / `wip/windows-paste-vt-input` (this
+   work, now in `main`) can be deleted — the first only on the owner's word,
+   since it predates this session.
 10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
