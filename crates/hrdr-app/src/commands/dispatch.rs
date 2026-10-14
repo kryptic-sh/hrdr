@@ -278,7 +278,7 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 ));
                 return true;
             }
-            let new = new.canonicalize().unwrap_or(new);
+            let new = hrdr_tools::canonical_cwd(&new).unwrap_or(new);
             // Trust is answered per directory, when hrdr opens in one, and it
             // cannot be asked again here: the TUI owns the terminal by now, and
             // the question is a security decision that must not be reduced to a
@@ -937,12 +937,12 @@ mod tests {
             ));
             assert!(host.info_log.last().unwrap().starts_with(&format!(
                 "not a trusted directory: {} —",
-                hrdr_tools::display_path(&untrusted.canonicalize().unwrap(), style)
+                hrdr_tools::display_path(&hrdr_tools::canonical_cwd(&untrusted).unwrap(), style)
             )));
             assert_eq!(host.cwd, here);
             hrdr_agent::trust::trust(&target, style).unwrap();
             assert!(dispatch(&mut host, &format!("/cwd {}", target.display())));
-            let raw = target.canonicalize().unwrap();
+            let raw = hrdr_tools::canonical_cwd(&target).unwrap();
             assert_eq!(
                 host.info_log.last().unwrap(),
                 &format!("cwd → {}", hrdr_tools::display_path(&raw, style))

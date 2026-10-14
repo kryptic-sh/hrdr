@@ -179,6 +179,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **On Windows, `/cwd` records a directory the way hrdr sees it at startup.** It
+  stored the `\\?\C:\…` spelling that canonicalizing produces, while a process
+  started in that directory reports `C:\…`; sessions are filed by that string,
+  so an update's recovery after a `/cwd` looked in a different session directory
+  and could not resume. The plain spelling is now used whenever it names the
+  same directory (`crates/hrdr-tools`, `crates/hrdr-app`).
 - **A shell command killed by its timeout keeps the line it was still
   printing.** The partial output on a timed-out `shell` call dropped a line the
   command had not finished and anything still in its pipes. The killed tree's

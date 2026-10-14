@@ -842,6 +842,42 @@ fn canonicalize_nearest_bounded(path: &std::path::Path, budget: usize) -> PathBu
     }
 }
 
+/// `path` canonicalized and spelled the way a process sees its own working
+/// directory. On Windows that drops the `\\?\` prefix `canonicalize` adds,
+/// whenever the plain drive spelling names the same directory: a process
+/// started there reports the plain one, and sessions are filed by the cwd
+/// string, so a session saved under the verbatim spelling is not found from
+/// it. Elsewhere `canonicalize` has no second spelling to choose between.
+pub fn canonical_cwd(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let canonical = path.canonicalize()?;
+    Ok(plain_spelling(&canonical).unwrap_or(canonical))
+}
+
+#[cfg(windows)]
+fn plain_spelling(canonical: &std::path::Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    let mut components = canonical.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return None;
+    };
+    let Prefix::VerbatimDisk(drive) = prefix.kind() else {
+        return None;
+    };
+    let rest: PathBuf = components
+        .filter(|component| !matches!(component, Component::RootDir))
+        .collect();
+    let plain = PathBuf::from(format!("{}:\\", char::from(drive))).join(rest);
+    // A path past MAX_PATH, or a component Win32 would rewrite (a trailing dot
+    // or space), only resolves in its verbatim form; keep that one.
+    (plain.canonicalize().ok()? == canonical).then_some(plain)
+}
+
+#[cfg(not(windows))]
+fn plain_spelling(_canonical: &std::path::Path) -> Option<PathBuf> {
+    None
+}
+
 /// Prove `file` is still the object `path` names, closing the TOCTOU window
 /// between opening a file and validating where its path points.
 ///
@@ -4002,6 +4038,33 @@ b:2:y"
         // Returns *some* path — the point is it doesn't hang.
         let canon = canonicalize_nearest(&link);
         assert!(!canon.as_os_str().is_empty());
+    }
+
+    /// The directory `/cwd` records is spelled the way a process started there
+    /// reports its own cwd — how a relaunched or recovered session finds the
+    /// session it was saved as.
+    #[test]
+    fn canonical_cwd_is_the_spelling_a_process_started_there_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let recorded = canonical_cwd(&nested).unwrap();
+
+        let mut probe = if cfg!(windows) {
+            let mut probe = std::process::Command::new("cmd");
+            probe.args(["/d", "/c", "cd"]);
+            probe
+        } else {
+            let mut probe = std::process::Command::new("sh");
+            probe.args(["-c", "pwd -P"]);
+            probe
+        };
+        let output = probe.current_dir(&recorded).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            recorded.to_string_lossy()
+        );
     }
 
     // ---- validate_attach_path ----
