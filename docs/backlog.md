@@ -1724,6 +1724,14 @@ are `#[cfg]`- gated and were not compiled.
 
 Not bugs; things whose surprise is worth having written down.
 
+- **A worktree sharing `CARGO_TARGET_DIR` leaves stale guard binaries.**
+  `hrdr-test-support`'s `workspace_root` is `env!("CARGO_MANIFEST_DIR")`, baked
+  in at compile time, and cargo fingerprints path crates by workspace-relative
+  path — so a test binary built from a second worktree is reused, unchanged, by
+  the main checkout, and the repo-guard tests (`duration_constant_names`,
+  `every_test_binary_is_sandboxed`) look for the other worktree's manifest. Once
+  that worktree is removed they fail with "the root manifest is readable:
+  NotFound". Seen 2026-10-15; `cargo clean -p hrdr-test-support` clears it.
 - **A panicking tool now waits for its batch siblings before the turn ends.**
   Since the tool-batch dispatch change (2026-08-04, `run_tool_batch` spawns each
   call as its own task and resumes the panic after `join_all`), a panicking
@@ -3089,15 +3097,8 @@ recent commits. GAP: not line-by-line — the bulk of `hrdr-tools/src/tools/*` a
 read-only sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm +
 hrdr-tools + hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced
 at its cited lines by the sweep lead. **Status: findings 1, 3 and 4 shipped
-2026-08-28 and are removed here; 2 and 5 remain, with the deliberate-tradeoff
-revisit — see the note after the coverage section.**
-
-3. **SSE decoder drops its line-buffer capacity on every line.**
-   `hrdr-llm/src/sse.rs:141` does `std::mem::take(&mut self.line_buf)`, leaving
-   a zero-capacity `Vec` that the next line grows byte-by-byte (1→2→4→…) — once
-   per SSE line (≈ per token) on every streamed response. Fix: preserve capacity
-   — decode with a scoped `from_utf8_lossy` borrow, then hand the buffer back
-   with `raw.clear(); self.line_buf = raw;`. Micro; low priority.
+2026-08-28, 5 on 2026-10-15; 2 is disposed below, and the deliberate-tradeoff
+revisit remains — see the note after the coverage section.**
 
 **Deliberate tradeoff, not changed (revisit):** attachment base64 is re-encoded
 every round (`hrdr-llm/src/media.rs:788-790`, `STANDARD.encode(&self.bytes)` per
@@ -3132,9 +3133,10 @@ saves the inner-`Vec` allocations", but that held for the proposed `Arc` return,
 not for lending: since 2026-10-14 `highlight_each` lends the cached lines, so a
 streaming frame copies each span string once (into its `Span`) instead of twice.
 The per-frame full re-render remains the tracked transcript-render-walk gap.
-Finding 5 (SSE line-buffer capacity) is left unapplied: self-labelled micro, and
-preserving the buffer means a method extraction on the correctness-critical
-decoder for a win dwarfed by the round trip.
+Finding 5 (SSE line-buffer capacity) was first left unapplied as micro, then
+shipped 2026-10-15 since the item still read as open: `flush_line` hands the
+buffer back with its capacity and the field logic moved, unchanged, into
+`take_line`.
 
 ---
 

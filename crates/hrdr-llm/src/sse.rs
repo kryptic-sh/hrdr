@@ -147,11 +147,21 @@ impl SseDecoder {
         // `line_buf` produced by splitting on `\n` is a complete sequence of
         // UTF-8 codepoints — UTF-8 decoding is safe even if the *original*
         // chunk boundary split a codepoint mid-byte.
-        let raw = std::mem::take(&mut self.line_buf);
+        let mut raw = std::mem::take(&mut self.line_buf);
         let decoded = String::from_utf8_lossy(&raw);
         // Strip a trailing CR so CRLF (\r\n) line endings work transparently.
-        let line = decoded.strip_suffix('\r').unwrap_or(&decoded);
+        self.take_line(decoded.strip_suffix('\r').unwrap_or(&decoded));
+        drop(decoded);
+        // Hand the buffer back with its capacity, so the next line does not
+        // regrow it from nothing — a line arrives per streamed token. The
+        // decoder lives for one stream, and `push` caps what it can hold.
+        raw.clear();
+        self.line_buf = raw;
+    }
 
+    /// Classify one decoded line: on a blank line emit any complete pending
+    /// event to the ready queue, otherwise fold in its `data:` or `event:`.
+    fn take_line(&mut self, line: &str) {
         if line.is_empty() {
             // Blank line = event terminator.  Emit only when at least one
             // `data:` line was seen (suppress comment-only or `event:`-only
@@ -553,6 +563,25 @@ mod tests {
         dec.push(b"data: x\n\n").unwrap();
         assert_eq!(dec.drain().len(), 1);
         assert!(dec.finish().unwrap().is_empty());
+    }
+
+    /// A flushed line hands its buffer back with the capacity it grew, so the
+    /// next line of a stream reuses it rather than regrowing from empty.
+    #[test]
+    fn line_buffer_keeps_its_capacity_across_lines() {
+        let mut dec = SseDecoder::new();
+        let line = format!("data: {}\n", "x".repeat(200));
+        dec.push(line.as_bytes()).unwrap();
+        assert!(dec.line_buf.is_empty());
+        assert!(
+            dec.line_buf.capacity() >= 200,
+            "{}",
+            dec.line_buf.capacity()
+        );
+        dec.push(b"\ndata: next\n\n").unwrap();
+        let events = dec.drain();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].data, "next");
     }
 
     // ── unbounded-buffer DoS guard ────────────────────────────────────────────
