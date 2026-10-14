@@ -42,6 +42,8 @@ const MESSAGE_DEADLINE: Duration = DEADLINE.saturating_add(DIRECTORY_DEADLINE);
 struct State {
     descriptor: SessionDescriptor,
     open: bool,
+    /// The accept error that stopped the server, when one did rather than a close.
+    stopped_by: Option<String>,
     inbox: VecDeque<PeerMessage>,
     bytes: usize,
 }
@@ -86,6 +88,7 @@ impl Messaging {
             state: Mutex::new(State {
                 descriptor,
                 open: true,
+                stopped_by: None,
                 inbox: VecDeque::new(),
                 bytes: 0,
             }),
@@ -220,6 +223,14 @@ impl Messaging {
         self.shared.state.lock().unwrap().open
     }
 
+    /// Why the runtime stopped serving, when an accept error stopped it rather
+    /// than a close. A server that stops this way also leaves discovery — its
+    /// lease is released, so the next listing reaps its record — and nothing
+    /// else would say why the session became unreachable.
+    pub fn stopped_by(&self) -> Option<String> {
+        self.shared.state.lock().unwrap().stopped_by.clone()
+    }
+
     /// Resolve on the next arrival or close, without inspecting the inbox — for a
     /// consumer that dequeues elsewhere and only needs waking. An arrival with no
     /// waiter is kept for the next call, so none is lost between calls. Shares
@@ -291,7 +302,10 @@ async fn serve(
                         });
                     }
                     Err(error) if unavailable(&error) => {},
-                    Err(_) => break,
+                    Err(error) => {
+                        shared.state.lock().unwrap().stopped_by = Some(error.to_string());
+                        break;
+                    }
                 }
             }
         }

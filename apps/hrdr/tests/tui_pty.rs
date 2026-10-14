@@ -1084,7 +1084,9 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
     let bodies = server.chat_bodies();
     assert!(
         bodies[1].to_string().contains(&peer_id),
-        "the sessions tool listed the peer: {}",
+        "the sessions tool listed the peer (peer open: {}, stopped by: {:?}): {}",
+        peer.is_open(),
+        peer.stopped_by(),
         bodies[1]
     );
 
@@ -1095,7 +1097,9 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
         }
         assert!(
             start.elapsed() < EXIT,
-            "the peer never received the message"
+            "the peer never received the message (peer open: {}, stopped by: {:?})",
+            peer.is_open(),
+            peer.stopped_by()
         );
         std::thread::sleep(Duration::from_millis(50));
     };
