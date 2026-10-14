@@ -351,7 +351,10 @@ pub enum ProcessLiveness {
 
 /// Capture the current process identity.
 ///
-/// On Windows `created` is the `GetProcessTimes` creation FILETIME. Other
+/// `created` distinguishes this process from a later one that reuses its PID:
+/// on Windows the `GetProcessTimes` creation FILETIME; on Linux a digest of the
+/// boot id and the process's start time in ticks since boot (see
+/// [`unix_lease::start`]); on macOS the start time `proc_pidinfo` reports. Other
 /// platforms deliberately return no lease: a PID alone is not a safe owner
 /// identity after reuse.
 pub fn current_process_lease() -> Option<ProcessLease> {
@@ -376,7 +379,15 @@ pub fn current_process_lease() -> Option<ProcessLease> {
             created: u64::from(created.dwLowDateTime) | (u64::from(created.dwHighDateTime) << 32),
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let pid = std::process::id();
+        unix_lease::start(pid).ok().map(|start| ProcessLease {
+            pid,
+            created: start.created,
+        })
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         None
     }
@@ -445,10 +456,101 @@ pub fn process_lease_liveness(lease: ProcessLease) -> ProcessLiveness {
             ProcessLiveness::Replaced
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match unix_lease::start(lease.pid) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessLiveness::Dead,
+            Err(_) => ProcessLiveness::Unknown,
+            Ok(start) if start.created != lease.created => ProcessLiveness::Replaced,
+            // A zombie has exited: it holds nothing but its exit status.
+            Ok(start) if start.exited => ProcessLiveness::Dead,
+            Ok(_) => ProcessLiveness::Live,
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = lease;
         ProcessLiveness::Unknown
+    }
+}
+
+/// Process start identities on the unix platforms that expose one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_lease {
+    /// What [`start`] learns about a process.
+    pub(super) struct Start {
+        /// The lease's `created`: stable for the process's life and different
+        /// for any later process reusing the PID.
+        pub(super) created: u64,
+        /// The process has exited and only its zombie remains.
+        pub(super) exited: bool,
+    }
+
+    /// The start identity of `pid`; `NotFound` when no such process exists.
+    ///
+    /// Linux reports the start time in clock ticks since boot (`/proc/<pid>/stat`
+    /// field 22), unique only within one boot, so it is combined with the boot
+    /// id. `btime` would make it absolute, but it moves when the clock is
+    /// stepped, and a live process must never look replaced.
+    #[cfg(target_os = "linux")]
+    pub(super) fn start(pid: u32) -> std::io::Result<Start> {
+        let invalid =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed /proc stat");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        // The command name (field 2) is parenthesised and may itself hold spaces
+        // or parentheses, so the fixed fields resume after the last `)`: field 3
+        // (state) is the first there, field 22 (starttime) the twentieth.
+        let (_, rest) = stat.rsplit_once(')').ok_or_else(invalid)?;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let state = fields.first().ok_or_else(invalid)?;
+        let ticks: u64 = fields
+            .get(19)
+            .and_then(|field| field.parse().ok())
+            .ok_or_else(invalid)?;
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let digest = hrdr_llm::sha256_hex(format!("{}:{ticks}", boot_id.trim()).as_bytes());
+        let created = u64::from_str_radix(&digest[..16], 16).map_err(|_| invalid())?;
+        Ok(Start {
+            created,
+            exited: matches!(*state, "Z" | "X"),
+        })
+    }
+
+    /// macOS reports the start time as wall-clock seconds and microseconds,
+    /// fixed when the process starts.
+    #[cfg(target_os = "macos")]
+    pub(super) fn start(pid: u32) -> std::io::Result<Start> {
+        let pid = libc::c_int::try_from(pid)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .map_err(|_| std::io::Error::other("proc_bsdinfo size"))?;
+        // SAFETY: `info` is a valid, writable `proc_bsdinfo` of exactly `size`
+        // bytes, and `proc_pidinfo` writes at most `size` bytes into it.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+            )
+        };
+        if written != size {
+            let error = std::io::Error::last_os_error();
+            // Only ESRCH means the process is gone. Anything else — EPERM for
+            // another user's process above all — is a probe failure, and must
+            // never read as death.
+            return Err(if error.raw_os_error() == Some(libc::ESRCH) {
+                std::io::Error::from(std::io::ErrorKind::NotFound)
+            } else {
+                error
+            });
+        }
+        Ok(Start {
+            created: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+            exited: info.pbi_status == libc::SZOMB,
+        })
     }
 }
 
@@ -1263,22 +1365,57 @@ mod tests {
 
     #[test]
     fn process_lease_probe_is_conservative_when_unavailable() {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         {
             let lease = super::ProcessLease { pid: 1, created: 1 };
+            assert_eq!(super::current_process_lease(), None);
             assert_eq!(
                 super::process_lease_liveness(lease),
                 super::ProcessLiveness::Unknown
             );
         }
-        #[cfg(windows)]
-        {
-            let current = super::current_process_lease().unwrap();
-            assert_eq!(
-                super::process_lease_liveness(current),
-                super::ProcessLiveness::Live
-            );
-        }
+    }
+
+    /// Where the platform has a lease, this process's own reads as live, the
+    /// same PID with another start reads as replaced, and an exited, reaped
+    /// child reads as dead. Verified locally on Windows; Linux and macOS run on
+    /// CI.
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_lease_tells_live_replaced_and_dead_apart() {
+        let current = super::current_process_lease().expect("this platform has leases");
+        assert_eq!(current.pid, std::process::id());
+        assert_eq!(super::current_process_lease(), Some(current), "stable");
+        assert_eq!(
+            super::process_lease_liveness(current),
+            super::ProcessLiveness::Live
+        );
+        let other_start = super::ProcessLease {
+            created: current.created ^ 1,
+            ..current
+        };
+        assert_eq!(
+            super::process_lease_liveness(other_start),
+            super::ProcessLiveness::Replaced
+        );
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--list", "--exact", "no-such-test"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        // Reaped: the PID now names no process, unless the system has already
+        // handed it to another one — which must read as replaced, never live.
+        let liveness = super::process_lease_liveness(super::ProcessLease { pid, created: 1 });
+        assert!(
+            matches!(
+                liveness,
+                super::ProcessLiveness::Dead | super::ProcessLiveness::Replaced
+            ),
+            "{liveness:?}"
+        );
     }
 
     /// A running process reads as alive, and one that has exited and been reaped
