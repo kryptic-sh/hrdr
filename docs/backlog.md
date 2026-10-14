@@ -308,25 +308,25 @@ corresponding Unix failure branch has not been exercised. Blob lock and OAuth
 refresh persistence errors remain ignored, with native labels in those discarded
 errors.
 
-A local default-concurrency gate failed
-`tools::tests::bash_timeout_kills_process_and_keeps_partial_output`; all four
-workspace gate commands passed with `CARGO_BUILD_JOBS=1` and
-`NEXTEST_TEST_THREADS=4`, without assertion changes. Investigate concurrency
-sensitivity rather than claiming that default execution is reliably green.
-Additional runs during the session also reported intermittent
+Intermittent failures seen in runs during the messaging work and not
+root-caused:
 `transcript_log::tests::a_coalesced_transcript_folds_exactly_like_the_event_stream`
-(`took_ms` mismatch), watch-delivery timing, and session-save timing failures.
-These were not root-caused or fixed in the messaging slice.
+(`took_ms` mismatch), watch-delivery timing, and session-save timing.
 
-**Shell timeout follow-up:** Investigate intermittent missing-prefix failures in
+**Shell timeout tests, 2026-10-14.** The missing-prefix failures in
 `tools::shell::tests::a_timeout_fails_the_call_but_a_non_zero_exit_does_not` and
-`tools::tests::bash_timeout_kills_process_and_keeps_partial_output` under
-concurrent Windows test load. Earlier serialized and normal-concurrency runs
-passed unchanged, but the timeout failure recurred during final verification.
-Distinguish interpreter startup latency from output capture with deterministic
-readiness-based coverage; do not weaken the partial-output assertions. A
-read-only investigation also reported a possible post-kill output-drain gap in
-`ShellTool`; verify that separately before fixing.
+`tools::tests::bash_timeout_kills_process_and_keeps_partial_output` had two
+candidate causes. The post-kill drain gap was real and is fixed: a line the
+command had not finished was dropped with the read loop, which the new
+unfinished-line case shows deterministically (it fails without the drain). The
+1s deadline could also expire before Git Bash started under load; both tests now
+use `test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS`. Which cause produced the CI
+failures is unknown — neither was reproduced on demand. The PowerShell branch of
+the unfinished-line case has not run locally (`test_env::shell` picks Git Bash
+here). The same day, one full `hrdr-tools` run in WSL under load (a release
+build running beside it) failed
+`proc::tests::git_runner_deadline_covers_readers_after_the_leader_exits` on its
+`TimedOut` kind assertion; five isolated reruns passed. Not investigated.
 
 ## GitHub Actions setup-zig cache verification
 

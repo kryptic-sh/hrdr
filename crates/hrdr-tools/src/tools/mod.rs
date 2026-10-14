@@ -1363,7 +1363,10 @@ mod tests {
         c.enforce_timeout_floor = false;
         let out = ShellTool::new(shell)
             .execute(
-                serde_json::json!({"command": "echo early; sleep 30", "timeout_secs": 1}),
+                serde_json::json!({
+                    "command": "echo early; sleep 30",
+                    "timeout_secs": crate::test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS,
+                }),
                 &c,
             )
             .await

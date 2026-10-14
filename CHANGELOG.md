@@ -179,6 +179,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A shell command killed by its timeout keeps the line it was still
+  printing.** The partial output on a timed-out `shell` call dropped a line the
+  command had not finished and anything still in its pipes. The killed tree's
+  output is now drained, for a bounded time, before the timeout is reported
+  (`crates/hrdr-tools`).
 - **A store lock no longer times out a writer queued behind working ones.**
   Writers to `auth.json`, `config.toml` and the blob store waited about five
   seconds in total before giving up, so on a slow filesystem the last of many

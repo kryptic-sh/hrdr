@@ -42,6 +42,12 @@ pub(crate) fn python() -> Option<&'static str> {
     found
 }
 
+/// The `timeout_secs` the deadline tests give a command that prints and then
+/// sleeps. It must outlast the interpreter's startup — under Git Bash on Windows
+/// that takes seconds when the suite runs in parallel — or the output those
+/// tests check survives the kill was never written at all.
+pub(crate) const PRINT_THEN_SLEEP_TIMEOUT_SECS: u64 = 5;
+
 /// How long a test grandchild sleeps before it proves it is still alive.
 const GRANDCHILD_SECS: u64 = 2;
 

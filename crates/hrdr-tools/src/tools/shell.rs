@@ -627,6 +627,11 @@ impl Tool for ShellTool {
     }
 }
 
+/// How long a timed-out command's pipes are drained after its process tree is
+/// killed. The kill closes them, so this only bounds a descendant that escaped
+/// it and still holds them open.
+const KILLED_OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Read one line (through `\n`) from `reader` into `buf`, but never buffer more
 /// than `cap` bytes of it: once `buf` holds `cap` bytes the rest of an
 /// over-long line is consumed and discarded up to its newline. This is the
@@ -863,62 +868,75 @@ pub(crate) async fn run_streamed_command(
         }};
     }
 
-    // Read stdout + stderr concurrently; read_line_capped bounds each line at
-    // BASH_LINE_CAP as it reads, so a single newline-less run (minified source,
-    // `tr '\0' a </dev/zero`) is cut instead of buffered whole and OOMing.
-    let collect = async {
-        let mut out_done = false;
-        let mut err_done = false;
-        let mut out_buf = Vec::<u8>::new();
-        let mut err_buf = Vec::<u8>::new();
-        let mut out_over = false;
-        let mut err_over = false;
-        loop {
-            tokio::select! {
-                n = read_line_capped(&mut out_reader, &mut out_buf, &mut out_over, BASH_LINE_CAP), if !out_done => {
-                    match n? {
-                        0 => out_done = true,
-                        _ => {
-                            // The buffer is already capped at BASH_LINE_CAP; strip
-                            // any trailing newline / carriage-return.
-                            if out_buf.last() == Some(&b'\n') { out_buf.pop(); }
-                            if out_buf.last() == Some(&b'\r') { out_buf.pop(); }
-                            let capped_len = out_buf.len().min(BASH_LINE_CAP);
-                            let mut line = String::from_utf8_lossy(&out_buf[..capped_len]).into_owned();
-                            if !keep_ansi && crate::ansi::needs_clean(&line) {
-                                line = crate::ansi::clean(&line).into_owned();
-                            }
-                            // Counted after cleaning: the caps, the spool note and
-                            // the grep-tail check are all about what the model sees.
-                            line.push('\n');
-                            stdout_bytes += line.len();
-                            ingest_line!(line);
-                            out_buf.clear();
-                            out_over = false;
-                        }
-                    }
-                }
-                n = read_line_capped(&mut err_reader, &mut err_buf, &mut err_over, BASH_LINE_CAP), if !err_done => {
-                    match n? {
-                        0 => err_done = true,
-                        _ => {
-                            if err_buf.last() == Some(&b'\n') { err_buf.pop(); }
-                            if err_buf.last() == Some(&b'\r') { err_buf.pop(); }
-                            let capped_len = err_buf.len().min(BASH_LINE_CAP);
-                            let mut line = String::from_utf8_lossy(&err_buf[..capped_len]).into_owned();
-                            if !keep_ansi && crate::ansi::needs_clean(&line) {
-                                line = crate::ansi::clean(&line).into_owned();
-                            }
-                            line.push('\n');
-                            ingest_line!(line);
-                            err_buf.clear();
-                            err_over = false;
-                        }
-                    }
-                }
-                else => break,
+    // Per-stream line state lives outside the read loop, so a deadline that
+    // cuts the loop short can still drain what the killed command wrote.
+    let mut out_done = false;
+    let mut err_done = false;
+    let mut out_buf = Vec::<u8>::new();
+    let mut err_buf = Vec::<u8>::new();
+    let mut out_over = false;
+    let mut err_over = false;
+
+    // Ingest the line read into `$buf`: it is already capped at BASH_LINE_CAP;
+    // strip any trailing newline / carriage-return. Stdout's bytes are counted
+    // after cleaning: the caps, the spool note and the grep-tail check are all
+    // about what the model sees.
+    macro_rules! take_line {
+        ($buf:ident, $stdout:expr) => {{
+            if $buf.last() == Some(&b'\n') {
+                $buf.pop();
             }
-        }
+            if $buf.last() == Some(&b'\r') {
+                $buf.pop();
+            }
+            let capped_len = $buf.len().min(BASH_LINE_CAP);
+            let mut line = String::from_utf8_lossy(&$buf[..capped_len]).into_owned();
+            if !keep_ansi && crate::ansi::needs_clean(&line) {
+                line = crate::ansi::clean(&line).into_owned();
+            }
+            line.push('\n');
+            if $stdout {
+                stdout_bytes += line.len();
+            }
+            ingest_line!(line);
+            $buf.clear();
+        }};
+    }
+
+    // Read stdout + stderr concurrently to EOF; read_line_capped bounds each
+    // line at BASH_LINE_CAP as it reads, so a single newline-less run (minified
+    // source, `tr '\0' a </dev/zero`) is cut instead of buffered whole and
+    // OOMing. At EOF it hands back a newline-less tail as a line of its own.
+    macro_rules! read_to_eof {
+        () => {
+            loop {
+                tokio::select! {
+                    n = read_line_capped(&mut out_reader, &mut out_buf, &mut out_over, BASH_LINE_CAP), if !out_done => {
+                        match n? {
+                            0 => out_done = true,
+                            _ => {
+                                take_line!(out_buf, true);
+                                out_over = false;
+                            }
+                        }
+                    }
+                    n = read_line_capped(&mut err_reader, &mut err_buf, &mut err_over, BASH_LINE_CAP), if !err_done => {
+                        match n? {
+                            0 => err_done = true,
+                            _ => {
+                                take_line!(err_buf, false);
+                                err_over = false;
+                            }
+                        }
+                    }
+                    else => break,
+                }
+            }
+        };
+    }
+
+    let collect = async {
+        read_to_eof!();
         let status = child.wait().await.context("waiting on command")?;
         anyhow::Ok(status)
     };
@@ -932,6 +950,31 @@ pub(crate) async fn run_streamed_command(
             // reaps `bash` — `node` would keep holding its port forever.
             group.kill();
             let _ = child.kill().await;
+            // What the command wrote before it died is still in the pipes, and a
+            // line it had not finished is in its buffer: both are the partial
+            // output the model needs to avoid re-running the command. The dead
+            // tree closes the pipes, so this reaches EOF at once — unless a
+            // descendant escaped the kill holding them, hence the bound.
+            let drain = async {
+                read_to_eof!();
+                anyhow::Ok(())
+            };
+            match tokio::time::timeout(KILLED_OUTPUT_DRAIN, drain).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    ingest_line!(format!(
+                        "[output after the kill could not be read: {error}]\n"
+                    ));
+                }
+                Err(_) => {
+                    if !out_buf.is_empty() {
+                        take_line!(out_buf, true);
+                    }
+                    if !err_buf.is_empty() {
+                        take_line!(err_buf, false);
+                    }
+                }
+            }
             let mut msg = format!(
                 "[command timed out after {}s; process killed — raise timeout_secs or \
                  run a narrower command]",
@@ -1902,15 +1945,46 @@ mod tests {
             Shell::Bash | Shell::Posix => "echo starting; sleep 30",
             Shell::PowerShell => "Write-Output starting; Start-Sleep -Seconds 30",
         };
+        let deadline = test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS;
         let err = ShellTool::new(shell)
-            .execute(json!({"command": timeout_cmd, "timeout_secs": 1}), &ctx)
+            .execute(
+                json!({"command": timeout_cmd, "timeout_secs": deadline}),
+                &ctx,
+            )
             .await
             .expect_err("a killed command is not a successful one");
         let msg = err.to_string();
-        assert!(msg.contains("timed out after 1s"), "{msg}");
+        assert!(
+            msg.contains(&format!("timed out after {deadline}s")),
+            "{msg}"
+        );
         assert!(
             msg.contains("starting"),
             "partial output must survive: {msg}"
+        );
+
+        // A line the command had not finished is partial output too: it was read
+        // into the line buffer but not yet ingested when the deadline fired. The
+        // marker is assembled at run time, so only the command's own write can
+        // put it in the result.
+        let unfinished_cmd = match shell {
+            Shell::Bash | Shell::Posix => "printf 'unfinished-%s' line; sleep 30",
+            Shell::PowerShell => {
+                "[Console]::Out.Write('unfinished-' + 'line'); [Console]::Out.Flush(); \
+                 Start-Sleep -Seconds 30"
+            }
+        };
+        let err = ShellTool::new(shell)
+            .execute(
+                json!({"command": unfinished_cmd, "timeout_secs": deadline}),
+                &ctx,
+            )
+            .await
+            .expect_err("a killed command is not a successful one");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unfinished-line"),
+            "an unfinished line must survive the kill: {msg}"
         );
 
         // Ran to completion and said no: still Ok. The command answered, and the
