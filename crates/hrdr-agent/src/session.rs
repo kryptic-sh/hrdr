@@ -79,13 +79,13 @@ pub struct SessionState {
     /// The run this state records was scoped to the read-only tool set
     /// ([`AgentConfig::read_only`](crate::AgentConfig::read_only)) — an
     /// `explore`/`review`/`plan`-style sub-agent. Persisted because capability is
-    /// part of *what this run was*: `task_revive` restores it so a revived run is
-    /// pruned to the same tool set instead of coming back write-capable.
+    /// part of *what this run was*, and a record that dropped it would describe a
+    /// read-only run as write-capable. (It was written for `task_revive`, which is
+    /// gone; nothing restores a run from it today.)
     ///
     /// A snapshot written before the field existed has no key → `false` →
     /// write-capable. That is the truth for the main session and for every write
-    /// sub-agent (the runs revive exists for); the price is that a read-only run
-    /// persisted earlier still revives write-capable, exactly as it did before.
+    /// sub-agent; a read-only run persisted earlier reads as write-capable.
     #[serde(default)]
     pub read_only: bool,
     /// The session's file id (stem). Derived from the filename, not stored in it.
@@ -2324,8 +2324,8 @@ mod tests {
 
     /// `save_to_path` writes to an explicit file (creating parent dirs) and the
     /// state round-trips back through `load_path` — the sub-agent snapshot
-    /// primitive. It carries **messages + metadata** (the model context a
-    /// `task_revive` relaunch needs); the sub-agent's *transcript* is its own
+    /// primitive. It carries **messages + metadata** (the model context, which
+    /// the jsonl cannot reconstruct); the sub-agent's *transcript* is its own
     /// sibling jsonl, not this snapshot, so it is deliberately absent here.
     #[test]
     fn save_to_path_round_trips_through_load_path() {

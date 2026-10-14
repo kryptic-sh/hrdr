@@ -1462,13 +1462,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   staleness plus the usage-tracking half recorded above. The external-drift half
   shipped 2026-08-05 (`5bc2e5d`) — see the memory item in
   [Permissions, isolation, and state](#permissions-isolation-and-state).
-- **Profile-faithful revive** — the residual the above left. Only _capability_
-  is persisted, not the profile: a revived run does not get its original persona
-  (`agent_prompt`) or explicit `tools:` allow-list back, because neither was
-  ever persisted. Restoring them means persisting the profile name and
-  re-resolving it at revive time, which is a larger change than the capability
-  fix and a question about what "revive" means — the same run, or the same
-  _agent_. **Needs a call.**
 - **Command follow-ups** (the feature shipped 2026-07-27 as "skills" and was
   renamed 2026-08-09 — `hrdr-agent/src/commands.rs` plus
   `prompt::commands_section`). Left out on purpose: no `command` usage signal

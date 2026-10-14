@@ -929,9 +929,9 @@ pub struct Agent {
     /// session-scoped feature — see [`AgentConfig::delegated`].
     delegated: bool,
     /// This agent's tool set was pruned to the read-only one
-    /// ([`AgentConfig::read_only`]). Kept so whoever persists or rebuilds this
-    /// agent — `task_revive`, through the sub-agent snapshot — can restore the
-    /// same scope instead of assuming write capability.
+    /// ([`AgentConfig::read_only`]). Kept so whatever persists this agent — the
+    /// sub-agent snapshot — records the scope it actually ran with instead of
+    /// assuming write capability.
     read_only: bool,
     /// The explicit tool allow-list, if this agent was constructed with one.
     allowed_tools: Option<Vec<String>>,
