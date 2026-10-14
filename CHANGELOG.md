@@ -193,6 +193,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`rustls` updated to 0.23.46** for RUSTSEC-2026-0346 (client session `Debug`
+  output exposed TLS secrets), RUSTSEC-2026-0347 (ECH rejection sent buffered
+  data to the outer server), RUSTSEC-2026-0348 (Brotli certificate decompression
+  could allocate 1 GiB before authentication) and RUSTSEC-2026-0349 (an
+  unauthenticated ServerHello could downgrade later key exchange). hrdr's HTTPS
+  goes through it.
 - **`grep` no longer loads a huge file whole.** A file over the read tool's size
   cap is skipped and named in the result, with a pointer to `rg` through
   `shell`, instead of being read into memory — so a multi-gigabyte log can no
