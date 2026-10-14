@@ -2,7 +2,7 @@
 //! results). `search` uses a zero-config DuckDuckGo HTML backend by default,
 //! or a SearXNG instance when `SEARXNG_URL` is set (a JSON API — more robust).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -624,14 +624,36 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_ipv4(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_blocked_ipv4(mapped);
+            if let Some(embedded) = embedded_ipv4(v6)
+                && is_blocked_ipv4(embedded)
+            {
+                return true;
             }
             v6.is_loopback() // ::1
                 || v6.is_unspecified() // ::, which a connect() lands on localhost
                 || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 (unique local)
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 (link-local)
         }
+    }
+}
+
+/// The IPv4 address an IPv6 one carries, in each form that reaches it: mapped
+/// `::ffff:a.b.c.d` and the deprecated compatible `::a.b.c.d` (RFC 4291 2.5.5),
+/// NAT64's well-known `64:ff9b::/96` (RFC 6052), and 6to4's `2002:AABB:CCDD::/48`
+/// (RFC 3056). Spelling an internal v4 address in any of them must not slip past
+/// the v4 checks.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let [a, b, c, d, e, f, g, h] = v6.segments();
+    let from = |high: u16, low: u16| {
+        let [w, x] = high.to_be_bytes();
+        let [y, z] = low.to_be_bytes();
+        Ipv4Addr::new(w, x, y, z)
+    };
+    match [a, b, c, d, e, f] {
+        [0, 0, 0, 0, 0, 0xffff] | [0, 0, 0, 0, 0, 0] => Some(from(g, h)),
+        [0x64, 0xff9b, 0, 0, 0, 0] => Some(from(g, h)),
+        [0x2002, ..] => Some(from(b, c)),
+        _ => None,
     }
 }
 
@@ -976,6 +998,30 @@ mod tests {
         assert!(!is_blocked_ip("100.128.0.1".parse().unwrap())); // just past the /10
         assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_blocked_ip("2001:4860:4860::8888".parse().unwrap())); // public v6
+    }
+
+    /// An internal IPv4 address spelled inside an IPv6 literal is still
+    /// internal: compatible, NAT64 and 6to4 forms are blocked like the mapped
+    /// one, and the same forms of a public address are not.
+    #[test]
+    fn is_blocked_ip_sees_ipv4_embedded_in_ipv6() {
+        for blocked in [
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe", // 169.254.169.254
+            "2002:7f00:1::",
+            "2002:c0a8:101::1", // 192.168.1.1
+        ] {
+            assert!(is_blocked_ip(blocked.parse().unwrap()), "{blocked}");
+            assert!(
+                is_blocked_host(&format!("http://[{blocked}]/x")),
+                "{blocked}"
+            );
+        }
+        for public in ["::8.8.8.8", "64:ff9b::808:808", "2002:808:808::1"] {
+            assert!(!is_blocked_ip(public.parse().unwrap()), "{public}");
+        }
     }
 
     /// The connect-time resolver drops internal addresses and fails closed when

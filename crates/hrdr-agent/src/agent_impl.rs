@@ -688,9 +688,20 @@ impl Agent {
             };
             match connected {
                 Ok((client, tools)) => {
-                    let n = tools.len();
+                    // Exposed names are sanitized and namespaced, so two
+                    // different tools can land on one (`fs/read` and `fs_read`,
+                    // or server `a_b`'s `c` and server `a`'s `b_c`), or on a
+                    // built-in. The first keeps the name; the rest are refused
+                    // aloud rather than replacing it.
+                    let mut n = 0;
+                    let mut refused = Vec::new();
                     for t in tools {
-                        self.tools.register(t);
+                        let name = t.name();
+                        if self.tools.register_new(t) {
+                            n += 1;
+                        } else {
+                            refused.push(format!("`{name}`"));
+                        }
                     }
                     self.mcp_clients.push(client);
                     notices.push(format!(
@@ -698,6 +709,13 @@ impl Agent {
                         cfg.name,
                         if n == 1 { "" } else { "s" }
                     ));
+                    if !refused.is_empty() {
+                        notices.push(format!(
+                            "MCP '{}': skipped {} — the name is already taken by another tool",
+                            cfg.name,
+                            refused.join(", ")
+                        ));
+                    }
                 }
                 Err(e) => notices.push(format!("MCP '{}' failed: {e}", cfg.name)),
             }

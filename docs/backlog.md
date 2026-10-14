@@ -1846,10 +1846,6 @@ overrides it). Residual, recorded as hardening below.
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
   then `atomic_write` re-opens the path (`mutation.rs:150-153`); a symlink swap
   between the two could redirect a write. Same-user, no privilege boundary.
-- `is_blocked_ip` still has no arm for the IPv4-compatible (`::127.0.0.1`),
-  NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) forms of an internal address —
-  the same class as the unspecified `::` that was closed, and each reachable by
-  spelling a loopback or private v4 address inside a v6 literal.
 - The secret-line filter's `-`-delimited token parse
   (`SecretLineMemo::is_secret_line` → `line_path_token` in `hrdr-tools`) takes
   the first `sep<digits>sep` run, so it can mis-attribute a line to a wrong path
@@ -3182,13 +3178,10 @@ session/transcript 100 MiB caps; untrusted-content envelope nonce forgery —
 canonicalization in `canonicalize_nearest` widens the documented write-TOCTOU on
 software-guard-only hosts (Windows / Linux without Landlock, where `shell` is
 already unconfined and noticed) — resolve remaining dangling intermediates by
-hand or re-check inside `atomic_write`; sanitized MCP tool-name collisions
-(`fs/read` vs `fs_read` → `server_fs_read`) shadow silently — error or dedupe;
-`verify` executes gate commands parsed from repo CI YAML — keep out of
-`JAIL_ TOOLS` (already is) and consider a `--dry-run`; session-file
-`cwd`/`read_only`/ identity trusted from disk at resume — re-validate at adopt;
-`trust.rs` store directory permissions not tightened like
-`auth::create_dir_owner_only`.
+hand or re-check inside `atomic_write`; `verify` executes gate commands parsed
+from repo CI YAML — keep out of `JAIL_ TOOLS` (already is) and consider a
+`--dry-run`; session-file `cwd`/`read_only`/ identity trusted from disk at
+resume — re-validate at adopt.
 
 **Coverage:** hrdr-tools walked in full incl. `mcp/` and secret_diff; the
 platform-gated backends (Windows LowIntegrity, macOS Seatbelt) were only read —

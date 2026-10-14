@@ -96,8 +96,10 @@ pub fn trust(dir: &Path, unix_style_paths: bool) -> Result<()> {
     if stored().contains(&k) {
         return Ok(());
     }
+    // Owner-only like the store file itself: the list decides which
+    // directories may steer this user's agent.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
+        crate::auth::create_dir_owner_only(parent).with_context(|| {
             format!(
                 "creating {}",
                 hrdr_tools::display_path(parent, unix_style_paths)
@@ -255,6 +257,23 @@ mod tests {
             !is_trusted(&child),
             "a child of a trusted directory must be answered on its own"
         );
+    }
+
+    /// The store's directory is created owner-only, like the store file.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_store, _lock) = private_store();
+        let dir = tempfile::tempdir().unwrap();
+        trust(dir.path(), true).unwrap();
+        let parent = trusted_dirs_path().unwrap();
+        let mode = std::fs::metadata(parent.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
     }
 
     /// Trusting twice must not append twice — the store is a set.

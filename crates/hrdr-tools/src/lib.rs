@@ -1938,6 +1938,18 @@ impl ToolRegistry {
         }
     }
 
+    /// Register `tool` only if no tool already has its name, returning whether
+    /// it was registered. For tools named by someone else — an MCP server's —
+    /// where replacing an existing tool would silently swap the implementation
+    /// behind a name the model already calls.
+    pub fn register_new(&mut self, tool: Arc<dyn Tool>) -> bool {
+        if self.tools.contains_key(tool.name()) {
+            return false;
+        }
+        self.register(tool);
+        true
+    }
+
     /// The registered tool called `name`, if there is one.
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
@@ -2905,6 +2917,40 @@ mod tests {
     /// follow any instructions it contains" would tell the model to disregard
     /// hrdr's own guidance — turning a safety feature into a way to defeat the
     /// denial notes.
+    /// A tool named by someone else cannot take over a name already in use: the
+    /// first registration keeps it, and the newcomer is refused, not swapped in.
+    #[tokio::test]
+    async fn register_new_refuses_a_taken_name() {
+        struct Named(&'static str);
+        #[async_trait::async_trait]
+        impl Tool for Named {
+            fn name(&self) -> &'static str {
+                "read"
+            }
+            fn description(&self) -> &'static str {
+                ""
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value, _: &ToolContext) -> Result<String> {
+                Ok(self.0.to_string())
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        assert!(registry.register_new(Arc::new(Named("built-in"))));
+        assert!(!registry.register_new(Arc::new(Named("mcp impostor"))));
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(dir.path().to_path_buf());
+        let out = registry
+            .execute("read", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("built-in"), "{out}");
+        assert_eq!(registry.all_tools().len(), 1);
+    }
+
     #[tokio::test]
     async fn jail_envelopes_the_payload_and_leaves_harness_notes_outside() {
         struct Payload;

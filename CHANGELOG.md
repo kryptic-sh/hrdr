@@ -189,6 +189,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`fetch` and `search` refuse internal IPv4 addresses spelled as IPv6.** The
+  SSRF guard caught the `::ffff:` mapped form but not the IPv4-compatible
+  `::a.b.c.d`, NAT64 `64:ff9b::/96` or 6to4 `2002::/16` spellings, so a loopback
+  or private address inside one of them got through (`crates/hrdr-tools`).
+- **An MCP tool can no longer replace another tool of the same name.** Exposed
+  names are sanitized and namespaced, so two tools could land on one name, or on
+  a built-in's; the later one silently took it over. It is now refused, and the
+  connect notice names it (`crates/hrdr-agent`, `crates/hrdr-tools`).
+- **The trusted-directories store's directory is created owner-only**, like the
+  store file and the other credential stores (`crates/hrdr-agent`).
 - **On Windows, `/cwd` records a directory the way hrdr sees it at startup.** It
   stored the `\\?\C:\…` spelling that canonicalizing produces, while a process
   started in that directory reports `C:\…`; sessions are filed by that string,
