@@ -82,7 +82,11 @@ push each verified slice to `main` before proceeding to the next slice.
    pinned ConPTY host): the send reported `SENT_TO_PEER`, but the peer's
    `dequeue` saw nothing within `EXIT` — "the peer never received the message".
    The same suite passed in that run's `test windows-latest` job; not reproduced
-   locally. Same day, one parallel `local_ipc` run failed
+   locally. The next run (38648655413, `665ea349`, same job) failed the same
+   test one step earlier: the `sessions` tool result did not list the peer at
+   all — discovery, not delivery. Both recurrences are the leak-guard job under
+   the pinned host, where the whole workspace suite runs in one process tree.
+   Same day, one parallel `local_ipc` run failed
    `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
    stalling for 43s; four reruns passed in ~5s. Real-process coverage:
    `tests/tui_pty.rs` (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`:
