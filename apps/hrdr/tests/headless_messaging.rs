@@ -119,12 +119,24 @@ async fn a_peer_message_joins_a_running_headless_turn_and_the_run_still_ends() {
         .await
         .expect("the running headless turn is discoverable");
     assert_eq!(target.session_name, "summarize the repository");
-    assert_eq!(
-        peer.send(&target, "also list the open TODOs".into())
-            .await
-            .unwrap(),
-        SendStatus::Accepted
-    );
+    let mut run = run;
+    let sent = peer.send(&target, "also list the open TODOs".into()).await;
+    let sent = match sent {
+        Ok(status) => status,
+        Err(error) => {
+            // Say what the run itself reported; a bare transport error does not.
+            let _ = run.child.kill();
+            let output = run
+                .child
+                .wait_with_output()
+                .expect("collect the run's output");
+            panic!(
+                "sending to the headless run failed: {error}\nrun stderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
+    assert_eq!(sent, SendStatus::Accepted);
     release.send(()).unwrap();
 
     let output = finish(run).await;

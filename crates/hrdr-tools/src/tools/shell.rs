@@ -1207,7 +1207,7 @@ mod tests {
         match shell {
             super::Shell::Bash => "test -n \"$BASH_VERSION\" && echo \"is\"\"-bash\"",
             super::Shell::Posix => {
-                "{ [ -z \"$BASH_VERSION\" ] || shopt -oq posix; } && echo \"is\"\"-posix\""
+                "case \"$0\" in *bash|*bash.exe) ;; *sh|*sh.exe) echo \"is\"\"-posix\";; esac"
             }
             super::Shell::PowerShell => "if ($PSVersionTable) { 'is' + '-powershell' }",
         }
