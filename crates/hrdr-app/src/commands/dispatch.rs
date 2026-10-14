@@ -840,8 +840,16 @@ mod tests {
             host.unix_style_paths = style;
             let label = hrdr_tools::display_path(&path, style);
             host.persist_setting("theme", hrdr_agent::ConfigValue::Str(r"C:\value\unchanged"));
+            // An empty log means the save SUCCEEDED, so the file was valid again
+            // by then — something rewrote it mid-test. Say what it held.
+            let logged = host.info_log.last().unwrap_or_else(|| {
+                panic!(
+                    "persist_setting succeeded on a file this test made invalid; it now holds {:?}",
+                    std::fs::read_to_string(&path)
+                )
+            });
             assert_eq!(
-                host.info_log.last().unwrap(),
+                logged,
                 &format!("couldn't save 'theme' to config: reading config file {label}")
             );
             host.unpersist_setting("theme");
