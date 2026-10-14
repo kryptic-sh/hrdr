@@ -3142,14 +3142,14 @@ handler, and the `--auto-compact` parse warning — each with a regression test
 that failed before the fix); item 6 open — recorded, not fixed.**
 
 6. **Hardening candidates from the hrdr-agent review** — none a live defect: a
-   generation-invalidated `RunGuard` leak one abort-site away from real;
-   unjoined live-stream forwarders that can drop the tail of advisory output; a
-   non-poison-tolerant `events` lock in `registry.rs` (a poisoned lock silently
-   stops recording a run's events). Two others are settled: the
-   `task_cancel`/handle-push race (fixed by `BackgroundPublication`, which holds
-   the handle lock while the row is published), and the budget wrap-up prompt
-   counting as a user turn (fixed 2026-10-15 — it is now a
-   `MessageOrigin::Nudge` through `push_user_message`).
+   generation-invalidated `RunGuard` leak one abort-site away from real, and
+   unjoined live-stream forwarders that can drop the tail of advisory output.
+   Settled: the `task_cancel`/handle-push race (fixed by
+   `BackgroundPublication`, which holds the handle lock while the row is
+   published); the budget wrap-up prompt counting as a user turn (fixed
+   2026-10-15, now a `MessageOrigin::Nudge` through `push_user_message`); and
+   the registry's `events` lock, which silently stopped recording once poisoned
+   (fixed 2026-10-15, it recovers like the crate's other locks).
 
 **Cleared (top of the list):** sandbox escapes (`..` and dangling-symlink
 canonicalization — the dangling case is a documented accepted write-TOCTOU, and

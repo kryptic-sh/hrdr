@@ -444,11 +444,14 @@ impl AgentRegistry {
                         to_write.push(ev.clone());
                     }
                 }
-                if let Ok(mut log) = e.events.lock() {
-                    for w in &to_write {
-                        log.push(w.clone());
-                    }
+                let mut log = e
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for w in &to_write {
+                    log.push(w.clone());
                 }
+                drop(log);
                 e.transcript.clone().map(|t| (t, to_write))
             })
         });
@@ -500,9 +503,10 @@ impl AgentRegistry {
             let Some(e) = v.iter().find(|e| e.key == key) else {
                 return Vec::new();
             };
-            let Ok(log) = e.events.lock() else {
-                return Vec::new();
-            };
+            let log = e
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             log.open_tools()
                 .iter()
                 .map(|(id, name)| crate::AgentEvent::ToolEnd {
@@ -575,9 +579,10 @@ impl AgentRegistry {
             // no handler to clear it, so without this the ids accumulate and the
             // NEXT crash would close a call from a turn that is long over,
             // stamping it with the wrong turn's reason.
-            if let Ok(mut log) = e.events.lock() {
-                log.clear_open_tools();
-            }
+            e.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_open_tools();
         });
         generation
     }
@@ -788,7 +793,10 @@ impl AgentRegistry {
     pub fn events_since(&self, key: u64, from: usize) -> Option<(Vec<crate::AgentEvent>, usize)> {
         self.with(|v| {
             let e = v.iter().find(|e| e.key == key)?;
-            let log = e.events.lock().ok()?;
+            let log = e
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Some(log.since(from))
         })
     }
@@ -800,9 +808,10 @@ impl AgentRegistry {
     /// one entry per streamed token delta, for the life of the session.
     pub fn compact(&self, key: u64, upto: usize) {
         self.update(key, |e| {
-            if let Ok(mut log) = e.events.lock() {
-                log.compact(upto);
-            }
+            e.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .compact(upto);
         });
     }
 
@@ -1396,6 +1405,29 @@ mod tests {
             live.events_since(99, 0).is_none(),
             "an unknown key has none"
         );
+    }
+
+    /// A panic while the event log was locked does not cut the agent's pane off:
+    /// recording and replay carry on through the poisoned lock.
+    #[test]
+    fn a_poisoned_event_log_keeps_recording() {
+        let live = AgentRegistry::new();
+        live.register(entry(1));
+        let log = live.with(|v| Arc::clone(&v[0].events));
+        let poisoner = std::thread::spawn(move || {
+            let _held = log.lock().unwrap();
+            panic!("poison the event log");
+        });
+        assert!(poisoner.join().is_err());
+
+        live.record(1, &crate::AgentEvent::Text("after".into()));
+        let (events, cursor) = live.events_since(1, 0).unwrap();
+        assert!(
+            matches!(&events[..], [crate::AgentEvent::Text(t)] if t == "after"),
+            "{events:?}"
+        );
+        live.compact(1, cursor);
+        assert!(live.events_since(1, cursor).unwrap().0.is_empty());
     }
 
     /// A record whose reader has folded everything in is released — otherwise it is
