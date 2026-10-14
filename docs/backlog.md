@@ -2581,20 +2581,9 @@ and **not** fixed.
 
 **Open — found, not fixed:**
 
-- **Multiline paste submits at newlines — observed on Windows 2026-10-09.** The
-  user reports pasted lines being sent as separate messages rather than the
-  whole paste appearing in the input box. Keep pasted LF/CRLF text together in
-  the composer without submitting until an explicit submit action. Investigate
-  native terminal input and bracketed-paste handling; an earlier inspection
-  suggested the Windows crossterm source did not emit `Event::Paste`, but verify
-  the installed implementation and actual event stream before assigning cause.
-  Ctrl+] clipboard paste was previously suggested as a workaround; recheck it.
-  Whether Linux/macOS are affected is unknown. Regression tests MUST run across
-  the full Linux, Windows, and macOS CI matrix, exercising the real input path
-  as well as composer handling. Cover LF/CRLF multiline content, no premature
-  submissions, complete paste preservation within the existing paste cap, and
-  ordinary explicit Enter submission afterward. Do not claim cross-platform
-  correctness from Windows-only tests or synthetic `Event::Paste` tests alone.
+- **Multiline paste** — fixed for modern console hosts (`58b2c631`); the
+  bracketed-paste pty regressions run ungated on Linux, macOS and Windows CI.
+  What is left is under queue item 9 at the top of this file.
 - **`cwd_slug` keys session folders on the raw cwd string, through an unstable
   hash — needs a decision.** Two problems in `hrdr-agent`'s `paths::cwd_slug`.
   (1) Windows keeps whatever drive and path case the shell was started with (VS
