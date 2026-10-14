@@ -77,7 +77,12 @@ push each verified slice to `main` before proceeding to the next slice.
    `ConnectionAborted` (`local_ipc::transport::rejected_peer`), which `serve`
    skips. No test can provoke that failure deterministically; the pty test now
    reports, on a failed send, whether the target was still published, so a
-   recurrence names the mechanism. Same day, one parallel `local_ipc` run failed
+   recurrence names the mechanism. A new symptom on 2026-10-15 (Windows
+   leak-guard job, run 38643593063 for `fc1acfca`, the first runs with CI's
+   pinned ConPTY host): the send reported `SENT_TO_PEER`, but the peer's
+   `dequeue` saw nothing within `EXIT` — "the peer never received the message".
+   The same suite passed in that run's `test windows-latest` job; not reproduced
+   locally. Same day, one parallel `local_ipc` run failed
    `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
    stalling for 43s; four reruns passed in ~5s. Real-process coverage:
    `tests/tui_pty.rs` (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`:
