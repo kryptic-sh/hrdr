@@ -198,6 +198,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Pasting several lines in Windows Terminal no longer sends each line.** On
+  Windows, crossterm reads console input as key presses and never reports a
+  paste, so every newline in a paste submitted the message. Under a modern
+  console host (`OpenConsole.exe`, which Windows Terminal ships) hrdr now reads
+  input as VT sequences and parses them with crossterm's own parser, vendored,
+  so a paste lands in the input box whole. The inbox `conhost.exe` loses parts
+  of fragmented sequences, so a classic console window keeps the old reader
+  (`crates/hrdr-tui`).
 - **`rustls` updated to 0.23.46** for RUSTSEC-2026-0346 (client session `Debug`
   output exposed TLS secrets), RUSTSEC-2026-0347 (ECH rejection sent buffered
   data to the outer server), RUSTSEC-2026-0348 (Brotli certificate decompression

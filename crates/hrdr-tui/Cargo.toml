@@ -38,3 +38,6 @@ async-trait = "0.1"
 # Sandboxes $HOME + the XDG roots before ANY test in this crate runs (ctor, no opt-in).
 hrdr-test-support.workspace = true
 
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+

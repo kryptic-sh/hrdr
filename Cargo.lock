@@ -1499,6 +1499,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-width",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -226,6 +226,21 @@ pub(crate) async fn run_recovery_loop(app: &mut App, terminal: &mut Tui) -> Resu
     Ok(())
 }
 
+/// The terminal's input. On Windows under a modern console host it is read
+/// as VT sequences (see `vt_input`), which is what lets a bracketed paste
+/// arrive as one paste; everywhere else crossterm reads it. If the VT reader
+/// cannot start, crossterm's — what every host used before — takes over.
+fn input_events()
+-> std::pin::Pin<Box<dyn futures_util::Stream<Item = std::io::Result<Event>> + Send>> {
+    #[cfg(windows)]
+    if crate::vt_input::modern_console_host()
+        && let Ok(input) = crate::vt_input::VtInput::start()
+    {
+        return Box::pin(input);
+    }
+    Box::pin(EventStream::new())
+}
+
 /// Drive `app` against the terminal until it quits: draw, then await terminal
 /// input, agent messages, config-file changes, or a spinner tick.
 pub(crate) async fn run_loop(
@@ -244,7 +259,7 @@ pub(crate) async fn run_loop(
         // `session_start` lifecycle hooks, off-thread like the probes.
         app.spawn_session_start_hooks();
     }
-    let mut events = EventStream::new();
+    let mut events = input_events();
     let mut rx = app.rx.take().expect("run_loop called once");
     // Periodic wake so the inference spinner animates between tokens.
     let mut ticker = tokio::time::interval(Duration::from_millis(ui::SPINNER_FRAME_MS));

@@ -106,6 +106,13 @@ jobs:
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # Windows pty tests run under Microsoft's packaged ConPTY host — a modern
+      # one, as Windows Terminal ships — which the paste tests require; see
+      # scripts/pin-conpty.ps1.
+      - name: Pin the ConPTY host
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/pin-conpty.ps1 -Destination target/debug/deps
       - run:
           cargo nextest run --workspace --all-features --locked --no-fail-fast
       - run: cargo test --workspace --doc --all-features --locked
@@ -132,6 +139,13 @@ jobs:
           cache: false
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
+      # Windows pty tests run under Microsoft's packaged ConPTY host — a modern
+      # one, as Windows Terminal ships — which the paste tests require; see
+      # scripts/pin-conpty.ps1.
+      - name: Pin the ConPTY host
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/pin-conpty.ps1 -Destination target/debug/deps
       - run:
           cargo test --locked -p hrdr-test-support --test leak_guard --
           --nocapture
@@ -153,6 +167,13 @@ jobs:
           cache: false
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
+      # Windows pty tests run under Microsoft's packaged ConPTY host — a modern
+      # one, as Windows Terminal ships — which the paste tests require; see
+      # scripts/pin-conpty.ps1.
+      - name: Pin the ConPTY host
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/pin-conpty.ps1 -Destination target/release/deps
       - run: cargo build --locked -p hrdr
       - run: cargo run --locked -p hrdr -- --version
       - run: cargo run --locked -p hrdr -- --help

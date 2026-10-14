@@ -227,33 +227,23 @@ push each verified slice to `main` before proceeding to the next slice.
    so queued messages are delivered before the handoff rather than lost. It
    becomes necessary once the contract is broadened to hand off with work
    outstanding.
-9. **Windows multiline-paste transport investigation — deferred branch.**
-   Pending work is preserved and pushed at `wip/windows-paste-transport` commit
-   `2d653861b1e4c8fa18adb27e5f51320ccd9dffae`. The branch contains real ConPTY
-   LF/CRLF regressions, approved `crossterm_winapi` test-only probes, and the
-   config-test isolation fix. It intentionally fails the paste regressions: the
-   inbox `conhost.exe` loses prefixes of fragmented VT paste delimiters even
-   with VT input enabled, while complete frames survive. Test the pinned
-   Microsoft ConPTY host before choosing the conditionally approved vendored
-   Crossterm parser path; verify loaded DLL and host paths so fallback cannot
-   masquerade as a result. Do not merge this branch or release from it until the
-   regressions pass across the required matrix. **Pinned-host result,
-   2026-10-15:** the branch's commit, rebased onto main as
-   `wip/windows-paste-transport-rebased`, still fails all four paste regressions
-   under the inbox host. With Microsoft's `Microsoft.Windows.Console.ConPTY`
-   1.25.260930003 (latest stable; both binaries Authenticode-signed by
-   Microsoft) side-loaded next to the test binary — and its `OpenConsole.exe`
-   seen running from that path during the run, so no silent fallback — the two
-   console-level probes (`console_records_preserve_framed_paste`,
-   `console_stream_preserves_framed_paste`) **pass**, while the two TUI tests
-   (`bracketed_paste_{lf,crlf}_waits_for_explicit_enter`) still fail. So a
-   modern host — the one Windows Terminal ships — delivers the paste frames
-   intact, and the remaining loss is crossterm's: on Windows it reads console
-   input records, never enables `ENABLE_VIRTUAL_TERMINAL_INPUT`, rejects
-   `EnableBracketedPaste` as unsupported, and never yields `Event::Paste`, so a
-   paste arrives as key presses and each newline submits. That satisfies the
-   condition on the vendored-parser path: enable VT input on Windows and parse
-   the input stream with crossterm's (private, so vendored) unix VT parser.
+9. **Windows multiline paste — fix on `wip/windows-paste-transport-rebased`,
+   pending CI.** crossterm's Windows backend reads console input records, never
+   enables `ENABLE_VIRTUAL_TERMINAL_INPUT` and never yields `Event::Paste`, so
+   each newline of a paste submitted. The owner chose (2026-10-15) a fix for
+   modern hosts only: `hrdr-tui`'s `vt_input` enables VT input and parses it
+   with crossterm 0.29.0's unix parser, vendored, when the console host is
+   `OpenConsole.exe` (found with `NtQueryInformationProcess` class 49 — under
+   ConPTY the console window belongs to the client, not the host); the inbox
+   `conhost.exe`, which loses prefixes of fragmented sequences, keeps
+   crossterm's reader. Verified natively on Windows: with Microsoft's
+   `Microsoft.Windows.Console.ConPTY` 1.25.260930003 side-loaded
+   (`scripts/pin-conpty.ps1`, pinned by SHA-256) all pty tests pass, the paste
+   regressions included; with the inbox host only those four fail, as before.
+   CI's Windows jobs pin that host, so every Windows pty test now runs the VT
+   reader — crossterm's reader no longer has pty coverage on Windows CI. Not
+   verified: typing in a real Windows Terminal or classic console window by
+   hand. Merge to `main` once the branch passes the CI matrix.
 10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`

@@ -467,8 +467,24 @@ impl Drop for Session {
     }
 }
 
+/// On Windows a paste reaches hrdr whole only under a modern console host, so
+/// the paste tests need the pinned one (`scripts/pin-conpty.ps1`) beside the
+/// test binary: `portable-pty` loads that `conpty.dll`, which starts that
+/// `OpenConsole.exe`. Skipped locally without it, failing on CI.
+fn skip_without_the_pinned_conpty_host() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let dir = exe.parent().expect("test binary directory");
+    hrdr_test_support::skip_for_want_of(
+        "the pinned ConPTY host beside the test binary (scripts/pin-conpty.ps1)",
+        dir.join("conpty.dll").is_file() && dir.join("OpenConsole.exe").is_file(),
+    )
+}
+
 fn bracketed_paste_stays_in_the_draft(newline: &str) {
-    if skip_for_want_of_a_pty() {
+    if skip_for_want_of_a_pty() || skip_without_the_pinned_conpty_host() {
         return;
     }
     let server = MockServer::start(vec![Chat::Sse(vec![
@@ -510,7 +526,13 @@ fn bracketed_paste_stays_in_the_draft(newline: &str) {
         .rev()
         .find(|m| m["role"] == "user")
         .expect("user message");
-    assert_eq!(user["content"], payload.replace("\r\n", "\n"));
+    // A user turn carries a local-time stamp for the model; the pasted text
+    // follows it unchanged.
+    let content = user["content"].as_str().expect("text content");
+    assert_eq!(
+        hrdr_agent::strip_user_timestamp(content),
+        payload.replace("\r\n", "\n")
+    );
 }
 
 #[test]
@@ -646,7 +668,7 @@ fn console_stream_preserves_framed_paste() {
 
 #[cfg(windows)]
 fn console_input_preserves_framed_paste(stream: bool) {
-    if skip_for_want_of_a_pty() {
+    if skip_for_want_of_a_pty() || skip_without_the_pinned_conpty_host() {
         return;
     }
     let home = tempfile::tempdir().unwrap();

@@ -26,6 +26,8 @@ pub use app::{
 };
 pub use trust_prompt::ask_trust;
 mod ui;
+#[cfg(windows)]
+mod vt_input;
 
 use std::io::{Stdout, stdout};
 
