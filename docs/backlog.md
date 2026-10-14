@@ -3299,14 +3299,17 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    one-cell chrome span advanced per frame and key the body on content hash
    alone; route running blocks through `ChunkRows::Lazy` so off-screen blocks
    aren't built.
-4. **MEDIUM — streaming markdown re-parsed and re-wrapped in full per frame.**
-   `hrdr-tui/src/ui.rs`: the body key is the precomputed `content_hash`, which
-   changes per delta, so a streaming message misses the cache on every frame.
-   Since 2026-10-14 frames woken only by agent messages are paced to the frame
-   interval (`tui::defer_message_frame`, `SPINNER_FRAME_MS`), so this costs one
-   full re-render per frame instead of one per token burst — still O(n) per
-   frame, O(n²) over a long reply at ~8 frames a second. Left: render
-   append-only from the last cached line when the delta is a pure append.
+4. **Streaming markdown re-rendered in full per frame — declined 2026-10-15,
+   measured.** The body key is the `content_hash`, which changes per delta, so a
+   streaming reply re-runs `markdown_lines` once per frame (paced by
+   `tui::defer_message_frame`). Measured in `--release` on Windows against
+   prose + list + fenced-code markdown at width 100: 1.7 KB 63 µs, 6.6 KB 242
+   µs, 26.6 KB 0.97 ms, 106 KB 4.3 ms per render — about 37 µs per KB, under the
+   frame interval even for a reply far longer than usual. Rendering append-only
+   would have to split markdown at block boundaries that are not independent
+   (loose lists span blank lines, fences hold them, link definitions resolve
+   backwards), so the risk is a reply that renders differently while streaming
+   than once finished. Revisit only with a felt-lag report on a long reply.
 5. **MEDIUM-HIGH — O(n) full-transcript walk per frame, unbounded.** `ui.rs`
    `draw_chunks`: every frame iterates every transcript entry — 3-4 thread-local
    `RefCell` lookups + `Rc` clones (`cached_body`/`cached_block`/`chrome_hash`)
