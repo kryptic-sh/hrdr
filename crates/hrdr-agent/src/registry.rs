@@ -668,19 +668,28 @@ impl AgentRegistry {
         });
     }
 
-    /// What is still waiting to reach agent `key`, with peers attributed and
-    /// terminal-safe rather than presented as human input.
     /// Whether a peer message is waiting on the agent's queue.
     pub fn has_pending_peer(&self, key: u64) -> bool {
+        self.pending_peers(key) > 0
+    }
+
+    /// How many peer messages are waiting on the agent's queue.
+    pub fn pending_peers(&self, key: u64) -> usize {
         self.with(|v| {
-            v.iter().find(|e| e.key == key).is_some_and(|e| {
-                e.steering
-                    .lock()
-                    .is_ok_and(|q| q.iter().any(|steer| steer.peer.is_some()))
-            })
+            v.iter()
+                .find(|e| e.key == key)
+                .and_then(|e| {
+                    e.steering
+                        .lock()
+                        .ok()
+                        .map(|q| q.iter().filter(|steer| steer.peer.is_some()).count())
+                })
+                .unwrap_or(0)
         })
     }
 
+    /// What is still waiting to reach agent `key`, with peers attributed and
+    /// terminal-safe rather than presented as human input.
     pub fn pending(&self, key: u64) -> Vec<String> {
         self.with(|v| {
             v.iter()

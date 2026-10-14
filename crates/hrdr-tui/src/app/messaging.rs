@@ -250,17 +250,22 @@ impl App {
         });
     }
 
-    /// Close the runtime as the app exits, counting the messages it drops.
+    /// Close the runtime as the app exits, counting the messages it drops: those
+    /// still in its inbox, and the one already queued behind a turn the quit
+    /// cancels.
     pub(crate) async fn shutdown_messaging(&mut self) {
         if let Some(active) = self.messaging.take_active() {
-            self.messaging.undelivered_on_exit += active.runtime.close().await;
+            self.messaging.undelivered_on_exit +=
+                active.runtime.close().await + self.registry.pending_peers(hrdr_agent::MAIN_KEY);
         }
     }
 
     /// Hand the agent the next peer message it can take: wake it when idle, or
     /// queue one behind its current turn when it holds none already.
     pub(crate) fn maybe_deliver_peer(&mut self) {
-        if self.handoff_gate
+        // Once quitting, what is left stays in the inbox for the exit report.
+        if self.should_quit
+            || self.handoff_gate
             || self.compacting()
             || self
                 .user_shell

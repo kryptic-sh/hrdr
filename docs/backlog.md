@@ -64,9 +64,10 @@ push each verified slice to `main` before proceeding to the next slice.
    flake is gone. Real-process coverage: `tests/tui_pty.rs`
    (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
    shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
-   disabling), on the CI matrix; verified locally on Windows only so far. Still
-   unexercised across processes: a TUI session switch, the exit report of
-   undelivered messages, and access-control denial for a foreign OS user.
+   disabling), on the CI matrix; verified locally on Windows only so far.
+   `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
+   covers `/new` rotation and the exit report across processes. Still
+   unexercised across processes: access-control denial for a foreign OS user.
    Mutation check: removing the TUI's arrival wake did not fail the pty test —
    something else woke the loop there — so the wake is guarded only by the
    in-process test that waits for `PeerReady`.

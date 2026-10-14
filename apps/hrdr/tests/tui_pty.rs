@@ -882,6 +882,120 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
     Ok(())
 }
 
+/// 12b. A live TUI that starts a new session stops publishing the old one and
+///      publishes the new one under a fresh id; quitting it while a turn runs
+///      reports the peer messages it never delivered — the one queued behind
+///      the turn and the one still in its inbox.
+#[test]
+fn a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages()
+-> Result<(), String> {
+    use hrdr_agent::messaging::{Messaging, SendStatus};
+    use hrdr_tools::local_ipc::{SessionDescriptor, UserDirectory};
+
+    if skip_for_want_of_a_pty() {
+        return Ok(());
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let peer = rt
+        .block_on(Messaging::start(
+            UserDirectory::open().unwrap(),
+            format!("pty-switch-peer-{}", std::process::id()),
+            "pty switch peer".into(),
+            "/pty-switch-peer".into(),
+        ))
+        .unwrap();
+    let text =
+        |id: &str, reply: &str| vec![text_chunk(id, reply), stop_chunk(id), "[DONE]".to_string()];
+    let (release, released) = std::sync::mpsc::channel();
+    let server = MockServer::start(vec![
+        Chat::Sse(text("s1", "FIRST_SESSION_REPLY")),
+        Chat::Gated(released, text("s2", "SECOND_SESSION_REPLY")),
+    ]);
+    let mut s = Session::spawn(&server.base_url());
+    // Every test's sessions share the discovery directory; the project
+    // directory's unique name picks out this TUI's.
+    let place = s
+        ._project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let published = |peer: &Messaging| -> Vec<SessionDescriptor> {
+        rt.block_on(peer.discover())
+            .unwrap()
+            .into_iter()
+            .filter(|session| session.working_directory.contains(&place))
+            .collect()
+    };
+    let poll = |what: &str, mut done: Box<dyn FnMut() -> bool + '_>| {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < EXIT, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    s.wait_for("mock-model", BOOT);
+    s.send("first\r");
+    s.wait_for("FIRST_SESSION_REPLY", EXIT);
+    let mut first = None;
+    poll(
+        "the first session to be published",
+        Box::new(|| {
+            first = published(&peer).pop();
+            first.is_some()
+        }),
+    );
+    let first = first.unwrap();
+
+    s.send("/new\r");
+    poll(
+        "the replaced session to leave discovery",
+        Box::new(|| {
+            !published(&peer)
+                .iter()
+                .any(|session| session.session_id == first.session_id)
+        }),
+    );
+
+    s.send("second\r");
+    let mut second = None;
+    poll(
+        "the new session to be published under a fresh id",
+        Box::new(|| {
+            second = published(&peer)
+                .into_iter()
+                .find(|session| session.session_id != first.session_id);
+            second.is_some()
+        }),
+    );
+    let second = second.unwrap();
+    poll(
+        "the new session's turn to reach the model",
+        Box::new(|| server.chat_bodies().len() == 2),
+    );
+    for text in ["QUEUED_BEHIND_THE_TURN", "LEFT_IN_THE_INBOX"] {
+        assert_eq!(
+            rt.block_on(peer.send(&second, text.into())).unwrap(),
+            SendStatus::Accepted
+        );
+    }
+
+    // The turn is still held at the model, so neither message runs.
+    s.send("\x11");
+    s.wait_for("2 peer message(s) were not delivered before exit", EXIT);
+    assert!(s.wait_exit(EXIT).success(), "clean exit");
+    drop(release);
+    assert_eq!(server.chat_bodies().len(), 2, "no turn ran for a peer");
+    rt.block_on(peer.close());
+    Ok(())
+}
+
 /// 13. The terminal title reaches the terminal: an OSC title sequence carrying
 ///     the status emoji and the working directory's name, on every platform
 ///     (on Windows through ConPTY, which re-emits a console title as OSC).

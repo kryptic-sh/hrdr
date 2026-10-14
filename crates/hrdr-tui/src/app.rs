@@ -3125,6 +3125,9 @@ impl App {
     /// user message or a partial reply.
     fn request_quit(&mut self) {
         if self.running() {
+            // The cancel discards a peer message queued behind the turn; on the
+            // way out that is a message the exit report owes its sender.
+            self.messaging.undelivered_on_exit += self.registry.pending_peers(hrdr_agent::MAIN_KEY);
             self.cancel_turn();
         }
         self.should_quit = true;

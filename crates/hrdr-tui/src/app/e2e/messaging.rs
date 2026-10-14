@@ -135,6 +135,39 @@ async fn a_busy_session_takes_one_peer_message_at_a_time() {
 }
 
 #[tokio::test]
+async fn exit_counts_the_queued_peer_message_and_the_inbox_as_undelivered() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let id = started(&mut h, "exiting target").await;
+    let sender = peer("exit-sender").await;
+    let target = find(&sender, &id).await.unwrap();
+    for text in ["queued", "in the inbox"] {
+        assert_eq!(
+            sender.send(&target, text.into()).await.unwrap(),
+            SendStatus::Accepted
+        );
+    }
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    h.app.maybe_deliver_peer();
+    assert_eq!(h.app.registry.pending_peers(hrdr_agent::MAIN_KEY), 1);
+    assert_eq!(h.app.messaging.pending(), 1);
+
+    // The quit cancels the running turn, so neither message reaches the agent:
+    // the queued one is discarded with the turn, and nothing more is taken from
+    // the inbox on the way out.
+    h.app.request_quit();
+    h.app.maybe_deliver_peer();
+    assert_eq!(h.app.messaging.pending(), 1, "the inbox is left alone");
+    h.app.shutdown_messaging().await;
+    assert_eq!(h.app.messaging.undelivered_on_exit, 2);
+    assert!(
+        find(&sender, &id).await.is_none(),
+        "the exiting session leaves discovery"
+    );
+    sender.close().await;
+}
+
+#[tokio::test]
 async fn disabled_messaging_never_registers_the_session() {
     let _data_home = isolated_data_home();
     let mut h = Harness::new(vec![]).await;
