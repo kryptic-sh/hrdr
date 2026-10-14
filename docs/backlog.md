@@ -237,7 +237,23 @@ push each verified slice to `main` before proceeding to the next slice.
    Microsoft ConPTY host before choosing the conditionally approved vendored
    Crossterm parser path; verify loaded DLL and host paths so fallback cannot
    masquerade as a result. Do not merge this branch or release from it until the
-   regressions pass across the required matrix.
+   regressions pass across the required matrix. **Pinned-host result,
+   2026-10-15:** the branch's commit, rebased onto main as
+   `wip/windows-paste-transport-rebased`, still fails all four paste regressions
+   under the inbox host. With Microsoft's `Microsoft.Windows.Console.ConPTY`
+   1.25.260930003 (latest stable; both binaries Authenticode-signed by
+   Microsoft) side-loaded next to the test binary — and its `OpenConsole.exe`
+   seen running from that path during the run, so no silent fallback — the two
+   console-level probes (`console_records_preserve_framed_paste`,
+   `console_stream_preserves_framed_paste`) **pass**, while the two TUI tests
+   (`bracketed_paste_{lf,crlf}_waits_for_explicit_enter`) still fail. So a
+   modern host — the one Windows Terminal ships — delivers the paste frames
+   intact, and the remaining loss is crossterm's: on Windows it reads console
+   input records, never enables `ENABLE_VIRTUAL_TERMINAL_INPUT`, rejects
+   `EnableBracketedPaste` as unsupported, and never yields `Event::Paste`, so a
+   paste arrives as key presses and each newline submits. That satisfies the
+   condition on the vendored-parser path: enable VT input on Windows and parse
+   the input stream with crossterm's (private, so vendored) unix VT parser.
 10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     Deferred until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
