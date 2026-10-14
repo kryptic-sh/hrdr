@@ -82,31 +82,10 @@ fn ask_themed(keys: &[&str], theme: Option<&str>) -> Asked {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_hrdr"));
     cmd.args(["--no-auto-resume", "--no-bell"]);
     cmd.cwd(project.path());
-    for (key, value) in [
-        ("HOME", home.path()),
-        ("USERPROFILE", home.path()),
-        ("APPDATA", home.path()),
-        ("LOCALAPPDATA", home.path()),
-        ("XDG_CONFIG_HOME", home.path()),
-        ("XDG_DATA_HOME", home.path()),
-        ("XDG_STATE_HOME", home.path()),
-        // Deliberately NOT pre-trusted: this test is about being asked.
-        ("XDG_CACHE_HOME", home.path()),
-        ("XDG_RUNTIME_DIR", runtime.path()),
-    ] {
-        cmd.env(key, value);
-    }
-    cmd.env("TERM", "xterm-256color");
-    for key in ["HRDR_MODEL", "HRDR_API_KEY", "RUST_LOG"] {
-        cmd.env_remove(key);
-    }
-    // These tests assert on the escape codes the question is painted in, so
-    // color must be on regardless of the ambient environment: a machine (or a
-    // CI job) that exports NO_COLOR would otherwise strip the very output
-    // under test.
-    for key in ["NO_COLOR", "CLICOLOR"] {
-        cmd.env_remove(key);
-    }
+    // Deliberately NOT pre-trusted: this test is about being asked. These
+    // tests assert on the escape codes the question is painted in, which is
+    // why the isolation also drops an exported NO_COLOR.
+    common::isolate_pty_child(&mut cmd, home.path(), Some(runtime.path()));
 
     let mut child = pty.slave.spawn_command(cmd).expect("spawn hrdr");
     drop(pty.slave);

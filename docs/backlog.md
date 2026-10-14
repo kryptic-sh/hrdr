@@ -3225,11 +3225,9 @@ nothing behavior-changing proposed.
    generic `cached<C,K>`; `cached_block` a thin wrapper.
 3. **Test-suite dedups (worst first)** — `tui_pty.rs` `Session::spawn`
    reimplements `common::drain_pty` line-for-line (verified identical);
-   isolated-child env table copied 5× across headless/headless_tty/trust_pty/
-   tui_pty — one `common::isolated_env` helper; `chrome_line`/ `chrome_fragment`
-   one function with two flag settings (`apps/hrdr/src/main.rs`);
-   `run_hrdr_inner` a pure middleman — delete, point callers at
-   `run_hrdr_inner_with_home`.
+   `chrome_line`/ `chrome_fragment` one function with two flag settings
+   (`apps/hrdr/src/main.rs`); `run_hrdr_inner` a pure middleman — delete, point
+   callers at `run_hrdr_inner_with_home`.
 4. **Editor wrap-placement block repeats 3×** — `hrdr-editor/src/lib.rs`
    `compute_wrapped_layout` (word-fits / word-onto-fresh-line / whitespace-fits
    arms): extract a private `place()` helper; the hard-break arm is a genuine
@@ -3645,12 +3643,6 @@ args wrapper, and the shared id mint — fixed and closed 2026-09-04.)
 - **08-30 #2** — `cached_body` (ui.rs:2540) / `cached_block` (ui.rs:2559) are
   still the same lookup-filter-else-render-insert shape over two TLS caches; one
   generic `cached<C, K>`. Open.
-- **08-30 #3b, partial** — the isolated-child env table is still copied three
-  times: `apps/hrdr/tests/headless_tty.rs:71-82`, `trust_pty.rs:85-98`,
-  `tui_pty.rs:109-121` (eight shared entries; `XDG_RUNTIME_DIR` in two of the
-  three; the `env_remove` lists differ between them — exactly the drift this
-  dedup exists to stop). One `common::isolated_env` helper, parameterizing the
-  stragglers, still the action. (08-30 3a/3c/3d shipped — see above.)
 - **08-30 #4** — editor wrap-placement still repeats the place-loop three times:
   `crates/hrdr-editor/src/lib.rs:268-333` (`compute_wrapped_layout`: word-fits
   270-278, word-onto-fresh-line 279-292, whitespace-fits 318-326) and the

@@ -68,28 +68,7 @@ fn run_on_a_pty(env: &[(&str, &str)]) -> String {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_hrdr"));
     cmd.args(["run", "say hello"]);
     cmd.cwd(project.path());
-    for (key, value) in [
-        ("HOME", home.path()),
-        ("USERPROFILE", home.path()),
-        ("APPDATA", home.path()),
-        ("LOCALAPPDATA", home.path()),
-        ("XDG_CONFIG_HOME", home.path()),
-        ("XDG_DATA_HOME", home.path()),
-        ("XDG_STATE_HOME", home.path()),
-        ("XDG_CACHE_HOME", home.path()),
-    ] {
-        cmd.env(key, value);
-    }
-    cmd.env("TERM", "xterm-256color");
-    for key in [
-        "HRDR_MODEL",
-        "HRDR_API_KEY",
-        "RUST_LOG",
-        "NO_COLOR",
-        "CLICOLOR",
-    ] {
-        cmd.env_remove(key);
-    }
+    common::isolate_pty_child(&mut cmd, home.path(), None);
     for (key, value) in env {
         cmd.env(key, value);
     }

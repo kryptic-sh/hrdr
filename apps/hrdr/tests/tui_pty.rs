@@ -104,34 +104,12 @@ fn run_tui(keys: &str) -> Run {
     // closed port): the health probe fails, and the TUI must come up anyway.
     cmd.args(["--no-auto-resume", "--no-bell"]);
     cmd.cwd(project.path());
-    // Point every "where does config/state live" knob at a throwaway directory, so
-    // the test can't read the developer's config or write into their sessions.
-    for (key, value) in [
-        ("HOME", home.path()),
-        ("USERPROFILE", home.path()),
-        ("APPDATA", home.path()),
-        ("LOCALAPPDATA", home.path()),
-        ("XDG_CONFIG_HOME", home.path()),
-        ("XDG_DATA_HOME", home.path()),
-        ("XDG_STATE_HOME", home.path()),
-        ("XDG_CACHE_HOME", home.path()),
-        ("XDG_RUNTIME_DIR", runtime.path()),
-    ] {
-        cmd.env(key, value);
-    }
+    common::isolate_pty_child(&mut cmd, home.path(), Some(runtime.path()));
     // The TUI is what a user sees AFTER they have answered for this directory,
-    // so answer it here. Without this the child stops on the trust question and
-    // every assertion below reads a prompt instead of a first frame — and the
-    // store has to be the throwaway one, which is why `XDG_CACHE_HOME` joins the
-    // list above rather than leaking the developer's real answers into the test.
+    // so answer it here, in the throwaway trust store the isolation points at.
+    // Without this the child stops on the trust question and every assertion
+    // below reads a prompt instead of a first frame.
     pre_trust(home.path(), project.path());
-    cmd.env("TERM", "xterm-256color");
-    // Whatever the developer has exported must not reach the child. (`$HRDR_BASE_URL`
-    // is not on the list because it no longer exists — the endpoint belongs to the
-    // provider, and only a provider definition can name one.)
-    for key in ["HRDR_MODEL", "HRDR_API_KEY"] {
-        cmd.env_remove(key);
-    }
 
     let mut child = pty.slave.spawn_command(cmd).expect("spawn hrdr");
     // The child holds the only slave handle it needs; ours would keep the pty open
@@ -342,29 +320,9 @@ fn spawn_pty(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_hrdr"));
     cmd.args(["--no-auto-resume", "--no-bell"]);
     cmd.cwd(project.path());
-    for (key, value) in [
-        ("HOME", home.path()),
-        ("USERPROFILE", home.path()),
-        ("APPDATA", home.path()),
-        ("LOCALAPPDATA", home.path()),
-        ("XDG_CONFIG_HOME", home.path()),
-        ("XDG_DATA_HOME", home.path()),
-        ("XDG_STATE_HOME", home.path()),
-        ("XDG_CACHE_HOME", home.path()),
-        ("XDG_RUNTIME_DIR", runtime.path()),
-    ] {
-        cmd.env(key, value);
-    }
-    // The TUI is what a user sees AFTER they have answered for this directory,
-    // so answer it here. Without this the child stops on the trust question and
-    // every assertion below reads a prompt instead of a first frame — and the
-    // store has to be the throwaway one, which is why `XDG_CACHE_HOME` joins the
-    // list above rather than leaking the developer's real answers into the test.
+    common::isolate_pty_child(&mut cmd, home.path(), Some(runtime.path()));
+    // Answered here for the same reason as `run_tui`'s.
     pre_trust(home.path(), project.path());
-    cmd.env("TERM", "xterm-256color");
-    for key in ["HRDR_MODEL", "HRDR_API_KEY", "RUST_LOG"] {
-        cmd.env_remove(key);
-    }
     for (key, value) in env {
         cmd.env(key, value);
     }

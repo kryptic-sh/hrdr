@@ -409,6 +409,43 @@ pub fn pty_available() -> bool {
 /// missing pty is a broken environment and the only useful thing a test can do
 /// is fail. A skip that cannot tell those apart converts an infrastructure
 /// failure into a green tick, which is the one outcome worse than either.
+/// Isolate a pty child from the developer's machine: every place hrdr reads
+/// config or keeps state points at `home` (its runtime directory at `runtime`,
+/// when the test needs one), the terminal is a known one, and nothing the
+/// developer exports reaches it — a model, a key, a log filter, or a colour
+/// preference, which some tests assert the painted output of.
+pub fn isolate_pty_child(
+    cmd: &mut portable_pty::CommandBuilder,
+    home: &std::path::Path,
+    runtime: Option<&std::path::Path>,
+) {
+    for key in [
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ] {
+        cmd.env(key, home);
+    }
+    if let Some(runtime) = runtime {
+        cmd.env("XDG_RUNTIME_DIR", runtime);
+    }
+    cmd.env("TERM", "xterm-256color");
+    for key in [
+        "HRDR_MODEL",
+        "HRDR_API_KEY",
+        "RUST_LOG",
+        "NO_COLOR",
+        "CLICOLOR",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 pub fn skip_for_want_of_a_pty() -> bool {
     if pty_available() || std::env::var_os("CI").is_some() {
         return false;
