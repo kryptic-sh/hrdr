@@ -64,7 +64,17 @@ impl Shell {
             const CANDIDATES: &[Shell] = &[Shell::Bash, Shell::PowerShell, Shell::Posix];
             #[cfg(not(windows))]
             const CANDIDATES: &[Shell] = &[Shell::Bash, Shell::Posix];
-            CANDIDATES.iter().copied().filter(|s| s.runs()).collect()
+            let shells: Vec<Shell> = CANDIDATES.iter().copied().filter(|s| s.runs()).collect();
+            // Git for Windows' `sh` is its bash under another name (often a
+            // launcher for the same `bash.exe`), so beside Git Bash it is no
+            // second dialect — only a fallback where Git Bash is missing.
+            if cfg!(windows) && shells.contains(&Shell::Bash) {
+                return shells
+                    .into_iter()
+                    .filter(|&shell| shell != Shell::Posix)
+                    .collect();
+            }
+            shells
         })
     }
 

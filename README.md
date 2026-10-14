@@ -16,7 +16,8 @@ supported shell the machine has and letting the model pick one per command.
 `PATH` or next to the installed Git (never the WSL `bash.exe` launcher), with
 **Windows PowerShell** (`powershell.exe -NoProfile -NonInteractive -Command`)
 offered beside it and used as the default when Git Bash is absent. POSIX `sh` is
-offered too, and is the default where there is no `bash`.
+offered beside `bash` on Linux and macOS, and is the default where there is no
+`bash`; on Windows, Git's `sh` is the same bash, so it is only that fallback.
 
 > Active development. The agent loop, adaptive tool set, sub-agents, sessions,
 > config hot-reload, and a rich TUI are in place. hrdr connects to any running
@@ -80,8 +81,8 @@ sudo rpm -i hrdr-*.rpm
   **full** result is saved to a per-session temp file and the model is pointed
   at it instead of losing the overflow. The `shell` tool is presence-aware: it
   offers only shells that run here — `bash` (Git Bash on Windows) by default,
-  plus PowerShell on Windows and POSIX `sh` — and the prompt names each one with
-  its syntax rules.
+  plus PowerShell on Windows and POSIX `sh` elsewhere — and the prompt names
+  each one with its syntax rules.
 - **Pluggable input discipline.** Default is a plain, claude-style input (always
   typing; `Enter` sends, `Shift+Enter` / `\`+`Enter` insert a newline, `Ctrl+G`
   opens `$EDITOR`, readline-ish `Ctrl+A`/`Ctrl+E`/`Ctrl+W`). `--vim` swaps in a

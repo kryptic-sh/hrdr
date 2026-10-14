@@ -151,8 +151,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   selectable.** On Windows the default is now Git Bash — found on `PATH` or next
   to the installed Git, never the WSL `bash.exe` launcher — with Windows
   PowerShell as the fallback. The `shell` tool takes a `shell` argument naming
-  any installed shell (`bash`, `powershell`, `sh`), and the system prompt lists
-  them with the default and each one's syntax rules (`crates/hrdr-tools`,
+  any installed shell (`bash`, `powershell`, and `sh` outside Windows, where
+  Git's `sh` is the same bash), and the system prompt lists them with the
+  default and each one's syntax rules (`crates/hrdr-tools`,
   `crates/hrdr-agent`).
 - **The system prompt keeps graphical tests off the user's desktop.** A writing
   agent is steered to windowless tests first, then a private display (Xvfb, a
