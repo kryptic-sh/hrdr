@@ -101,7 +101,18 @@ pub fn resume_plan(
     let mut new_cwd = None;
     if !session.cwd.is_empty() && Path::new(&session.cwd) != prev_cwd {
         let target = PathBuf::from(&session.cwd);
-        if target.is_dir() {
+        // The directory comes from the session file, so it gets the same trust
+        // gate `/cwd` applies: an unanswered directory is not walked into
+        // mid-session, where its `AGENTS.md` would load under the tools the
+        // current directory earned.
+        if target.is_dir() && !hrdr_agent::trust::is_trusted(&target) {
+            lines.push(format!(
+                "note: session cwd {} is not a trusted directory — hrdr asks about a \
+                 directory when it opens there, and cannot ask mid-session; staying in {}",
+                hrdr_tools::display_path(&target, unix_style_paths),
+                hrdr_tools::display_path(prev_cwd, unix_style_paths)
+            ));
+        } else if target.is_dir() {
             lines.push(format!(
                 "cwd → {}",
                 hrdr_tools::display_path(&target, unix_style_paths)
@@ -543,6 +554,9 @@ mod reload_message_tests {
             "target"
         });
         std::fs::create_dir(&target).unwrap();
+        // The session was saved where hrdr was opened, and opening it there
+        // asked about the directory.
+        hrdr_agent::trust::trust(&target, true).unwrap();
         for cwd in [&target, &dir.path().join("missing/child")] {
             let session = crate::SessionState {
                 cwd: cwd.display().to_string(),
@@ -580,6 +594,30 @@ mod reload_message_tests {
                 assert_eq!(hrdr_agent::cwd_slug(&session.cwd), slug);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_trust_tests {
+    /// A session saved in a directory nobody answered for does not move the
+    /// tools there: the resume stays put and says why, as `/cwd` would.
+    #[test]
+    fn resuming_into_an_untrusted_directory_stays_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = dir.path().join("previous");
+        let untrusted = dir.path().join("never-answered");
+        std::fs::create_dir(&untrusted).unwrap();
+        let session = crate::SessionState {
+            cwd: untrusted.display().to_string(),
+            ..Default::default()
+        };
+        let plan = super::resume_plan(&session, &prev, "", true);
+        assert!(plan.new_cwd.is_none(), "{:?}", plan.lines);
+        assert!(
+            plan.lines[1].contains("is not a trusted directory"),
+            "{:?}",
+            plan.lines
+        );
     }
 }
 

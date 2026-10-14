@@ -198,6 +198,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Resuming a session no longer moves into a directory nobody trusted.**
+  `/resume` switched the tools to the session's saved directory whenever it
+  existed, skipping the trust check `/cwd` makes, so a session saved in an
+  unanswered checkout could load that checkout's `AGENTS.md` under the tools the
+  current directory earned. It now stays put and says why (`crates/hrdr-app`).
 - **Pasting several lines in Windows Terminal no longer sends each line.** On
   Windows, crossterm reads console input as key presses and never reports a
   paste, so every newline in a paste submitted the message. Under a modern

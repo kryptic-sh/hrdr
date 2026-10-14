@@ -3216,8 +3216,9 @@ software-guard-only hosts (Windows / Linux without Landlock, where `shell` is
 already unconfined and noticed) — resolve remaining dangling intermediates by
 hand or re-check inside `atomic_write`; `verify` executes gate commands parsed
 from repo CI YAML — keep out of `JAIL_ TOOLS` (already is) and consider a
-`--dry-run`; session-file `cwd`/`read_only`/ identity trusted from disk at
-resume — re-validate at adopt.
+`--dry-run`; session-file `read_only` and identity are still trusted from disk
+at resume (same-user files; the `cwd` is re-checked against the trust store
+since 2026-10-15).
 
 **Coverage:** hrdr-tools walked in full incl. `mcp/` and secret_diff; the
 platform-gated backends (Windows LowIntegrity, macOS Seatbelt) were only read —
