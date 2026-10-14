@@ -3141,14 +3141,15 @@ bounds in `parse_imf_fixdate`, the cancelled-shell id-marker in the `UserShell`
 handler, and the `--auto-compact` parse warning — each with a regression test
 that failed before the fix); item 6 open — recorded, not fixed.**
 
-6. **Session-name blowup candidates** — the sub-agent review surfaced five
-   hardening items, none a live defect (generation-invalidated `RunGuard` leak
-   one abort-site away from real; unjoined live-stream forwarders can drop the
-   tail of advisory output; the budget wrap-up message carries
-   `MessageOrigin:: User` skewing compaction tail selection; a
-   non-poison-tolerant `events` lock; a `task_cancel`/handle-push race that
-   reports "Cancelled" while the run continues). **Hardening, not findings** —
-   recorded for triage.
+6. **Hardening candidates from the hrdr-agent review** — none a live defect: a
+   generation-invalidated `RunGuard` leak one abort-site away from real;
+   unjoined live-stream forwarders that can drop the tail of advisory output; a
+   non-poison-tolerant `events` lock in `registry.rs` (a poisoned lock silently
+   stops recording a run's events). Two others are settled: the
+   `task_cancel`/handle-push race (fixed by `BackgroundPublication`, which holds
+   the handle lock while the row is published), and the budget wrap-up prompt
+   counting as a user turn (fixed 2026-10-15 — it is now a
+   `MessageOrigin::Nudge` through `push_user_message`).
 
 **Cleared (top of the list):** sandbox escapes (`..` and dangling-symlink
 canonicalization — the dangling case is a documented accepted write-TOCTOU, and

@@ -1935,13 +1935,23 @@ async fn agent_run_wrap_up_round_never_nudges() {
         .await
         .unwrap();
 
+    // The one harness prompt in history is the wrap-up itself — tagged as the
+    // harness speaking, so compaction does not count it as a user turn — and
+    // not the TODO turn-end nudge.
+    let nudges: Vec<&ChatMessage> = agent
+        .messages()
+        .iter()
+        .filter(|m| m.origin == MessageOrigin::Nudge)
+        .collect();
+    assert_eq!(nudges.len(), 1, "{nudges:?}");
     assert!(
-        !agent
-            .messages()
-            .iter()
-            .any(|m| m.origin == MessageOrigin::Nudge),
-        "the wrap-up round must never trigger a turn-end nudge"
+        nudges[0]
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains(crate::turn_loop::WRAP_UP_PROMPT)),
+        "the wrap-up round must never trigger a turn-end nudge: {nudges:?}"
     );
+    assert!(!crate::compaction::is_user_turn(nudges[0]));
     assert!(
         events.iter().any(|e| matches!(
             e,

@@ -6,6 +6,10 @@ use super::*;
 /// (appended to the last tool result of that round).
 const WRAP_UP_WARNING_ROUNDS: usize = 3;
 
+/// What the harness tells the model when the tool-round budget runs out, ahead
+/// of the final round that is sent with no tools.
+pub(crate) const WRAP_UP_PROMPT: &str = "[The tool-call budget for this turn is exhausted. Do      not request more tool calls. Summarize what you accomplished and what remains to be done.]";
+
 /// Fraction of the tool-round budget after which the model gets one *soft*
 /// warning — numerator over [`CHECKPOINT_WARNING_DEN`].
 ///
@@ -902,11 +906,12 @@ impl Agent {
             "tool-round limit reached ({}) — asking the model to wrap up",
             self.max_steps
         )));
-        Arc::make_mut(&mut self.messages).push(ChatMessage::user(
-            "[The tool-call budget for this turn is exhausted. Do not request more tool \
-             calls. Summarize what you accomplished and what remains to be done.]"
-                .to_string(),
-        ));
+        self.push_user_message(
+            WRAP_UP_PROMPT,
+            // The harness speaking, not the user: compaction must not count it
+            // as a turn when it picks the verbatim tail.
+            MessageOrigin::Nudge,
+        );
         // The push is a user turn the round's snapshot (emitted at the top of
         // the loop) does not cover — snapshot it now so a failure in the
         // wrap-up round below cannot leave agent history and the persisted

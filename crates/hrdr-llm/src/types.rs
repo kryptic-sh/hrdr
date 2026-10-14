@@ -44,9 +44,10 @@ pub enum MessageOrigin {
     User,
     /// A message from another session's agent, never a human turn.
     Peer,
-    /// A synthetic prompt the harness injects when the model ends its turn
-    /// with no tool calls while the shared TODO list still has unfinished
-    /// items — never a real user turn. See `Agent::run`'s turn loop.
+    /// A synthetic prompt the harness injects into a turn — when the model ends
+    /// its turn with no tool calls while the shared TODO list still has
+    /// unfinished items, or when the tool-round budget runs out and the model
+    /// is told to wrap up. Never a real user turn. See `Agent::run`'s turn loop.
     Nudge,
     /// The product of a tool call, delivered as a `Role::User` message because
     /// it arrives after the round that requested it closed — a detached

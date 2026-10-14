@@ -475,7 +475,8 @@ fn carry_prior_summary(full: &[ChatMessage], window: Vec<ChatMessage>) -> Vec<Ch
 /// `Role::User` alone is not the question. hrdr pushes FOUR kinds of user-role
 /// message through the one `push_user_message` chokepoint, and only one of them
 /// is the user speaking: a [`MessageOrigin::Nudge`] is the harness prompting
-/// itself about unfinished TODOs, a [`MessageOrigin::Tool`] is a detached
+/// itself (about unfinished TODOs, or to wrap up when the tool-round budget runs
+/// out), a [`MessageOrigin::Tool`] is a detached
 /// sub-agent's report arriving after its round closed, and a
 /// [`MessageOrigin::Summary`] is compaction's own output. Counting those as
 /// turns spends the verbatim tail budget on messages the user never sent —

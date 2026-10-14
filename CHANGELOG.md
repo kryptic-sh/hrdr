@@ -198,6 +198,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Compaction no longer counts the tool-budget wrap-up as a user turn.** When a
+  turn ran out of tool rounds, the "summarize and stop" prompt hrdr sends the
+  model went into history as if the user had said it, so compaction treated it
+  as a real turn when choosing what to keep word for word. It is now tagged as
+  the harness speaking, and carries the timestamp every other user-role message
+  gets (`crates/hrdr-agent`).
 - **Resuming a session no longer moves into a directory nobody trusted.**
   `/resume` switched the tools to the session's saved directory whenever it
   existed, skipping the trust check `/cwd` makes, so a session saved in an
