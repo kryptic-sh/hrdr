@@ -3325,17 +3325,24 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    `hrdr-app/src/highlight.rs`: full-output `block.lines.clone()` per call even
    when one line is new; each streaming frame of a growing code block is O(total
    lines). Fix: return a borrow or share lines behind an `Rc`.
-9. **MEDIUM — per-file `canonicalize_nearest` in the grep/replace walkers.**
-   `grep.rs`/`replace.rs`: every walked file pays an lstat + full realpath
-   (≈depth+2 syscalls) just to answer the deny-list check; 20 K files ≈ 100–200
-   K extra syscalls. Fix: run `secret_file_reason` on the raw walker path first
-   (zero syscalls for `.env`/`id_rsa`/`.ssh` — the common case) and canonicalize
-   only when the raw check is `None`.
+9. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
+   walkers.** The recorded fix (raw-path `secret_file_reason` first) saves
+   nothing: the common file is not a secret, so it is still canonicalized. The
+   one real saving — canonicalize the root once and join each entry's relative
+   path — is only sound if no directory component can be a link, and on Windows
+   a junction directory inside the tree can be walked into; a shortcut there
+   could let a junction into `~/.ssh` past the deny-list. A few syscalls per
+   file are not worth weakening a secret-file check.
 10. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
     `metadata().len()` guard and no match-count bound on memory (the read
     completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
     (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
-    and stop once `matches > max_matches`.
+    and stop once `matches > max_matches`. Note 2026-10-14: a size skip would
+    silently drop large files from results (`rg` searches them), so streaming is
+    the fix that keeps behaviour — it needs a binary check up front
+    (`read_to_string` rejects non-UTF-8 today, which streaming would only
+    discover mid-file after emitting matches) and a ring buffer for `-C`
+    context.
 11. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
     `WindowScanner`: each page re-counts newlines from the start — O(N) per
     page, ~O(N×pages) over a large file paged start-to-finish. Fix: let
@@ -3739,19 +3746,15 @@ Ranked by impact, biggest first:
 7. **MEDIUM (re-confirmed, 08-30 #8) — `HighlightCache` clones every accumulated
    line per call.** `crates/hrdr-app/src/highlight.rs:140` `block.lines.clone()`
    per streaming frame of a growing code block. Open.
-8. **MEDIUM (re-confirmed, 08-30 #10) — per-file `canonicalize_nearest` in the
-   grep/replace walkers.** `grep.rs:233,339` / `replace.rs:351` — every walked
-   file pays an lstat + full realpath for the deny-list check. Fix as recorded
-   (raw-path `secret_file_reason` first). Open.
-9. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
+8. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
    cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
    matches only after the whole read. Open.
-10. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
-    request.** `catalog.rs:219,257,318-324`; caller sites unchanged
-    (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
-11. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
+9. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
+   request.** `catalog.rs:219,257,318-324`; caller sites unchanged
+   (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
+10. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
     page.** `WindowScanner::new` (`read.rs:240,573`). Open.
-12. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+11. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
     acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
     `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
     in the transcript projection (`transcript_log.rs:114-115`); runs per
@@ -3760,10 +3763,10 @@ Ranked by impact, biggest first:
     `to_write` feeds both the deque and the transcript write, so
     `Record::from_event` would need to borrow the payload from the deque entry.
     Still available; open.
-13. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+12. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
     `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
     unchanged. Open.
-14. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+13. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
     commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
     (#16 no-usage re-estimate — held open by decision) or the hrdr-tools
     dispatch (#17 args clone). Presumed open-by-construction.
