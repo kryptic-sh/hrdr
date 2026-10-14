@@ -1322,12 +1322,12 @@ fn todo_lines(app: &App) -> Option<(Vec<Line<'static>>, Option<usize>)> {
                 .collect()
         })
         .unwrap_or_default();
-    let mut todos = app
-        .panes
-        .active_pane()
-        .todos
-        .lock()
-        .map(|t| t.clone())
+    // Sorted by reference under the lock: this runs every frame, and the rows
+    // below format fresh strings anyway, so cloning the items would buy nothing.
+    let todos_guard = app.panes.active_pane().todos.lock().ok();
+    let mut todos: Vec<&hrdr_tools::TodoItem> = todos_guard
+        .as_deref()
+        .map(|todos| todos.iter().collect())
         .unwrap_or_default();
     if goals.is_empty() && todos.is_empty() {
         return None;

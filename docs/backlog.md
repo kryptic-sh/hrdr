@@ -3306,13 +3306,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    Related to prior backlog entry `## Frame cost measured 2026-08-13` #1 (the
    "still walks every transcript entry" gap — its fix shape is the same
    `ChunkRows::Lazy` extension) — **cross-listed**.
-6. **MEDIUM — todo panel clones and sorts the entire todo list every frame.**
-   `ui.rs` `todo_lines`: `todos.clone()` (every item's Strings) + `sort_by_key`
-   - `retain` per frame at up to 8.3 Hz; bound is todo count, not the panel's
-     row cap; `spinner_live` also locks the todos mutex every frame. Fix:
-     memoize the rendered panel lines invalidated on todo-set change, or sort
-     indexes and count without cloning item Strings.
-7. **MEDIUM — editor wrap layout recomputed over the whole buffer on every
+6. **MEDIUM — editor wrap layout recomputed over the whole buffer on every
    keystroke.** `hrdr-editor/src/plain.rs` memo invalidates on every mutation
    and recomputes `compute_wrapped_layout` over the whole buffer + builds a
    fresh String per compute; typing at the end of a large buffer is O(buffer)
@@ -3321,11 +3315,11 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    (only the wrapped portion after the edited line can change), or recompute
    only when buffer/width changed since the last frame — the loop's drain
    already coalesces keystrokes.
-8. **MEDIUM — `HighlightCache` clones every accumulated line on each call.**
+7. **MEDIUM — `HighlightCache` clones every accumulated line on each call.**
    `hrdr-app/src/highlight.rs`: full-output `block.lines.clone()` per call even
    when one line is new; each streaming frame of a growing code block is O(total
    lines). Fix: return a borrow or share lines behind an `Rc`.
-9. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
+8. **Declined 2026-10-14 — per-file `canonicalize_nearest` in the grep/replace
    walkers.** The recorded fix (raw-path `secret_file_reason` first) saves
    nothing: the common file is not a secret, so it is still canonicalized. The
    one real saving — canonicalize the root once and join each entry's relative
@@ -3333,22 +3327,21 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
    a junction directory inside the tree can be walked into; a shortcut there
    could let a junction into `~/.ssh` past the deny-list. A few syscalls per
    file are not worth weakening a secret-file check.
-10. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
-    `metadata().len()` guard and no match-count bound on memory (the read
-    completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
-    (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
-    and stop once `matches > max_matches`. Note 2026-10-14: a size skip would
-    silently drop large files from results (`rg` searches them), so streaming is
-    the fix that keeps behaviour — it needs a binary check up front
-    (`read_to_string` rejects non-UTF-8 today, which streaming would only
-    discover mid-file after emitting matches) and a ring buffer for `-C`
-    context.
-11. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
+9. **MEDIUM — grep reads every file whole with no size cap.** `grep.rs`: no
+   `metadata().len()` guard and no match-count bound on memory (the read
+   completes before `GREP_MAX_MATCHES` can cut it). Fix: size guard first
+   (mirror `replace`'s >2 MiB skip) or stream lines through a bounded `BufRead`
+   and stop once `matches > max_matches`. Note 2026-10-14: a size skip would
+   silently drop large files from results (`rg` searches them), so streaming is
+   the fix that keeps behaviour — it needs a binary check up front
+   (`read_to_string` rejects non-UTF-8 today, which streaming would only
+   discover mid-file after emitting matches) and a ring buffer for `-C` context.
+10. **LOW — paged reads re-scan the file from byte 0 on every page.** `read.rs`
     `WindowScanner`: each page re-counts newlines from the start — O(N) per
     page, ~O(N×pages) over a large file paged start-to-finish. Fix: let
     `ReadRecord` carry the last-scanned byte offset and resume there (coverage
     already guarantees contiguous-from-line-1 paging).
-12. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
+11. **LOW — per-chunk event clones on the streamed-delta path.** `registry.rs`
     `record` + `transcript_log.rs`: ~3-4 small allocations + 3 lock acquisitions
     per chunk (per token group). Bounded per token, the hottest loop in
     hrdr-agent; a 60k-token reply ≈ 240k small allocations. Fix: move each event
@@ -3357,7 +3350,7 @@ items re-found (see cross-list). **Status: all open — recorded, not fixed.**
     (Prior `## Performance review — second pass 2026-08-04` #2 made the same
     measurement and dropped it as infeasible for the `Record::from_event` half —
     this adds the still-available `deque double-push` half.)
-13. **LOW — no-usage fallback re-estimates the whole history every round.**
+12. **LOW — no-usage fallback re-estimates the whole history every round.**
     `budget.rs`: `estimate_tokens_in_messages` per round when the server reports
     no usage — O(messages) per round. Prior backlog item (`2026-08-04` #3)
     dropped the running-counter fix as risk > value (~µs per round) — noted, not
@@ -3740,21 +3733,18 @@ Ranked by impact, biggest first:
    frame. Source-entry scanning and dirty-prefix assembly are cached; cache the
    static materialized prefix while resolving dynamic header, reasoning, and
    tool-group bodies per frame. Open.
-6. **MEDIUM (re-confirmed, 08-30 #6) — todo panel clones and sorts the whole
-   list every frame.** `todo_lines` `ui.rs:1247-1261` (`todos.clone()` +
-   `sort_by_key` per frame; `spinner_live` also locks the todos mutex). Open.
-7. **MEDIUM (re-confirmed, 08-30 #8) — `HighlightCache` clones every accumulated
+6. **MEDIUM (re-confirmed, 08-30 #8) — `HighlightCache` clones every accumulated
    line per call.** `crates/hrdr-app/src/highlight.rs:140` `block.lines.clone()`
    per streaming frame of a growing code block. Open.
-8. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
+7. **MEDIUM (re-confirmed, 08-30 #11) — grep reads each file whole with no size
    cap.** `grep.rs:244` `read_to_string` per file; `GREP_MAX_MATCHES` cuts
    matches only after the whole read. Open.
-9. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
+8. **MEDIUM (re-confirmed, 08-30 #19) — catalog cross-provider re-scan per
    request.** `catalog.rs:219,257,318-324`; caller sites unchanged
    (`client.rs:1263,1365,1390`, `delegation.rs:226`). Open.
-10. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
-    page.** `WindowScanner::new` (`read.rs:240,573`). Open.
-11. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
+9. **LOW (re-confirmed, 08-30 #14) — paged reads re-scan from byte 0 on every
+   page.** `WindowScanner::new` (`read.rs:240,573`). Open.
+10. **LOW (re-confirmed, 08-30 #15) — per-event double-clone + 3 lock
     acquisitions in `record`.** `registry.rs:416/424/433` (`ev.clone()` into
     `to_write`) then `:438` (`log.push(w.clone())`), plus a third payload clone
     in the transcript projection (`transcript_log.rs:114-115`); runs per
@@ -3763,10 +3753,10 @@ Ranked by impact, biggest first:
     `to_write` feeds both the deque and the transcript write, so
     `Record::from_event` would need to borrow the payload from the deque entry.
     Still available; open.
-12. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
+11. **LOW (re-confirmed, 08-30 #20) — SSE decoder byte-at-a-time.**
     `sse.rs:117-126` — the shared-drain refactor wrapped the same `push`,
     unchanged. Open.
-13. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
+12. **08-30 #12/#13/#16/#17 (LOW) — not re-verified, stand as recorded.** No
     commit since 08-30 touches `replace.rs` (#12 double-match pass), `budget.rs`
     (#16 no-usage re-estimate — held open by decision) or the hrdr-tools
     dispatch (#17 args clone). Presumed open-by-construction.
