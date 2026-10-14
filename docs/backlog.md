@@ -2689,16 +2689,27 @@ and **not** fixed.
   ignores `HOME`/`USERPROFILE` there, so a test that writes through a `dirs`
   fallback lands in the runner's real profile, not the sentinel. Its temp-dir
   check does work.
-- **One Windows leak-guard run left 17 `.tmpXXXXXX` dirs in `%TEMP%`**, in the
-  same run a `!command` e2e test failed; the next run was clean. Not reproduced,
-  so not attributed. A likely shape if it returns: Windows cannot delete a
-  directory that is a live process's cwd or holds an open file, so a `TempDir`
-  dropped while a spawned child is still being torn down leaks silently. The
-  guard now lists what each leaked dir holds, which names the test. During the
-  2026-10-09 home-display slice, an additional armed leak-guard failure was
-  reported: leftover `.tmp*` directories containing `data`, while the
-  real-user-state sentinel passed. This result has not been independently
-  reproduced or attributed; do not report the armed guard as green.
+- **Windows test runs with a failure leaked their temp dirs — fixed
+  2026-10-15.** libtest ends a binary with a failed test through
+  `std::process::exit`, which on Windows is `ExitProcess`: no `atexit` handler
+  runs, and `dtor` registers through `atexit` there, so `remove_sandbox` and
+  `drop_deferred_temp_dirs` were skipped and every failing run left its sandbox
+  root plus each `defer_tempdir` dir behind (measured: a passing `hrdr-tui` lib
+  run left 0, the same run with one forced failure left 62). That is what the
+  earlier "17 `.tmp` dirs, in a run where a test failed" sightings were. Each
+  sandbox root now holds an exclusively locked `.alive` file for its process's
+  life, and every test binary's ctor removes roots whose lock it can take
+  (`sweep_abandoned_sandboxes`; roots without the file go after an hour);
+  deferred dirs are created inside the root (`hrdr_test_support::tempdir`).
+  Verified on Windows: the failing run now leaves only its root, which the next
+  run removes. Not cleaned: `.tmp*` dirs leaked into the system temp dir before
+  the fix — 16,972 on the owner's machine, not all necessarily hrdr's — which
+  nothing can attribute safely.
+- **`runtime_reload_restyles_warm_theme_picker_and_completion` failed once**
+  under the local Windows leak guard (2026-10-15):
+  `app.active_completions().unwrap()` was `None` inside the style loop
+  (`hrdr-tui/src/app.rs`). It passed in every other run that day, including the
+  next leak-guard run. Not investigated.
 - **Not reviewed:** the `hjkl-clipboard` Windows backend.
 
 ## Correctness review 2026-08-14

@@ -58,13 +58,15 @@ pub const WINDOWS_USERPROFILE_CHILD_ENV: &str = "HRDR_TEST_WINDOWS_USERPROFILE_C
 /// 1.x requires the ctor to declare it.
 #[ctor::ctor(unsafe)]
 fn sandbox_user_state() {
-    let root = std::env::temp_dir().join(format!("hrdr-test-sandbox-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("{SANDBOX_PREFIX}{}", std::process::id()));
     // A process with this pid is long gone; start from nothing.
     let _ = std::fs::remove_dir_all(&root);
     let home = root.join("home");
-    for dir in ["home", "data", "config", "state", "cache", "runtime"] {
+    for dir in ["home", "data", "config", "state", "cache", "runtime", "tmp"] {
         std::fs::create_dir_all(root.join(dir)).expect("a test sandbox is creatable");
     }
+    hold_sandbox_alive(&root);
+    sweep_abandoned_sandboxes(&root);
 
     // SAFETY: a ctor runs before `main`, and therefore before the test harness has
     // created any thread. This is the one point in a test binary's life at which
@@ -132,6 +134,91 @@ fn remove_sandbox() {
     }
 }
 
+/// Every test binary's sandbox root is `<temp>/<SANDBOX_PREFIX><pid>`.
+const SANDBOX_PREFIX: &str = "hrdr-test-sandbox-";
+
+/// The file in a sandbox root its process holds an exclusive lock on for life.
+const ALIVE_FILE: &str = ".alive";
+
+/// How old a sandbox root with no [`ALIVE_FILE`] must be before a sweep removes
+/// it: long enough that it cannot be a sibling binary still between creating its
+/// root and locking the file.
+const UNLOCKED_SANDBOX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The lock that marks this process's sandbox as in use; never released while the
+/// process runs, and released by the OS however the process ends.
+static SANDBOX_ALIVE: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Lock `root`'s [`ALIVE_FILE`] for the life of the process.
+///
+/// The exit dtors cannot be the only cleanup: on Windows `std::process::exit` —
+/// how libtest ends a binary with a failed test — calls `ExitProcess`, which runs
+/// no `atexit` handler, and `dtor` registers through `atexit` there. So every
+/// failing run used to leave its whole sandbox behind. A kernel lock is released
+/// on any exit, which is what lets [`sweep_abandoned_sandboxes`] tell an
+/// abandoned root from a live one.
+fn hold_sandbox_alive(root: &Path) {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join(ALIVE_FILE))
+        .expect("a test sandbox's liveness file is creatable");
+    file.try_lock()
+        .expect("a fresh test sandbox's liveness file is unlocked");
+    let _ = SANDBOX_ALIVE.set(file);
+}
+
+/// Remove sandbox roots their processes left behind, which a live process's
+/// [`ALIVE_FILE`] lock rules out. A root with no such file predates it, or
+/// belongs to a sibling binary that has not locked it yet, so it goes only once
+/// older than [`UNLOCKED_SANDBOX_AGE`].
+///
+/// Best-effort, like the exit dtor it backs up: two binaries starting together
+/// may race to remove the same root, and a leftover that resists removal is
+/// retried by the next run rather than failing this one.
+fn sweep_abandoned_sandboxes(own: &Path) {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix(SANDBOX_PREFIX))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if path == own || !sandbox_is_abandoned(&path) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(ipc_parent_for(&path, pid));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// Whether nothing holds `root` — see [`sweep_abandoned_sandboxes`].
+fn sandbox_is_abandoned(root: &Path) -> bool {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(ALIVE_FILE))
+    {
+        // Taking the lock proves its holder is gone; the handle is closed before
+        // the caller removes the directory.
+        Ok(file) => file.try_lock().is_ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::metadata(root)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= UNLOCKED_SANDBOX_AGE),
+        Err(_) => false,
+    }
+}
+
 /// The parent of the suite's session-messaging discovery directory.
 ///
 /// Unix sockets live in it, and a socket path is capped at about a hundred
@@ -139,11 +226,24 @@ fn remove_sandbox() {
 /// under the sandbox would not fit, so unix uses a short per-process `/tmp`
 /// directory instead, removed at exit like the sandbox.
 fn ipc_parent(root: &Path) -> PathBuf {
+    ipc_parent_for(root, std::process::id())
+}
+
+/// [`ipc_parent`] for the process `pid` that owns `root`.
+fn ipc_parent_for(root: &Path, pid: u32) -> PathBuf {
     if cfg!(unix) {
-        PathBuf::from("/tmp").join(format!("hrdr-test-ipc-{}", std::process::id()))
+        PathBuf::from("/tmp").join(format!("hrdr-test-ipc-{pid}"))
     } else {
         root.join("runtime")
     }
+}
+
+/// A private temp dir inside this process's sandbox root rather than the system
+/// temp dir — what a test hands to [`defer_tempdir`] should come from here, so
+/// that a run whose exit dtors never ran leaves it where the next run's sweep
+/// reclaims it (see [`hold_sandbox_alive`]).
+pub fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(sandbox_root().join("tmp")).expect("a sandbox temp dir is creatable")
 }
 
 /// Keep a test's private temp dir alive until the test binary exits.
@@ -413,6 +513,36 @@ mod tests {
         assert_eq!(
             std::env::var_os("XDG_DATA_HOME").as_deref(),
             Some(sandboxed.as_os_str())
+        );
+    }
+
+    /// A sandbox is reclaimed only once nothing holds its liveness lock, so a
+    /// sweep never removes a running binary's root — this process's own
+    /// included — and does remove one whose process ended without its dtors.
+    #[test]
+    fn only_an_unheld_sandbox_is_abandoned() {
+        assert!(
+            !super::sandbox_is_abandoned(&super::sandbox_root()),
+            "this process holds its own sandbox"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let alive = std::fs::File::create(root.path().join(super::ALIVE_FILE)).unwrap();
+        alive.try_lock().unwrap();
+        assert!(
+            !super::sandbox_is_abandoned(root.path()),
+            "a held lock means a live owner"
+        );
+        drop(alive);
+        assert!(
+            super::sandbox_is_abandoned(root.path()),
+            "a released lock means the owner is gone"
+        );
+
+        let unlocked = tempfile::tempdir().unwrap();
+        assert!(
+            !super::sandbox_is_abandoned(unlocked.path()),
+            "a fresh root with no liveness file may be a sibling still starting"
         );
     }
 }

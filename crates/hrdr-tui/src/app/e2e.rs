@@ -780,7 +780,7 @@ fn isolated_data_home() -> DataHomeGuard {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // A previous test's panic must not poison the lock for everyone else.
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = hrdr_test_support::tempdir();
     // SAFETY: the lock above serializes every writer and reader of these vars.
     unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
     unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
