@@ -2640,7 +2640,18 @@ and **not** fixed.
   `host.info_log.last().unwrap()`. The serial suite and nextest passed.
   Investigate shared environment/config state before attributing the failure or
   changing the test; do not treat serial success as proof that parallel
-  execution is reliable.
+  execution is reliable. Narrowed 2026-10-15, cause still not found: an empty
+  `info_log` means `persist_setting` SUCCEEDED (the default host logs only on
+  error), so `config.toml` was valid again between the test writing invalid
+  bytes and persisting — something rewrote it mid-test. Ruled out by reading:
+  every dispatch test that runs a config-writing command holds `CONFIG_LOCK`
+  (the two registry tests included); `browser_login_completion_line` writes
+  config directly but its only test passes `token_saved: false`; `/doctor` and
+  `helpers.rs`'s reload test only read the path; no `spawn_blocking` work writes
+  config; leftover async tasks are dropped unpolled with each current-thread
+  `#[tokio::test]` runtime; nothing in `hrdr-app` sets env vars, and
+  `with_test_env` moves only `XDG_DATA_HOME`. Not yet checked: writers reached
+  through `hrdr-agent` (agent construction, `TestHost::new`).
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
