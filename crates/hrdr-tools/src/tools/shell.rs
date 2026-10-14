@@ -1206,7 +1206,9 @@ mod tests {
     fn identify(shell: super::Shell) -> &'static str {
         match shell {
             super::Shell::Bash => "test -n \"$BASH_VERSION\" && echo \"is\"\"-bash\"",
-            super::Shell::Posix => "case \"${0##*/}\" in sh|sh.exe) echo \"is\"\"-posix\";; esac",
+            super::Shell::Posix => {
+                "{ [ -z \"$BASH_VERSION\" ] || shopt -oq posix; } && echo \"is\"\"-posix\""
+            }
             super::Shell::PowerShell => "if ($PSVersionTable) { 'is' + '-powershell' }",
         }
     }
