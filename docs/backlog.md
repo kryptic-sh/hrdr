@@ -2684,11 +2684,13 @@ and **not** fixed.
   `atomic_write_preserves_mode_and_replaces_content`), `O_NOFOLLOW`
   (`open_wire_log_*`, `owner_only_options_no_follow_refuses_a_symlink` — no
   Windows equivalent exists, see Hardening notes) and the Landlock backend.
-  **Not unix by nature, still gated:** the symlink case in `hrdr-agent`'s
-  `delegation.rs` — grep `std::os::unix::fs::symlink`. What else remains is unix
-  by nature: the `hrdr-llm` `O_NOFOLLOW`/mode-bit tests, `sandbox.rs`'s `/etc`
-  link, and `lsp.rs`'s `within_root` case, which re-spells the path by letter
-  case on Windows instead. Also ported 2026-10-15:
+  **Not unix by nature, still gated:** none. The last,
+  `a_jailed_delegation_requires_a_contained_cwd`'s symlink escape, now links to
+  the caller's own parent instead of `/` and fails on Windows when containment
+  is checked lexically. What remains is unix by nature: the `hrdr-llm`
+  `O_NOFOLLOW`/mode-bit tests, `sandbox.rs`'s `/etc` link, and `lsp.rs`'s
+  `within_root` case, which re-spells the path by letter case on Windows
+  instead. Also ported 2026-10-15:
   `a_dangling_symlink_cannot_escape_the_writable_roots` (the dangling-link
   sandbox escape; fails on Windows when dangling links go unresolved) and the
   symlink half of `a_writable_root_is_writable_all_the_way_down` — which cannot
