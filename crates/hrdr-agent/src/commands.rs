@@ -1048,7 +1048,6 @@ mod tests {
     /// layout — does contribute its files, while a `shared -> …` link dropped
     /// inside a command dir contributes nothing. Both halves are asserted
     /// because the two look identical from outside and behave oppositely.
-    #[cfg(unix)]
     #[test]
     fn a_symlinked_dir_is_walked_but_a_symlink_inside_one_is_not() {
         let dotfiles = tempfile::tempdir().unwrap();
@@ -1056,7 +1055,12 @@ mod tests {
 
         let linked = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(linked.path().join(".hrdr")).unwrap();
-        std::os::unix::fs::symlink(dotfiles.path(), linked.path().join(".hrdr/commands")).unwrap();
+        if !hrdr_test_support::symlink_or_skip(
+            dotfiles.path(),
+            &linked.path().join(".hrdr/commands"),
+        ) {
+            return;
+        }
         let commands = discover_commands(linked.path(), crate::prompt::ProjectInstructions::Load);
         assert!(
             commands.iter().any(|c| c.name == "ship"),
@@ -1066,7 +1070,10 @@ mod tests {
         let nested = tempfile::tempdir().unwrap();
         let dir = nested.path().join(".hrdr/commands");
         std::fs::create_dir_all(&dir).unwrap();
-        std::os::unix::fs::symlink(dotfiles.path(), dir.join("shared")).unwrap();
+        assert!(hrdr_test_support::symlink_or_skip(
+            dotfiles.path(),
+            &dir.join("shared")
+        ));
         let commands = discover_commands(nested.path(), crate::prompt::ProjectInstructions::Load);
         assert!(
             !commands.iter().any(|c| c.name == "shared/ship"),
@@ -1083,14 +1090,15 @@ mod tests {
     /// rather than an assertion. Today the walk follows no link below the dir
     /// itself; this is what would fail if a later walk did, without cycle
     /// detection.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_cycle_does_not_hang_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let hrdr = dir.path().join(".hrdr/commands");
         std::fs::create_dir_all(&hrdr).unwrap();
         std::fs::write(hrdr.join("ship.md"), "ship it").unwrap();
-        std::os::unix::fs::symlink(&hrdr, hrdr.join("loop")).unwrap();
+        if !hrdr_test_support::symlink_or_skip(&hrdr, &hrdr.join("loop")) {
+            return;
+        }
 
         let commands = discover_commands(dir.path(), crate::prompt::ProjectInstructions::Load);
         assert!(commands.iter().any(|c| c.name == "ship"));

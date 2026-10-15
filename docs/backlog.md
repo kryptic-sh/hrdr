@@ -2672,21 +2672,21 @@ and **not** fixed.
   `atomic_write_preserves_mode_and_replaces_content`), `O_NOFOLLOW`
   (`open_wire_log_*`, `owner_only_options_no_follow_refuses_a_symlink` — no
   Windows equivalent exists, see Hardening notes) and the Landlock backend.
-  **Not unix by nature, still gated:** the commands/skills/trust discovery
-  symlink tests, plus symlink tests in `hrdr-llm` (`client.rs`, `fs.rs`),
-  `hrdr-agent` (`delegation.rs`), and `hrdr-tools` (`sandbox.rs`, `tree.rs`,
-  `lsp.rs`'s other, and two in `lib.rs`) — grep `std::os::unix::fs::symlink`.
-  The guards they cover do run on Windows. `hrdr_test_support::symlink_or_skip`
-  is the portable helper — file or directory link by target kind, skipping
-  locally without the privilege and failing on CI. Ported 2026-10-15, each shown
-  to fail on Windows when its guard is broken:
-  `atomic_write_writes_through_a_symlink`,
+  **Not unix by nature, still gated:** symlink tests in `hrdr-llm` (`client.rs`,
+  `fs.rs`), `hrdr-agent` (`delegation.rs`), and `hrdr-tools` (`sandbox.rs`,
+  `tree.rs`, `lsp.rs`'s other, and two in `lib.rs`) — grep
+  `std::os::unix::fs::symlink`. The guards they cover do run on Windows.
+  `hrdr_test_support::symlink_or_skip` is the portable helper — file or
+  directory link by target kind, skipping locally without the privilege and
+  failing on CI. Ported 2026-10-15, each shown to fail on Windows when its guard
+  is broken: `atomic_write_writes_through_a_symlink`,
   `guard_not_swapped_rejects_a_path_repointed_after_open`,
-  `a_secret_line_memo_is_a_per_run_snapshot`,
-  `confinement_resolves_a_symlinked_workspace_root` (which needed `file_uri` in
-  place of a hand-built `file://` string). Expect `\\?\` canonical prefixes and
-  file-URI formatting in the rest. `a_bang_command_runs_unsandboxed` stays
-  unix-only on purpose (its doc says why).
+  `a_secret_line_memo_is_a_per_run_snapshot`, the commands/skills discovery and
+  trust symlink tests, `confinement_resolves_a_symlinked_workspace_root` (which
+  needed `file_uri` in place of a hand-built `file://` string). Expect `\\?\`
+  canonical prefixes and file-URI formatting in the rest.
+  `a_bang_command_runs_unsandboxed` stays unix-only on purpose (its doc says
+  why).
 - **The Windows leak guard sees less than the others.** `dirs::home_dir()`
   ignores `HOME`/`USERPROFILE` there, so a test that writes through a `dirs`
   fallback lands in the runner's real profile, not the sentinel. Its temp-dir

@@ -1131,7 +1131,6 @@ mod tests {
     /// does contribute its bundles, while a `shared -> …` link dropped inside a
     /// root contributes nothing. Both halves are asserted because the two look
     /// identical from outside and behave oppositely.
-    #[cfg(unix)]
     #[test]
     fn a_symlinked_root_is_walked_but_a_symlink_inside_one_is_not() {
         let dotfiles = tempfile::tempdir().unwrap();
@@ -1139,8 +1138,12 @@ mod tests {
 
         let linked_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(linked_root.path().join(".hrdr")).unwrap();
-        std::os::unix::fs::symlink(dotfiles.path(), linked_root.path().join(".hrdr/skills"))
-            .unwrap();
+        if !hrdr_test_support::symlink_or_skip(
+            dotfiles.path(),
+            &linked_root.path().join(".hrdr/skills"),
+        ) {
+            return;
+        }
         let found = discover_skills(linked_root.path(), crate::prompt::ProjectInstructions::Load);
         assert!(
             found.skills.iter().any(|s| s.name == "ship"),
@@ -1151,7 +1154,10 @@ mod tests {
         let nested = tempfile::tempdir().unwrap();
         let root = nested.path().join(".hrdr/skills");
         std::fs::create_dir_all(&root).unwrap();
-        std::os::unix::fs::symlink(dotfiles.path(), root.join("shared")).unwrap();
+        assert!(hrdr_test_support::symlink_or_skip(
+            dotfiles.path(),
+            &root.join("shared")
+        ));
         let found = discover_skills(nested.path(), crate::prompt::ProjectInstructions::Load);
         assert!(
             found.skills.is_empty(),
@@ -1162,13 +1168,14 @@ mod tests {
 
     /// A symlink cycle inside a skill root must not hang discovery — a liveness
     /// guard, so the failure it catches is the run never returning.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_cycle_does_not_hang_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".hrdr/skills");
         bundle(&root, "ship", &skill_md("ship", "d", "Body."));
-        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        if !hrdr_test_support::symlink_or_skip(&root, &root.join("loop")) {
+            return;
+        }
 
         let found = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
         assert!(found.skills.iter().any(|s| s.name == "ship"));

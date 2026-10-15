@@ -290,14 +290,15 @@ mod tests {
     /// A symlink into a trusted tree is not a way to borrow its answer: both
     /// spellings resolve to the same canonical path, so the answer is the same
     /// one, not a second one.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_resolves_to_the_directory_it_points_at() {
         let (_store, _lock) = private_store();
         let real = tempfile::tempdir().unwrap();
         let link_parent = tempfile::tempdir().unwrap();
         let link = link_parent.path().join("link");
-        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        if !hrdr_test_support::symlink_or_skip(real.path(), &link) {
+            return;
+        }
 
         trust(&link, true).unwrap();
         assert!(
