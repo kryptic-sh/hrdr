@@ -1710,7 +1710,17 @@ pane, a relative `/cwd` resolves against main's cwd, moves only the sub-agent,
 then repoints the global chrome as if main had moved. A bare `/cwd` afterwards
 contradicts the status bar. `/status` has the same split — main's cwd beside the
 active agent's message count. Needs a call: derive the base from `host.agent()`,
-or add `active_cwd()` so both halves name one agent.
+or add `active_cwd()` so both halves name one agent. **Re-checked 2026-10-15,
+still true:** `TuiHost::agent` is `active_agent()` ("commands act on the agent
+you are looking at") while `TuiHost::cwd` is `agent_cwd(&self.app.agent)`, and
+`cwd_changed` → `App::apply_cwd_view` repoints session-wide state (status-bar
+dir, git branch, file index and watcher, `rediscover`). **Question for the
+owner**, options: (a) `/cwd` on a sub-agent pane reports and moves that
+sub-agent only, leaving session chrome alone (needs `active_cwd()` and a
+`cwd_changed` that knows which agent moved); (b) bare `/cwd` reports the viewed
+agent's directory, but moving one is refused on a sub-agent pane ("`/cwd` moves
+the session — switch to the main pane"). Recommended: (b) — small, and a
+sub-agent's directory is fixed by the `task` that started it.
 
 **Checked and fine, so nobody re-derives it:** the `bool` contract is sound —
 every in-arm return is `true`, only the unknown arm and the non-`/` guard return
