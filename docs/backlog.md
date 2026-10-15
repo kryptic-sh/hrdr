@@ -2684,7 +2684,7 @@ and **not** fixed.
   `guard_not_swapped_rejects_a_path_repointed_after_open`,
   `a_secret_line_memo_is_a_per_run_snapshot`,
   `confinement_resolves_a_symlinked_workspace_root` (which needed `file_uri` in
-  place of a hand-built `file://` string). Expect `\?\` canonical prefixes and
+  place of a hand-built `file://` string). Expect `\\?\` canonical prefixes and
   file-URI formatting in the rest. `a_bang_command_runs_unsandboxed` stays
   unix-only on purpose (its doc says why).
 - **The Windows leak guard sees less than the others.** `dirs::home_dir()`
