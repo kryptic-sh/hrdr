@@ -351,10 +351,12 @@ push each verified slice to `main` before proceeding to the next slice.
    (`hrdr-wip/…tar.gz`: no such directory); main and tags are unaffected. That
    failure is currently what stops such a run from publishing — see "A manual CI
    run publishes from any branch" under the owner questions; do not fix the
-   naming alone. The superseded branches `wip/windows-paste-transport` (the
-   original probes) and `wip/windows-paste-transport-rebased` /
-   `wip/windows-paste-vt-input` (this work, now in `main`) can be deleted — the
-   first only on the owner's word, since it predates this session.
+   naming alone. `wip/windows-paste-vt-input`, the merged work, was deleted
+   2026-10-16. Two branches remain on origin, neither merged:
+   `wip/windows-paste-transport` (the original probes, also local) and
+   `wip/windows-paste-transport-rebased` (the same probe commit rebased — its
+   tip is not in `main`, despite having been called merged here). Both only on
+   the owner's word.
 10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     **[Deferred — question for the owner; see the index at the top]** Deferred
     until the earlier queued work is finished. Compare hrdr's
@@ -2817,9 +2819,9 @@ and **not** fixed.
   (`sweep_abandoned_sandboxes`; roots without the file go after an hour);
   deferred dirs are created inside the root (`hrdr_test_support::tempdir`).
   Verified on Windows: the failing run now leaves only its root, which the next
-  run removes. Not cleaned: `.tmp*` dirs leaked into the system temp dir before
-  the fix — 16,972 on the owner's machine, not all necessarily hrdr's — which
-  nothing can attribute safely.
+  run removes. The `.tmp*` dirs leaked into the system temp dir before the fix —
+  17,297 on the owner's machine, all `tempfile`-shaped and none touched in the
+  last hour — were deleted on the owner's word 2026-10-16.
 - **Not reviewed:** the `hjkl-clipboard` Windows backend.
 
 ## Correctness review 2026-08-14
