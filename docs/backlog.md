@@ -1530,7 +1530,14 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   The guarantee left on Windows is the containing per-user directory's inherited
   default, stated once on `hrdr_llm::owner_only_options`. Per-user ACLs need a
   new dependency in `hrdr-llm` and are a deliberate non-goal until someone runs
-  hrdr on Windows in anger.
+  hrdr on Windows in anger. **Question for the owner (2026-10-15):** that
+  condition now holds — the owner develops and runs hrdr natively on Windows.
+  Should credential and session files get an explicit owner-only DACL? The
+  dependency would be `windows-sys` (already in the tree through `hrdr-tools`
+  and `hrdr-tui`, with `Win32_Security_Authorization` for the Low-integrity
+  labels), added to `hrdr-llm`; the cost is the code to build the DACL and its
+  tests. Leaving it means a credential file is protected only by the profile
+  directory's inherited ACL, which on a standard install is already per-user.
 - **`O_NOFOLLOW` covers only the final path component.** A symlinked _parent_
   directory is still traversed on the wire-log open, and there is no Windows
   equivalent at all, so callers relying on it keep their own preflight check.
