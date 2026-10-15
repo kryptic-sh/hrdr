@@ -2727,8 +2727,9 @@ and **not** fixed.
   Ratatui drawing seam, failures, and unwind cleanup. Visual confirmation in
   either terminal remains outstanding. Ordered writes do not make frames atomic
   or guarantee terminal blink timing; restoration after output failure is best
-  effort. Coverage still excludes `Write` forwarding/short writes, autoresize
-  size/clear failures, and restoration-flush failure/panic injection.
+  effort. `Write` forwarding and short writes, autoresize `size()`/clear
+  failures, and a failing or panicking restoration on drop are covered since
+  2026-10-16 (`cursor_backend/tests.rs`).
 - **Parallel config-mutation test failure:** During cursor-adapter verification,
   the ordinary parallel workspace suite failed in
   `config_mutation_path_style_host_forwarding` at

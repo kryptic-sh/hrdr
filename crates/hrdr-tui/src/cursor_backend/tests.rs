@@ -19,6 +19,39 @@ struct RecordingBackend {
     screen: TestBackend,
     events: Rc<RefCell<Vec<Event>>>,
     fail_at: Option<usize>,
+    /// `size()` errors, as a terminal that cannot report its size does.
+    fail_size: bool,
+    /// `show_cursor()` panics, to drive a restoration that unwinds.
+    panic_on_show: bool,
+    /// Bytes `Write` received, and how many one `write` call accepts.
+    written: Vec<u8>,
+    write_limit: usize,
+}
+
+impl RecordingBackend {
+    fn new(events: Rc<RefCell<Vec<Event>>>) -> Self {
+        Self {
+            screen: TestBackend::new(4, 2),
+            events,
+            fail_at: None,
+            fail_size: false,
+            panic_on_show: false,
+            written: Vec::new(),
+            write_limit: usize::MAX,
+        }
+    }
+}
+
+impl Write for RecordingBackend {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len().min(self.write_limit);
+        self.written.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.record(Event::Flush)
+    }
 }
 
 impl RecordingBackend {
@@ -59,6 +92,7 @@ impl Backend for RecordingBackend {
 
     fn show_cursor(&mut self) -> io::Result<()> {
         self.record(Event::Show)?;
+        assert!(!self.panic_on_show, "show_cursor panic");
         self.screen.show_cursor().map_err(|never| match never {})
     }
 
@@ -93,6 +127,9 @@ impl Backend for RecordingBackend {
     }
 
     fn size(&self) -> io::Result<Size> {
+        if self.fail_size {
+            return Err(io::Error::other("size failure"));
+        }
         self.screen.size().map_err(|never| match never {})
     }
 
@@ -102,17 +139,12 @@ impl Backend for RecordingBackend {
 
     fn flush(&mut self) -> io::Result<()> {
         self.record(Event::Flush)?;
-        self.screen.flush().map_err(|never| match never {})
+        Backend::flush(&mut self.screen).map_err(|never| match never {})
     }
 }
 
 fn terminal() -> Terminal<CursorBackend<RecordingBackend>> {
-    Terminal::new(CursorBackend::new(RecordingBackend {
-        screen: TestBackend::new(4, 2),
-        events: Rc::default(),
-        fail_at: None,
-    }))
-    .unwrap()
+    Terminal::new(CursorBackend::new(RecordingBackend::new(Rc::default()))).unwrap()
 }
 
 fn paint(frame: &mut Frame, text: &str, cursor: Option<(u16, u16)>) {
@@ -263,9 +295,8 @@ fn hide_cancels_deferred_show_and_outside_frame_show_is_immediate() {
 fn adapter_drop_bypasses_deferral_and_tolerates_restoration_error() {
     let terminal = terminal();
     let mut backend = CursorBackend::new(RecordingBackend {
-        screen: TestBackend::new(4, 2),
-        events: terminal.backend().inner.events.clone(),
         fail_at: Some(2),
+        ..RecordingBackend::new(terminal.backend().inner.events.clone())
     });
     let events = backend.inner.events.clone();
     backend.hide_cursor().unwrap();
@@ -276,4 +307,80 @@ fn adapter_drop_bypasses_deferral_and_tolerates_restoration_error() {
         *events.borrow(),
         vec![Event::Hide, Event::Show, Event::Flush]
     );
+}
+
+/// `Write` passes bytes straight through, and reports the inner writer's count
+/// unchanged — a short write stays short, so the caller's `write_all` retries.
+#[test]
+fn write_forwards_bytes_and_short_counts() {
+    let mut backend = CursorBackend::new(RecordingBackend {
+        write_limit: 2,
+        ..RecordingBackend::new(Rc::default())
+    });
+    assert_eq!(backend.write(b"abcd").unwrap(), 2);
+    backend.write_all(b"cd").unwrap();
+    assert_eq!(backend.inner.written, b"abcd");
+    Write::flush(&mut backend).unwrap();
+    assert_eq!(*backend.inner.events.borrow(), vec![Event::Flush]);
+}
+
+/// Autoresize runs inside the frame, after the hide: when its `size()` query or
+/// its clear fails, the error surfaces, the deferral resets, and the hidden
+/// cursor is still owed — and restored on drop.
+#[test]
+fn autoresize_failures_surface_and_still_restore() {
+    // `size()` fails.
+    let mut sizeless = terminal();
+    let events = sizeless.backend().inner.events.clone();
+    sizeless.backend_mut().inner.fail_size = true;
+    let error = draw_frame(&mut sizeless, |f| paint(f, "a", Some((1, 0)))).unwrap_err();
+    assert_eq!(error.to_string(), "size failure");
+    assert_eq!(*events.borrow(), vec![Event::Hide, Event::Flush]);
+    assert!(!sizeless.backend().deferring);
+    assert!(sizeless.backend().restoration_owed);
+    drop(sizeless);
+    assert!(events.borrow().ends_with(&[Event::Show, Event::Flush]));
+
+    // The resize clear fails.
+    let mut terminal = terminal();
+    let events = terminal.backend().inner.events.clone();
+    draw_frame(&mut terminal, |f| paint(f, "a", Some((1, 0)))).unwrap();
+    terminal.backend_mut().inner.screen.resize(5, 3);
+    events.borrow_mut().clear();
+    terminal.backend_mut().inner.fail_at = Some(3);
+    let error = draw_frame(&mut terminal, |f| paint(f, "b", Some((2, 0)))).unwrap_err();
+    assert_eq!(error.to_string(), "failure at 3");
+    assert_eq!(
+        *events.borrow(),
+        vec![Event::Hide, Event::Flush, Event::Clear]
+    );
+    assert!(terminal.backend().restoration_owed);
+    drop(terminal);
+    assert_eq!(&events.borrow()[3..], &[Event::Show, Event::Flush]);
+}
+
+/// Restoration on drop never propagates: a failing flush is ignored, and a
+/// panicking show is caught rather than unwinding out of `drop`.
+#[test]
+fn drop_restoration_survives_a_failing_flush_and_a_panic() {
+    let events: Rc<RefCell<Vec<Event>>> = Rc::default();
+    let mut backend = CursorBackend::new(RecordingBackend {
+        fail_at: Some(3),
+        ..RecordingBackend::new(events.clone())
+    });
+    backend.hide_cursor().unwrap();
+    drop(backend);
+    assert_eq!(
+        *events.borrow(),
+        vec![Event::Hide, Event::Show, Event::Flush]
+    );
+
+    let events: Rc<RefCell<Vec<Event>>> = Rc::default();
+    let mut backend = CursorBackend::new(RecordingBackend {
+        panic_on_show: true,
+        ..RecordingBackend::new(events.clone())
+    });
+    backend.hide_cursor().unwrap();
+    drop(backend);
+    assert_eq!(*events.borrow(), vec![Event::Hide, Event::Show]);
 }
