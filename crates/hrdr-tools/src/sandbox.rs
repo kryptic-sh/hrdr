@@ -2120,9 +2120,7 @@ mod tests {
     /// the write tool follows the link and creates the file at the target, so
     /// the guard has to resolve the link *before* the root check. Regression
     /// for the escape where `canonicalize_nearest` kept the lexical link path
-    /// (inside the root) and the write landed outside it. Unix-only — creating
-    /// symlinks on Windows needs privileges.
-    #[cfg(unix)]
+    /// (inside the root) and the write landed outside it.
     #[test]
     fn a_dangling_symlink_cannot_escape_the_writable_roots() {
         let dir = tempfile::tempdir().unwrap();
@@ -2142,7 +2140,9 @@ mod tests {
         // the dangling case the guard used to wave through. A write through it
         // creates the file outside the root.
         let link = root.join("link");
-        std::os::unix::fs::symlink("../outside.txt", &link).unwrap();
+        if !hrdr_test_support::symlink_or_skip(Path::new("../outside.txt"), &link) {
+            return;
+        }
         assert!(
             policy
                 .check_write(&canonicalize_nearest(&link), &link, true)
@@ -2155,7 +2155,10 @@ mod tests {
         let inner = root.join("inner");
         std::fs::create_dir_all(&inner).unwrap();
         let benign = inner.join("link");
-        std::os::unix::fs::symlink("new.txt", &benign).unwrap();
+        assert!(hrdr_test_support::symlink_or_skip(
+            Path::new("new.txt"),
+            &benign
+        ));
         assert!(
             policy
                 .check_write(&canonicalize_nearest(&benign), &benign, true)
@@ -2294,10 +2297,8 @@ mod tests {
 
         // …including through a symlink, which is why the check is on canonical
         // paths rather than on the string the model typed.
-        #[cfg(unix)]
-        {
-            let link = dir.path().join("escape");
-            std::os::unix::fs::symlink(dir.path().parent().unwrap(), &link).unwrap();
+        let link = dir.path().join("escape");
+        if hrdr_test_support::symlink_or_skip(dir.path().parent().unwrap(), &link) {
             check_write(&policy, &link.join("hrdr-outside-probe")).unwrap_err();
         }
     }

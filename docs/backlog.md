@@ -2672,10 +2672,16 @@ and **not** fixed.
   `atomic_write_preserves_mode_and_replaces_content`), `O_NOFOLLOW`
   (`open_wire_log_*`, `owner_only_options_no_follow_refuses_a_symlink` — no
   Windows equivalent exists, see Hardening notes) and the Landlock backend.
-  **Not unix by nature, still gated:** symlink tests in `hrdr-agent`
-  (`delegation.rs`) and `hrdr-tools` (`sandbox.rs`, `lsp.rs`'s other) — grep
-  `std::os::unix::fs::symlink`; the `hrdr-llm` ones left are
-  `O_NOFOLLOW`/mode-bit tests, unix by nature. Also ported 2026-10-15:
+  **Not unix by nature, still gated:** the symlink case in `hrdr-agent`'s
+  `delegation.rs` — grep `std::os::unix::fs::symlink`. What else remains is unix
+  by nature: the `hrdr-llm` `O_NOFOLLOW`/mode-bit tests, `sandbox.rs`'s `/etc`
+  link, and `lsp.rs`'s `within_root` case, which re-spells the path by letter
+  case on Windows instead. Also ported 2026-10-15:
+  `a_dangling_symlink_cannot_escape_the_writable_roots` (the dangling-link
+  sandbox escape; fails on Windows when dangling links go unresolved) and the
+  symlink half of `a_writable_root_is_writable_all_the_way_down` — which cannot
+  fail on Windows: the policy's roots are `\\?\`-prefixed there, so a raw
+  unresolved path is refused anyway. Also ported 2026-10-15:
   `tree_symlink_marks` (its body was `cfg(unix)`, so it passed on Windows
   checking nothing), `attachment_presentation_directory_suffixes`' link case,
   and `normalize_path_handles_existing_and_nonexistent_symlink_targets` — which
