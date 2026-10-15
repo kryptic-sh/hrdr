@@ -1519,14 +1519,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   only `write.md`; and the two pipe rules share one identical message string, so
   the table is keyed positionally rather than by message. Eliminating the
   duplication itself still wants runtime-composed descriptions.
-- **The pipe-to-shell guardrail's recovery text assumes POSIX.** Verified
-  nuance: there are **two** pipe rules — a POSIX `curl|wget … | sh` one and a
-  case-insensitive PowerShell-shaped `iwr|iex` one — so coverage is not
-  POSIX-only. What is POSIX-only is the recovery example
-  (`curl -fsSL <url> -o <tmp>/script.sh`), built in `guardrails.rs` outside the
-  `Shell` seam because `default_guardrails()` has no shell in scope. Correct
-  today (the shell is always bash/sh); it is the one place a new dialect would
-  have to be threaded through by hand.
 - **hrdr sets no Windows ACL on any file it writes.** The residual of the
   Windows-drift audit pass, which **ran** and landed three fixes (`8e5bc9d`):
   the credential `sync_all` gated on unix though portable, `atomic_write`'s

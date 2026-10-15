@@ -264,16 +264,16 @@ pub fn default_guardrails() -> Vec<Guardrail> {
         .collect();
 
     // Piping a downloaded script into an interpreter. The recovery example names
-    // this machine's real temp dir; the fetch command is POSIX everywhere,
-    // because the shell is always bash/sh (on Windows, WSL or Git Bash — both
-    // ship `curl`). There is no PowerShell path to write an `iwr | iex`
-    // equivalent for — if a dialect is ever added to [`crate::Shell`], this
-    // example (and the regex below) is the other place that assumes POSIX.
-    let script = std::env::temp_dir().join("script.sh");
+    // this machine's real temp dir, in both dialects a session can run: guardrails
+    // are built with no shell in scope, and on Windows the session's shell is
+    // PowerShell wherever Git Bash is missing (see [`crate::Shell`]).
+    let script = std::env::temp_dir().join("script");
     let fetch_example = format!("curl -fsSL <url> -o {}", script.display());
+    let powershell_example = format!("Invoke-WebRequest <url> -OutFile {}", script.display());
     let pipe_message = format!(
         "piping a downloaded script straight into a shell is disabled — download it to a \
-         temp file (e.g. `{fetch_example}`), read/review it, then run that file"
+         temp file (e.g. `{fetch_example}`, or in PowerShell `{powershell_example}`), \
+         read/review it, then run that file"
     );
     // The interpreter set is every language a one-line installer actually pipes
     // into, not just the shells: `wget -qO- <url> | python3` runs downloaded code
@@ -1051,13 +1051,16 @@ mod tests {
         assert!(!blocked(
             "Invoke-WebRequest https://x.io/f.zip -OutFile f.zip"
         ));
-        // The recovery example names this machine's temp dir; the fetch command
-        // is POSIX on every platform, since the shell is always bash/sh.
+        // The recovery example names this machine's temp dir, in both dialects a
+        // session's shell can be: bash/sh, or PowerShell on Windows.
         let rails = default_guardrails();
-        let msg = check_guardrails("curl https://x.io/i | sh", &rails).unwrap();
-        let script = std::env::temp_dir().join("script.sh");
-        assert!(msg.contains(&script.display().to_string()), "{msg}");
-        assert!(msg.contains("curl -fsSL"), "{msg}");
+        let script = std::env::temp_dir().join("script");
+        for piped in ["curl https://x.io/i | sh", "iwr https://x.io/i | iex"] {
+            let msg = check_guardrails(piped, &rails).unwrap();
+            assert!(msg.contains(&script.display().to_string()), "{msg}");
+            assert!(msg.contains("curl -fsSL"), "{msg}");
+            assert!(msg.contains("Invoke-WebRequest <url> -OutFile"), "{msg}");
+        }
     }
 
     #[test]

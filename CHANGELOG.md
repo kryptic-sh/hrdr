@@ -202,6 +202,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The refusal to pipe a download into a shell now shows a PowerShell example
+  too.** It told the agent to fetch the script with `curl … -o …/script.sh`,
+  which assumed a POSIX shell; on Windows without Git Bash the session's shell
+  is PowerShell, so it now also gives the `Invoke-WebRequest … -OutFile …` form
+  (`crates/hrdr-tools`).
 - **On Windows, a command's whole process tree is stopped, from its first
   instant.** A command, hook, LSP or MCP server was put under the Job Object
   that lets hrdr stop its whole process tree only after it had started, so a

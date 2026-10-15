@@ -1894,7 +1894,7 @@ impl ToolRegistry {
     }
 
     /// The default set: file/search/todo/web tools plus the `shell` tool when a
-    /// shell (`bash`, or POSIX `sh`) is available on this machine.
+    /// supported shell is available on this machine (see [`Shell`]).
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Arc::new(ReadTool));
@@ -1902,8 +1902,8 @@ impl ToolRegistry {
         r.register(Arc::new(EditTool));
         r.register(Arc::new(ReplaceTool));
         // The shell tool is presence-gated so the model is only offered a shell
-        // it can actually use (`bash`, then POSIX `sh`; on Windows that means
-        // WSL or Git Bash — there is no PowerShell path).
+        // it can actually use: `bash` (on Windows, Git Bash — never the WSL
+        // launcher), then PowerShell on Windows, then POSIX `sh`.
         for shell in available_shell_tools() {
             r.register(shell);
         }
