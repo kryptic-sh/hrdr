@@ -1967,9 +1967,12 @@ overrides it). Residual, recorded as hardening below.
 - The OpenRouter callback server reflects the attacker's own (escaped) state
   string (`oauth.rs:259`); the comment at `:255-257` should be preserved — a
   future "echo the expected value" change would leak the CSRF token.
-- `trust.rs:95-100` opens the trusted-dirs store with `create(true)`: a
-  pre-existing world-readable file keeps its mode and a symlink is followed. Low
-  sensitivity (directory paths), user-owned dir.
+- `trust::trust` opens the trusted-dirs store with `create(true)`: a
+  pre-existing world-readable file keeps its mode and a symlink is followed. The
+  mode half is mitigated (re-checked 2026-10-15): the store's directory is
+  forced to `0700` on every trust write (`auth::create_dir_owner_only`, existing
+  directories included), so no other user can reach the file. The symlink half
+  is same-user only. Low sensitivity (directory paths).
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
   then `atomic_write` re-opens the path (`mutation.rs:150-153`); a symlink swap
   between the two could redirect a write. Same-user, no privilege boundary.
