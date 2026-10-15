@@ -163,6 +163,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Background sub-agents save their snapshot once, when the run ends.** Each
+  tool round of every background sub-agent used to deep-copy its whole history
+  and rewrite `<stem>.json` with two fsyncs, for a file nothing loads; the cost
+  grew with the square of the run. It is now written when the run settles. A
+  crash mid-run loses that file; the `.jsonl` transcript beside it is still
+  written as the run goes (`crates/hrdr-agent`).
 - **The `sessions` tool says which sessions it could not reach, and why.** A
   running session that failed its liveness probe used to be left out of the list
   silently; it is now listed under `unreachable` with the reason

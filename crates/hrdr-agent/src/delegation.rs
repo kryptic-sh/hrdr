@@ -201,11 +201,11 @@ pub(crate) const WRITE_HANDBACK_NOTE: &str = "\n\n(Its edits are already in your
 /// Where a delegated run's state is snapshotted, and everything about the run
 /// that never changes once it is spawned.
 ///
-/// A run saves itself twice — on every committed round, and once more when it
-/// settles — and those two saves must not be able to describe the same run
-/// differently, which is what six separately-captured locals invited. Nothing
-/// here is delegation-specific except the destination: the state written is the
-/// same [`crate::SessionState`] the session's own agent persists.
+/// A run saves itself once, when it settles; the identity is captured up front so
+/// the save describes the run as it was spawned, rather than six separately
+/// captured locals. Nothing here is delegation-specific except the destination:
+/// the state written is the same [`crate::SessionState`] the session's own agent
+/// persists.
 struct RunSnapshot {
     /// `<stem>.json`, beside the run's transcript. `None` when there is no
     /// transcript dir to write into (best-effort, the rule the jsonl follows).
@@ -215,9 +215,11 @@ struct RunSnapshot {
     /// reasoning, so re-briefing beats resuming. It is kept because it is the only
     /// durable copy of a sub-agent's *model-facing* messages (the jsonl holds the
     /// display fold, and cannot reconstruct signed thinking blocks), which is worth
-    /// having if anything ever needs to reconstruct a run. Whether to keep paying a
-    /// write per committed round for that is an open question in
-    /// `docs/backlog.md`; do not assume a reader exists.
+    /// having if anything ever needs to reconstruct a run. It is written once, when
+    /// the run settles — not per committed round, which cost a deep copy of the
+    /// history and two fsyncs every tool round for a file nothing reads. A crash
+    /// mid-run loses it; the jsonl transcript survives. Do not assume a reader
+    /// exists.
     path: Option<PathBuf>,
     name: String,
     read_only: bool,
@@ -411,9 +413,8 @@ async fn spawn_background(
     // closing line about where this sub-agent's edits will land.
     let cfg_read_only = cfg.read_only;
     // This run's snapshot identity, captured before `cfg` is moved into
-    // `Agent::new` below. One value, so the two save points (every committed
-    // round, and once more when the run settles) cannot describe the same run
-    // differently. Its `path` is filled in below, once the transcript is open.
+    // `Agent::new` below, for the one save when the run settles. Its `path` is
+    // filled in below, once the transcript is open.
     let snapshot = RunSnapshot {
         path: None,
         // The label names the snapshot's session (auto-derived, never user-named).
@@ -590,15 +591,6 @@ async fn spawn_background(
                         // `Start`/`End`/`Error` framing stays written directly, from the
                         // spawn scope, around this run.
                         usage_live.record(live_key, &ev);
-                        // On every committed round (a `History` event, emitted with
-                        // no dangling tool calls) snapshot this agent's state next
-                        // to the jsonl.
-                        if let AgentEvent::History(messages) = &ev {
-                            snapshot.save(
-                                (**messages).clone(),
-                                usage_live.usage(live_key).unwrap_or_default(),
-                            );
-                        }
                         let chunk = match ev {
                             AgentEvent::Text(t) => {
                                 out.push_str(&t);

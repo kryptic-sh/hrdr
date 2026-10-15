@@ -30,9 +30,6 @@ Everything below that waits on an owner decision rather than on work. Each line
 names the entry holding the options; the entry is the source of truth, this is
 only the list. Delete a line when its question is answered.
 
-- **Sub-agent `<stem>.json` snapshot** — delete, write once at run end, or keep
-  per-round (recommended: write once). Settles the top HIGH perf item too.
-  _Sandbox follow-ups → "Opened by the redesign"._
 - **Main-session save per tool round** — journal each round's messages and
   rewrite the full `.json` only at turn end (O(n) instead of O(n²) bytes), at
   the cost of "at most one round lost" becoming "at most one turn lost" unless
@@ -1526,22 +1523,6 @@ remains open:
 
 Opened by the redesign:
 
-- **The sub-agent `<stem>.json` snapshot is written and never read.**
-  **[Deferred — question for the owner; see the index at the top]** It existed
-  for `task_revive`, which is gone. Its only reader now is its own test
-  (`background_subagent_persists_its_own_session_state`). Deleting it removes a
-  per-turn-boundary write; keeping it keeps a crash-durable record of what a
-  sub-agent actually said. Decide, rather than leaving a file nobody loads — and
-  note that the panes read the sibling `.jsonl`, not this. **This decision also
-  settles the two HIGH perf entries on the same write** (a deep copy of the
-  whole history plus a two-fsync rewrite, inline on a tokio worker, every tool
-  round of every background sub-agent). Options, as of 2026-10-14: (a) delete
-  the snapshot — the cost goes with it; (b) keep it but write it once, at the
-  end of the run (the final save already exists after the loop) — a crash
-  mid-run then loses it, while the jsonl survives; (c) keep per-round writes and
-  pay for a coalescing background writer, or change `SessionState.messages` to
-  share the history, either a sizeable change on the persistence path for a file
-  nothing reads. Recommended: (b), or (a) if no reader is planned.
 - **`--sandbox jail` cannot apply to a write-capable session** **[Deferred —
   question for the owner; see the index at the top]**, so it floors at `write`
   and emits a notice pointing at the `prisoner` agent. That is honest but it is
@@ -3008,27 +2989,11 @@ lines by the sweep lead. **Status: 5 shipped 2026-08-14/15 — the TUI idle
 redraw + completion memo, tool-args parse-once, ToolEnd move, grep newline
 offsets, and the attachment digest memo. 2 open (deferred, reasons inline).**
 
-1. **The whole message history is deep-cloned per committed round — O(history)
-   per round, O(N²) across a session.** `crates/hrdr-agent/src/delegation.rs` —
-   on every `AgentEvent::History` (once per tool round), a sub-agent run does
-   `(**messages).clone()` and hands it to `RunSnapshot::save`, which then
-   serializes it (`Session::save_to_path`). The event carries
-   `Arc<Vec<ChatMessage>>` precisely so the agent's `Arc::make_mut` stays cheap;
-   every consumer immediately defeats it. Fix: the save/snapshot entry points
-   should take the `Arc<Vec<ChatMessage>>` (or `&[ChatMessage]`) and serialize
-   by borrowing. Note: the same-shape clone on the autosave path
-   (`hrdr-app/src/sessions.rs:20` `messages_owned()`) is on `save_agent_session`
-   — dead code, deleted by the tidy pass's candidate 2, so it dies with it. The
-   live autosave copies are in `hrdr-tui/src/app/session.rs` and the UI-thread
-   `app.rs` History handler; those are the payoff sites if the TUI gets a pass.
-   The sub-agent snapshot itself is a documented open question (a write per
-   committed round is already tracked in this backlog); this finding is the
-   extra clone on top of that known write. **Deferred 2026-08-14: the fix needs
-   the save/snapshot entry points to serialize by borrowing, which means
-   `Session::save_to_path` API surgery on the load-bearing persistence path —
-   bigger than the win for sub-agent snapshots; the live autosave copies are in
-   `hrdr-tui` (app.rs History handler, session.rs), the payoff sites if the TUI
-   gets a dedicated pass.**
+1. **The whole message history is deep-cloned per committed round.** The
+   sub-agent half shipped 2026-10-15: a background run no longer snapshots per
+   round, so its clone went with the write. What remains is the main session's
+   own copies — the TUI's `app.rs` History handler and `app/session.rs` — which
+   belong to the main-session save change (see the index).
 2. **The memory mtime-cache hit `cloned()`s the whole memory**
    (`hrdr-tools/src/memory.rs`) before the mtime filter, once per opening user
    message. The other half of this item — lowercasing every body per recall
@@ -3415,21 +3380,11 @@ hrdr-test-support + apps full incl. all test binaries.
 
 `:perf` over the whole tree (clean), split across four sub-agents; findings
 re-verified at cited lines (top items by the sweep lead). Two prior backlog
-items re-found (see cross-list). **Status 2026-10-15: 1 and 2 open (1 waits on
-the sub-agent snapshot decision); 3 declined; 4 merged; the running-tool
+items re-found (see cross-list). **Status 2026-10-15: 1 shipped and removed (the
+owner chose to write the sub-agent snapshot once, at run end); 2 open (the
+main-session save, owner-decided); 3 declined; 4 merged; the running-tool
 re-render finding shipped (`ChunkRows::AnimatedChrome`) and is removed.**
 
-1. **HIGH — every round of every background sub-agent deep-clones its whole
-   history and rewrites the snapshot file with 2 fsyncs inline on the tokio
-   worker.** `delegation.rs` snapshot path (`(**messages).clone()` →
-   `RunSnapshot::save` → `save_to_path` → `write_atomic` with file+dir fsync)
-   runs once per tool round (`AgentEvent::History`), concurrently across
-   sub-agents: O(history) per round → O(n²) over a run, multi-MB tool results
-   cloned and re-serialized every round. Fix: serialize from the
-   `Arc<Vec< ChatMessage>>` the event already carries (drop the deep clone);
-   move the write off the turn future (latest-wins save task or
-   `spawn_blocking`); rate-limit the snapshot — the sibling jsonl is the durable
-   record.
 2. **HIGH — main-agent session `.json` is a full rewrite of every message every
    tool round.** `Session::save` (comment there confirms: "rewritten on every
    tool round") — `attachment_refs` full scan + whole-body serialize +
@@ -3807,13 +3762,6 @@ perf pass itself.
 
 Ranked by impact, biggest first:
 
-1. **HIGH (re-confirmed, 08-30 #1) — per-round deep clone + snapshot save with 2
-   fsyncs on every delegated tool round.** `(**messages).clone()` on every
-   `AgentEvent::History` from a background sub-agent, `delegation.rs:509-510`,
-   then `RunSnapshot::save` → whole-body serialize → `save_to_path` →
-   `write_atomic`. O(history) per round, O(n²) over a run. Fix as recorded
-   (serialize from the `Arc<Vec<ChatMessage>>` the event carries; move the write
-   off the turn future). Open.
 2. **HIGH (re-confirmed, 08-30 #2) — main-session `.json` fully rewritten every
    tool round.** Design stated at `session.rs:512` ("a session file is rewritten
    on every tool round"); save still whole-body `write_atomic`
