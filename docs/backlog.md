@@ -30,6 +30,22 @@ Everything below that waits on an owner decision rather than on work. Each line
 names the entry holding the options; the entry is the source of truth, this is
 only the list. Delete a line when its question is answered.
 
+- **A manual CI run publishes from any branch.** `publish-github-release` in
+  `.github/workflows/ci.yml` runs on every `workflow_dispatch`, whatever the
+  ref, and `publish-crates`, `aur-bin`, `brew-tap`, `scoop-bucket` and `alpine`
+  all follow it — so dispatching on a branch creates a GitHub release named
+  after the branch, publishes the workspace's `Cargo.toml` version to crates.io
+  if it is not there yet, and pushes packaging with the branch name as the
+  version. Options: (a) gate publishing on
+  `startsWith(github.ref, 'refs/tags/v')` for both events, which keeps
+  re-running a release by dispatching on its tag, and then also spell `/` as `-`
+  in the archive names (`TAG=${GITHUB_REF_NAME//\//-}` in the bash steps,
+  `-replace '/', '-'` in the pwsh one — both checked locally 2026-10-16) so a
+  branch dispatch builds cleanly; (b) leave it, if dispatching on a branch to
+  publish is intended. Found 2026-10-16 while fixing the naming; the naming fix
+  was held back, because the failing `Package` step is today the only thing that
+  stops a `wip/…` dispatch from publishing. _Session coordination, queue
+  item 9._
 - **CRLF through `replace` and `write`** — preserve a file's dominant line
   ending or write what was given. _Windows support review 2026-09-15._
 - **`cwd_slug` hash and migration.** _Windows support review 2026-09-15._
@@ -325,11 +341,13 @@ push each verified slice to `main` before proceeding to the next slice.
    Windows reader — still used under the inbox `conhost.exe` — no longer has pty
    coverage there. The release `Package` steps name archives after the ref, so a
    `workflow_dispatch` run on a branch whose name holds `/` fails them
-   (`hrdr-wip/…tar.gz`: no such directory); main and tags are unaffected. The
-   superseded branches `wip/windows-paste-transport` (the original probes) and
-   `wip/windows-paste-transport-rebased` / `wip/windows-paste-vt-input` (this
-   work, now in `main`) can be deleted — the first only on the owner's word,
-   since it predates this session.
+   (`hrdr-wip/…tar.gz`: no such directory); main and tags are unaffected. That
+   failure is currently what stops such a run from publishing — see "A manual CI
+   run publishes from any branch" under the owner questions; do not fix the
+   naming alone. The superseded branches `wip/windows-paste-transport` (the
+   original probes) and `wip/windows-paste-transport-rebased` /
+   `wip/windows-paste-vt-input` (this work, now in `main`) can be deleted — the
+   first only on the owner's word, since it predates this session.
 10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     **[Deferred — question for the owner; see the index at the top]** Deferred
     until the earlier queued work is finished. Compare hrdr's
