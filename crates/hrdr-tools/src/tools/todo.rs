@@ -108,6 +108,12 @@ pub(crate) fn parse_todos(args: serde_json::Value) -> Result<Vec<TodoItem>> {
                         _ => bail!("`todos` must be an array of {{content, status}} items"),
                     }
                 }
+                // The array JSON-encoded into a string — some models send a
+                // structured argument that way (pi repairs the same for `edits`).
+                Value::String(text) => match serde_json::from_str(&text) {
+                    Ok(Value::Array(a)) => a,
+                    _ => bail!("`todos` must be an array of {{content, status}} items"),
+                },
                 // A single item object instead of a one-element array.
                 other => vec![other],
             }
@@ -377,6 +383,20 @@ mod tests {
             evidence: evidence.map(str::to_string),
             waits_on: None,
         }
+    }
+
+    /// Some models send a structured argument as its JSON encoding in a string;
+    /// the list inside is taken as the list, and a string that is not one is
+    /// still refused.
+    #[test]
+    fn a_todo_list_sent_as_a_json_string_is_read_as_the_list() {
+        let encoded = r#"[{"content":"ship it","status":"pending"}]"#;
+        let parsed = parse_todos(json!({ "todos": encoded })).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].content, "ship it");
+        assert_eq!(parsed[0].status, "pending");
+
+        assert!(parse_todos(json!({ "todos": "not a list" })).is_err());
     }
 
     #[test]

@@ -1227,6 +1227,10 @@ outlier is most likely to be a mistake rather than a stance.
   instead of an array"_. hrdr's tolerance is `serde(alias)` on **path fields
   only** (`read.rs`, `edit.rs`, `fileops.rs`); the payload fields that cost most
   when they fail — `old_string`/`new_string`/`content`/`pattern` — have none.
+  The JSON-string case pi repairs is now handled for hrdr's one array argument
+  that a string cannot also mean: `todo`'s `todos` (2026-10-15). `task`'s
+  `attachments` is left refusing a string with the exact form to send, since a
+  bare string there could just as well be one path.
 - **Expose session/model metadata to shell commands.** Verified:
   `Shell::command` configures program + args only, nothing else. pi injects
   `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`,

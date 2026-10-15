@@ -202,6 +202,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The `todo` tool accepts a task list sent as a JSON string.** Some models
+  encode a structured argument as a string; `todo` rejected such a list as
+  malformed and the model had to retry. It now reads the list inside
+  (`crates/hrdr-tools`).
 - **The refusal to pipe a download into a shell now shows a PowerShell example
   too.** It told the agent to fetch the script with `curl … -o …/script.sh`,
   which assumed a POSIX shell; on Windows without Git Bash the session's shell
