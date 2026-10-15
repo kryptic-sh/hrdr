@@ -24,6 +24,43 @@ Conventions:
 
 ---
 
+## Questions for the owner — index, 2026-10-15
+
+Everything below that waits on an owner decision rather than on work. Each line
+names the entry holding the options; the entry is the source of truth, this is
+only the list. Delete a line when its question is answered.
+
+- **Sub-agent `<stem>.json` snapshot** — delete, write once at run end, or keep
+  per-round (recommended: write once). Settles the top HIGH perf item too.
+  _Sandbox follow-ups → "Opened by the redesign"._
+- **CRLF through `replace` and `write`** — preserve a file's dominant line
+  ending or write what was given. _Windows support review 2026-09-15._
+- **`cwd_slug` hash and migration.** _Windows support review 2026-09-15._
+- **Windows sandbox refusal note** — hedged note or none (recommended: hedged).
+  _Windows support review → `sandbox_denial_note`._
+- **Owner-only DACL on Windows credential/session files.** _Consistency /
+  robustness → "hrdr sets no Windows ACL"._
+- **`/cwd` on a sub-agent pane** — move that agent only, or refuse (recommended:
+  refuse). _dispatch.rs review 2026-08-02._
+- **`/trust revoke`** and whether it downgrades the running session. _Tooling /
+  agent capability._
+- **Windows `write`-mode OS confinement** (Low-integrity relabelling of writable
+  roots). _Sandbox follow-ups._
+- **`termwiz` for the pty test harness.** _Queue item 1 → "The pty tests read
+  the screen by stripping escapes"._
+- **Per-pane compaction cancel; main-scoped system lines.** _Left open by the
+  compaction fix._
+- **Queue items 4, 5, 7, 10** — LLM-managed session names, Windows terminal
+  titles, TODO-to-TODO dependencies, OpenAI usage-dashboard parity. _Session
+  coordination and queued work._
+- **Replacing `serde_yaml_ng`.** _Needs a decision 2026-10-14._
+- **Which built-ins become skills.** _Needs a decision 2026-08-09._
+- **`CommandHost` text-fallback defaults; `gate_rank`/`kind_rank` merge;
+  verbose-gating the session banner; `jail` write floor and read-only git.**
+  Smaller calls recorded where each lives.
+
+---
+
 ## Session coordination and queued work — 2026-10-08
 
 Work in this order; these entries preserve the queue across sessions. Commit and
