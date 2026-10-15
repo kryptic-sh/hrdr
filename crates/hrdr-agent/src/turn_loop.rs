@@ -41,10 +41,10 @@ pub(crate) fn checkpoint_warning_round(max_steps: usize) -> Option<usize> {
 /// the cap is dropped (`try_send` returns `Full`), never queued or blocked on.
 ///
 /// This bounds the two channels this pipeline owns (`ctx.stream` and the shared
-/// forwarder), which fully defeats a synchronous emit tight-loop. The frontend's
-/// own `AgentEvent` queue downstream is a separate, still-unbounded hop, so a
-/// *streaming* flood can still grow memory there under a lagging renderer — a
-/// known follow-up (bound/coalesce that queue), not covered here.
+/// forwarder), which fully defeats a synchronous emit tight-loop. The hop past
+/// them is the frontend's: the TUI's `EventSender` feeds a bounded channel and
+/// coalesces streaming deltas into its backlog tail, so a flood grows that
+/// backlog by events, not by output.
 const UI_STREAM_CAP: usize = 1024;
 
 /// How long a finished tool batch waits for its live-output forwarders to close

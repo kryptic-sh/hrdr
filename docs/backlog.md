@@ -1973,8 +1973,6 @@ overrides it). Residual, recorded as hardening below.
   rename; the `NotEnforced` → refuse-spawn check is the backstop.
 - Seatbelt profiles are author-written and unvalidated on real macOS
   (`sandbox.rs:1358-1364`); only a macOS run can validate them.
-- `turn_loop.rs:40-43` — the frontend `AgentEvent` queue downstream is an
-  acknowledged unbounded hop.
 
 ---
 
