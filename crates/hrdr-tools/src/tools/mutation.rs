@@ -303,16 +303,15 @@ mod tests {
     /// A symlinked target keeps being a symlink: the in-place fallback writes
     /// *through* the link to its destination, where a temp+rename would have
     /// replaced the link itself with a regular file and orphaned the real file.
-    /// (Unix-only as a test — creating a symlink on Windows needs a privilege the
-    /// CI runner may not have — but the guard itself now runs on both.)
-    #[cfg(unix)]
     #[tokio::test]
     async fn atomic_write_writes_through_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("real.txt");
         let link = dir.path().join("link.txt");
         tokio::fs::write(&target, "old").await.unwrap();
-        tokio::fs::symlink(&target, &link).await.unwrap();
+        if !hrdr_test_support::symlink_or_skip(&target, &link) {
+            return;
+        }
 
         atomic_write(&link, "through the link").await.unwrap();
 

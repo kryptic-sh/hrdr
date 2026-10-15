@@ -2863,12 +2863,8 @@ mod tests {
     /// the path is repointed at another before the check runs. The handle still
     /// holds the *original* — reading through it would hand back content the
     /// path-based secret guard never saw — so the identities disagree and the
-    /// read is rejected.
-    ///
-    /// Unix-only because it swaps via symlink; the Windows arm compares the same
-    /// identity pair (volume serial + file index) through
-    /// `GetFileInformationByHandle`.
-    #[cfg(unix)]
+    /// read is rejected. (On Windows the identity pair is the volume serial +
+    /// file index, through `GetFileInformationByHandle`.)
     #[test]
     fn guard_not_swapped_rejects_a_path_repointed_after_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -2879,13 +2875,15 @@ mod tests {
 
         // `link` points at the secret; open it and hold that handle.
         let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        if !hrdr_test_support::symlink_or_skip(&secret, &link) {
+            return;
+        }
         let file = std::fs::File::open(&link).unwrap();
 
         // Now repoint it at the harmless file — the swap a path-based guard
         // would be fooled by.
         std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(&decoy, &link).unwrap();
+        assert!(hrdr_test_support::symlink_or_skip(&decoy, &link));
 
         let err = guard_not_swapped(&file, &link, true).expect_err("the swap must be caught");
         assert!(
@@ -3345,17 +3343,15 @@ mod tests {
     /// each distinct path once, not to re-check the filesystem per line. On the
     /// unmemoized code this fails: the second line re-canonicalizes through the
     /// new target and the line passes.
-    ///
-    /// Unix-only: it is built on `std::os::unix::fs::symlink`, whose Windows
-    /// twin needs a privileged reparse point and resolves differently.
-    #[cfg(unix)]
     #[test]
     fn a_secret_line_memo_is_a_per_run_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "KEY=xyz\n").unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
         let link = dir.path().join("resolved");
-        std::os::unix::fs::symlink(".env", &link).unwrap();
+        if !hrdr_test_support::symlink_or_skip(std::path::Path::new(".env"), &link) {
+            return;
+        }
         let mut memo = SecretLineMemo::default();
         // First line resolves `resolved` through to `.env`: a secret.
         assert!(memo.is_secret_line("resolved:1:KEY=xyz", dir.path()));
@@ -3363,7 +3359,10 @@ mod tests {
         // Retarget the symlink at a non-secret file: the memo keeps the first
         // verdict for the run.
         std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink("main.rs", &link).unwrap();
+        assert!(hrdr_test_support::symlink_or_skip(
+            std::path::Path::new("main.rs"),
+            &link
+        ));
         assert!(
             memo.is_secret_line("resolved:2:KEY=xyz", dir.path()),
             "the verdict is memoized for the run, not re-checked per line"

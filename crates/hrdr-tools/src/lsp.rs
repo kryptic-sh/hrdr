@@ -1765,7 +1765,6 @@ mod tests {
     /// platform with an explicit symlinked workspace root, so the fix cannot
     /// regress on a Linux-only `cargo test`.
     #[test]
-    #[cfg(unix)]
     fn confinement_resolves_a_symlinked_workspace_root() {
         let real = tempfile::tempdir().unwrap();
         let target = real.path().join("main.xyz");
@@ -1774,10 +1773,12 @@ mod tests {
         // A symlink standing in for the workspace root, as macOS's `/var` does.
         let link_parent = tempfile::tempdir().unwrap();
         let link = link_parent.path().join("ws");
-        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        if !hrdr_test_support::symlink_or_skip(real.path(), &link) {
+            return;
+        }
 
         let we = serde_json::json!({"changes": {
-        format!("file://{}", target.display()): [
+        file_uri(&target): [
             {"range": {"start": {"line": 0, "character": 4},
                        "end": {"line": 0, "character": 8}}, "newText": "blast"}
         ]}});
@@ -1790,7 +1791,7 @@ mod tests {
         let evil_path = outside.path().join("evil.xyz");
         std::fs::write(&evil_path, "x\n").unwrap();
         let evil = serde_json::json!({"changes": {
-        format!("file://{}", evil_path.display()): [
+        file_uri(&evil_path): [
             {"range": {"start": {"line": 0, "character": 0},
                        "end": {"line": 0, "character": 1}}, "newText": "y"}
         ]}});
