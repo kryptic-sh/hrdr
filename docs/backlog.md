@@ -421,9 +421,11 @@ refresh persistence errors remain ignored, with native labels in those discarded
 errors.
 
 Intermittent failures seen in runs during the messaging work and not
-root-caused:
-`transcript_log::tests::a_coalesced_transcript_folds_exactly_like_the_event_stream`
-(`took_ms` mismatch), watch-delivery timing, and session-save timing.
+root-caused: watch-delivery timing and session-save timing. (The third,
+`a_coalesced_transcript_folds_exactly_like_the_event_stream`'s `took_ms`
+mismatch, was the two folds stamping a reasoning block's duration from the wall
+clock; the test compares that a duration was recorded, not its milliseconds,
+since 2026-10-16.)
 
 **The pty tests read the screen by stripping escapes — needs a decision.**
 **[Deferred — question for the owner; see the index at the top]**
@@ -455,7 +457,13 @@ build running beside it) failed
 `proc::tests::git_runner_kills_an_overflowing_program_without_waiting_for_its_timeout`
 (its 2s budget for a `.cmd` printing 10,000 lines); three isolated reruns
 passed. Both are `CommandRunner` wall-clock tests failing only under suite load.
-Not investigated.
+Since 2026-10-16 both run against `RUN_BUDGET` (20s), far below their children's
+`CHILD_WAIT_SECS`, with a compile-time assertion keeping the two apart; each was
+shown red with its runner property broken. The deadline test's `TimedOut`
+failure is not explained: anything else means both pipes closed inside 100ms,
+i.e. the backgrounded holder never ran (a failed fork under load is the guess,
+not verified). Its assertion now prints the run's status and output, so the next
+failure says which.
 
 ## GitHub Actions setup-zig cache verification
 

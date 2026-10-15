@@ -1218,6 +1218,19 @@ mod tests {
         assert!(result.stderr.is_empty());
     }
 
+    /// How long a `CommandRunner` wall-clock test lets the whole run take. Under
+    /// a loaded parallel suite on Windows, a `.cmd` printing its output or a
+    /// process-tree kill can take seconds, so the budget is generous; what keeps
+    /// the tests honest is that it stays far below [`CHILD_WAIT_SECS`], so a
+    /// runner that waited for the child instead of stopping early still fails.
+    const RUN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// How long the wall-clock tests' children would run if nothing stopped
+    /// them.
+    const CHILD_WAIT_SECS: u64 = 60;
+
+    const _: () = assert!(RUN_BUDGET.as_secs() * 2 <= CHILD_WAIT_SECS);
+
     #[tokio::test]
     async fn git_runner_kills_an_overflowing_program_without_waiting_for_its_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1228,7 +1241,10 @@ mod tests {
         #[cfg(windows)]
         std::fs::write(
             &program,
-            "@for /L %%i in (1,1,10000) do @echo 0123456789\r\n@ping -n 6 127.0.0.1 >nul\r\n",
+            format!(
+                "@for /L %%i in (1,1,10000) do @echo 0123456789\r\n@ping -n {} 127.0.0.1 >nul\r\n",
+                CHILD_WAIT_SECS + 1
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -1238,7 +1254,7 @@ mod tests {
             std::fs::write(
                 &program,
                 format!(
-                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nyes x | head -c {}\nsleep 5\n",
+                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nyes x | head -c {}\nsleep {CHILD_WAIT_SECS}\n",
                     pid.display(),
                     super::CommandRunner::OUTPUT_LIMIT + 1
                 ),
@@ -1249,14 +1265,17 @@ mod tests {
 
         let started = Instant::now();
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            super::CommandRunner::with_timeout(&program, std::time::Duration::from_secs(5))
-                .run(dir.path(), &[]),
+            RUN_BUDGET,
+            super::CommandRunner::with_timeout(
+                &program,
+                std::time::Duration::from_secs(CHILD_WAIT_SECS),
+            )
+            .run(dir.path(), &[]),
         )
         .await
-        .expect("output overflow must not wait for the five-second child timeout");
+        .expect("output overflow must not wait for the child's own timeout");
         assert_eq!(result.kind, super::CommandRunKind::OutputOverflow);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(started.elapsed() < RUN_BUDGET);
         assert!(result.stdout.len() <= super::CommandRunner::OUTPUT_LIMIT);
         assert!(result.stderr.len() <= super::CommandRunner::OUTPUT_LIMIT);
         #[cfg(unix)]
@@ -1280,7 +1299,10 @@ mod tests {
         #[cfg(windows)]
         std::fs::write(
             &program,
-            "@start /b cmd /c \"ping -n 61 127.0.0.1 >nul\"\r\n@exit /b 0\r\n",
+            format!(
+                "@start /b cmd /c \"ping -n {} 127.0.0.1 >nul\"\r\n@exit /b 0\r\n",
+                CHILD_WAIT_SECS + 1
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -1290,7 +1312,7 @@ mod tests {
             std::fs::write(
                 &program,
                 format!(
-                    "#!/bin/sh\n(\n  sleep 1\n  : > '{}'\n  sleep 60\n) >&1 2>&2 &\nexit 0\n",
+                    "#!/bin/sh\n(\n  sleep 1\n  : > '{}'\n  sleep {CHILD_WAIT_SECS}\n) >&1 2>&2 &\nexit 0\n",
                     marker.display()
                 ),
             )
@@ -1300,14 +1322,24 @@ mod tests {
 
         let started = Instant::now();
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            RUN_BUDGET,
             super::CommandRunner::with_timeout(&program, std::time::Duration::from_millis(100))
                 .run(dir.path(), &[]),
         )
         .await
         .expect("the inherited pipe holder must not keep CommandRunner alive");
-        assert_eq!(result.kind, super::CommandRunKind::TimedOut);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Anything but `TimedOut` means both pipes closed inside the deadline —
+        // the backgrounded holder never ran (a failed fork under load). Say what
+        // the run saw, so a failure can tell that from a runner bug.
+        assert_eq!(
+            result.kind,
+            super::CommandRunKind::TimedOut,
+            "status {:?}, stdout {:?}, stderr {:?}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
+        assert!(started.elapsed() < RUN_BUDGET);
         #[cfg(unix)]
         {
             // The background subshell inherits both captured streams and writes

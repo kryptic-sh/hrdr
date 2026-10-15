@@ -1140,7 +1140,20 @@ mod tests {
             crate::apply_event(&mut want, ev);
         }
         let got = read_transcript(&path);
-        let kinds = |v: &[crate::Entry]| v.iter().map(|e| e.kind.clone()).collect::<Vec<_>>();
+        // A closed reasoning block records its duration from the wall clock, so
+        // two folds of one stream differ there by however long apart they ran.
+        // Compare that it was recorded, not the milliseconds.
+        let kinds = |v: &[crate::Entry]| {
+            v.iter()
+                .map(|e| match &e.kind {
+                    crate::EntryKind::Reasoning { text, took_ms } => crate::EntryKind::Reasoning {
+                        text: text.clone(),
+                        took_ms: took_ms.map(|_| 0),
+                    },
+                    kind => kind.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
         assert_eq!(kinds(&got), kinds(&want), "same fold, fewer lines");
     }
 
