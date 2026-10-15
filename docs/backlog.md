@@ -2705,11 +2705,6 @@ and **not** fixed.
   run removes. Not cleaned: `.tmp*` dirs leaked into the system temp dir before
   the fix — 16,972 on the owner's machine, not all necessarily hrdr's — which
   nothing can attribute safely.
-- **`runtime_reload_restyles_warm_theme_picker_and_completion` failed once**
-  under the local Windows leak guard (2026-10-15):
-  `app.active_completions().unwrap()` was `None` inside the style loop
-  (`hrdr-tui/src/app.rs`). It passed in every other run that day, including the
-  next leak-guard run. Not investigated.
 - **Not reviewed:** the `hjkl-clipboard` Windows backend.
 
 ## Correctness review 2026-08-14

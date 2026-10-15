@@ -4075,6 +4075,11 @@ mod tests {
     #[tokio::test]
     async fn runtime_reload_restyles_warm_theme_picker_and_completion() {
         use hrdr_app::CommandHost;
+        // The themes dir follows `XDG_CONFIG_HOME`, which the e2e harness swaps
+        // for a private root while it runs; hold the same guard, or a parallel
+        // e2e test moves the dir between writing these themes and completing
+        // them.
+        let _config_home = super::e2e::isolated_data_home();
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = AgentConfig {
             model: "local://test-model".parse().unwrap(),

@@ -776,7 +776,7 @@ fn without_bar(row: &str) -> &str {
 /// It hands the root back on drop: `XDG_DATA_HOME` / `XDG_CONFIG_HOME` are process-
 /// global, so a test holding a private root holds the lock while it does, and must not
 /// leave the vars pointing at a temp dir that is about to be deleted.
-fn isolated_data_home() -> DataHomeGuard {
+pub(super) fn isolated_data_home() -> DataHomeGuard {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // A previous test's panic must not poison the lock for everyone else.
     let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -792,7 +792,7 @@ fn isolated_data_home() -> DataHomeGuard {
 
 /// The lifetime of a private data home: holds the env lock and the temp dir, and puts
 /// the process-wide roots back when the test ends.
-struct DataHomeGuard {
+pub(super) struct DataHomeGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     tmp: Option<tempfile::TempDir>,
 }
