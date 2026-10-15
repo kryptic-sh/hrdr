@@ -157,16 +157,24 @@ static SANDBOX_ALIVE: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::
 /// failing run used to leave its whole sandbox behind. A kernel lock is released
 /// on any exit, which is what lets [`sweep_abandoned_sandboxes`] tell an
 /// abandoned root from a live one.
+///
+/// The file is locked under a name no sweep opens and only then renamed into
+/// place — the lock belongs to the open handle and survives the rename — so a
+/// sibling binary's sweep can never take a live root's lock in the moment
+/// between creating the file and locking it, which would both fail this ctor
+/// and delete a running binary's sandbox.
 fn hold_sandbox_alive(root: &Path) {
+    let pending = root.join(".alive-pending");
     let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .read(true)
         .write(true)
-        .open(root.join(ALIVE_FILE))
+        .open(&pending)
         .expect("a test sandbox's liveness file is creatable");
     file.try_lock()
-        .expect("a fresh test sandbox's liveness file is unlocked");
+        .expect("a liveness file no other process has opened is unlocked");
+    std::fs::rename(&pending, root.join(ALIVE_FILE))
+        .expect("a test sandbox's liveness file is publishable");
     let _ = SANDBOX_ALIVE.set(file);
 }
 
