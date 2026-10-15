@@ -2673,13 +2673,18 @@ and **not** fixed.
   (`open_wire_log_*`, `owner_only_options_no_follow_refuses_a_symlink` — no
   Windows equivalent exists, see Hardening notes) and the Landlock backend.
   **Not unix by nature, still gated:** symlink tests in `hrdr-agent`
-  (`delegation.rs`) and `hrdr-tools` (`sandbox.rs`, `tree.rs`, `lsp.rs`'s other,
-  and two in `lib.rs`) — grep `std::os::unix::fs::symlink`; the `hrdr-llm` ones
-  left are `O_NOFOLLOW`/mode-bit tests, unix by nature. The guards they cover do
-  run on Windows. `hrdr_test_support::symlink_or_skip` is the portable helper —
-  file or directory link by target kind, skipping locally without the privilege
-  and failing on CI. Ported 2026-10-15, each shown to fail on Windows when its
-  guard is broken: `atomic_write_writes_through_a_symlink`,
+  (`delegation.rs`) and `hrdr-tools` (`sandbox.rs`, `lsp.rs`'s other) — grep
+  `std::os::unix::fs::symlink`; the `hrdr-llm` ones left are
+  `O_NOFOLLOW`/mode-bit tests, unix by nature. Also ported 2026-10-15:
+  `tree_symlink_marks` (its body was `cfg(unix)`, so it passed on Windows
+  checking nothing), `attachment_presentation_directory_suffixes`' link case,
+  and `normalize_path_handles_existing_and_nonexistent_symlink_targets` — which
+  is weak everywhere: its "must not start with cwd" holds with or without the
+  symlink, since `link/../../other` leaves the project either way. The guards
+  they cover do run on Windows. `hrdr_test_support::symlink_or_skip` is the
+  portable helper — file or directory link by target kind, skipping locally
+  without the privilege and failing on CI. Ported 2026-10-15, each shown to fail
+  on Windows when its guard is broken: `atomic_write_writes_through_a_symlink`,
   `guard_not_swapped_rejects_a_path_repointed_after_open`,
   `a_secret_line_memo_is_a_per_run_snapshot`, the commands/skills discovery and
   trust symlink tests, `open_wire_log_rejects_symlink_placed_after_rename` (the
