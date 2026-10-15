@@ -2659,12 +2659,7 @@ and **not** fixed.
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
   intentionally does not affect animation eligibility; only transcript viewport
-  visibility does.
-- **The Job Object is assigned after spawn.** A descendant forked in that window
-  escapes the tree kill; documented in the `proc` module docs. The race-free
-  form (`CREATE_SUSPENDED` → assign → resume) is awkward through tokio.
-
-**Coverage gaps (stated as gaps):**
+  visibility does. **Coverage gaps (stated as gaps):**
 
 - **33 tests still run only on Linux** (CI at `5a8d8a5`). Unix by nature: the
   mode-bit tests (`*_owner_only`, `*_0600*`,

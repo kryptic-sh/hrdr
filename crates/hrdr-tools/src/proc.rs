@@ -29,12 +29,11 @@
 //!   the other option; a Job Object was chosen because it doesn't spawn yet
 //!   another process to do the killing.
 //!
-//! Known limitation (Windows only): the child is spawned running and assigned to
-//! the job a moment later, so a descendant forked in that narrow window escapes
-//! the job. The race-free form (`CREATE_SUSPENDED` → assign → `ResumeThread`) is
-//! awkward through tokio's spawn API; the window is tiny and this is a
-//! best-effort resource guard, not a security boundary. Unix has no such race —
-//! `process_group(0)` is applied pre-exec, atomically with the spawn.
+//! On Windows the job can only be assigned once the child exists, so the child
+//! is spawned suspended ([`configure`]), assigned, then resumed
+//! ([`ProcessGroup::attach`]) — nothing it starts can be created outside the
+//! job. Unix needs none of that: `process_group(0)` is applied pre-exec,
+//! atomically with the spawn.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -625,8 +624,12 @@ pub fn process_alive(pid: u32) -> bool {
 /// (`process_group(0)` — pgid becomes the child's own pid), so
 /// [`ProcessGroup::kill`] can later signal `-pgid` for the whole group.
 ///
-/// Windows: a no-op here. Grouping happens after spawn, once there is a
-/// process handle to assign into a Job Object — see [`ProcessGroup::attach`].
+/// Windows: spawns the child suspended. Grouping needs a process handle to
+/// assign into a Job Object, which exists only after spawn, and a child that
+/// ran in between could start a process outside the job — so it does not run
+/// until [`ProcessGroup::attach`] has assigned it and resumes it. **Every
+/// configured spawn must therefore be followed by `attach`**, which resumes the
+/// child whether or not the assignment succeeds.
 pub(crate) fn configure(cmd: &mut tokio::process::Command) {
     #[cfg(unix)]
     {
@@ -634,7 +637,10 @@ pub(crate) fn configure(cmd: &mut tokio::process::Command) {
     }
     #[cfg(windows)]
     {
-        let _ = cmd;
+        // `CREATE_SUSPENDED`, a fixed Win32 ABI value spelled out: the names
+        // are what move between `windows-sys` releases.
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        cmd.creation_flags(CREATE_SUSPENDED);
     }
 }
 
@@ -770,9 +776,12 @@ impl ProcessGroup {
         }
         #[cfg(windows)]
         {
-            Ok(Self {
-                job: windows_job::Job::new_and_assign(child)?,
-            })
+            // The child was spawned suspended (see `configure`), so nothing it
+            // starts can escape the job. It must run either way: resume it
+            // before reporting a failed assignment.
+            let job = windows_job::Job::new_and_assign(child);
+            windows_job::resume(child)?;
+            Ok(Self { job: job? })
         }
     }
 
@@ -879,6 +888,67 @@ mod windows_job {
     unsafe impl Send for Job {}
     unsafe impl Sync for Job {}
 
+    /// Resume `child`, spawned suspended by [`super::configure`]: every thread
+    /// it has — a process created suspended has only its main thread, which
+    /// `std` does not hand back. A child that cannot be resumed is terminated,
+    /// never left frozen.
+    pub(crate) fn resume(child: &tokio::process::Child) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
+        };
+
+        let Some(pid) = child.id() else {
+            return Ok(()); // already exited: nothing left to resume
+        };
+        let resumed = (|| {
+            // SAFETY: a snapshot handle, checked against INVALID_HANDLE_VALUE and
+            // closed below; `entry` is sized as the API requires before use.
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut found = 0;
+            let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+            let mut outcome = Ok(());
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    found += 1;
+                    // SAFETY: a thread id from the snapshot; the handle is
+                    // checked and closed.
+                    let thread =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                    if thread.is_null() || unsafe { ResumeThread(thread) } == u32::MAX {
+                        outcome = Err(io::Error::last_os_error());
+                    }
+                    if !thread.is_null() {
+                        unsafe { CloseHandle(thread) };
+                    }
+                }
+                more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+            }
+            unsafe { CloseHandle(snapshot) };
+            if found == 0 && outcome.is_ok() {
+                outcome = Err(io::Error::other(
+                    "the suspended child has no thread to resume",
+                ));
+            }
+            outcome
+        })();
+        if resumed.is_err()
+            && let Some(raw) = child.raw_handle()
+        {
+            // SAFETY: the child's own process handle, valid while `child` lives.
+            unsafe { TerminateProcess(raw, 1) };
+        }
+        resumed
+    }
+
     impl Job {
         #[cfg(test)]
         pub(crate) fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
@@ -979,6 +1049,35 @@ mod tests {
     /// keep the unit test fast and independent of any particular call site's
     /// plumbing. The end-to-end version (via the `bash` tool's timeout path)
     /// lives in `tools/shell.rs`.
+    /// On Windows a configured child does not run until `attach` has put it in
+    /// its job: it is spawned suspended, so nothing it starts can be created
+    /// before the job exists to hold it. Once attached it runs normally.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_configured_child_waits_for_attach_on_windows() {
+        let mut cmd = tokio::process::Command::new("cmd.exe");
+        cmd.args(["/C", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        super::configure(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+
+        // Ample time for `cmd /C exit 0` to finish — had it been running.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a configured child must not run before it is attached"
+        );
+
+        let _group = super::ProcessGroup::attach(&child).unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+            .await
+            .expect("an attached child runs to completion")
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[tokio::test]
     async fn killing_the_group_reaches_a_backgrounded_grandchild() {
         let Some(shell) = test_env::shell() else {
@@ -1056,12 +1155,15 @@ mod tests {
         use windows_sys::Win32::Foundation::GetHandleInformation;
 
         let mut command = tokio::process::Command::new("cmd");
+        // Not `timeout`: it refuses redirected stdin and exits at once, so the
+        // "running" child this test needs was already gone.
         command
-            .args(["/c", "timeout /t 60 /nobreak >nul"])
+            .args(["/c", "ping -n 60 127.0.0.1 >nul"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        super::configure(&mut command);
         let mut child = command.spawn().unwrap();
         let mut group = super::ProcessGroup::attach(&child).unwrap();
         let handle = group.job.raw_handle();
@@ -1126,7 +1228,7 @@ mod tests {
         #[cfg(windows)]
         std::fs::write(
             &program,
-            "@for /L %%i in (1,1,10000) do @echo 0123456789\r\n@timeout /t 5 /nobreak >nul\r\n",
+            "@for /L %%i in (1,1,10000) do @echo 0123456789\r\n@ping -n 6 127.0.0.1 >nul\r\n",
         )
         .unwrap();
         #[cfg(unix)]

@@ -198,6 +198,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **On Windows, a command's whole process tree is stopped, from its first
+  instant.** A command, hook, LSP or MCP server was put under the Job Object
+  that lets hrdr stop its whole process tree only after it had started, so a
+  process it launched in that first moment could outlive a cancel or timeout. It
+  is now started suspended, placed in the job, then resumed
+  (`crates/hrdr-tools`).
 - **A ChatGPT login refresh no longer fails when the server keeps the refresh
   token.** OAuth lets a token refresh leave out a new refresh token, meaning the
   current one stays valid; hrdr rejected such a response and forced a fresh
