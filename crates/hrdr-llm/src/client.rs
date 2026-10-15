@@ -4150,7 +4150,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn open_wire_log_rejects_symlink_placed_after_rename() {
         // Simulate the race window that rotate_wire_log faces: rename the
         // original active file to .1, then an external actor places a symlink
@@ -4169,7 +4168,9 @@ mod tests {
         // 3. A symlink appears at the now-vacant active path.
         let target = dir.path().join("target.log");
         std::fs::write(&target, b"evil payload").unwrap();
-        std::os::unix::fs::symlink(&target, &path).unwrap();
+        if !hrdr_test_support::symlink_or_skip(&target, &path) {
+            return;
+        }
 
         // 4. open_wire_log (called by rotate_wire_log for the fresh file)
         //    must reject the symlink.
