@@ -91,11 +91,19 @@ push each verified slice to `main` before proceeding to the next slice.
    its serve loop having stopped: `serve` breaks on any accept error outside
    `unavailable`, its listener then releases the lease, and the next listing
    reaps the record. The error used to be discarded; it is now kept
-   (`Messaging::stopped_by`) and the pty test's failure messages print it, so
-   the next recurrence names it. Not reproduced locally (12 runs of the two
-   messaging tests together, 6 of the full `tui_pty` suite, Windows, pinned
-   host). No test covers `stopped_by` being set: nothing can make a pipe accept
-   fail on demand. Same day, one parallel `local_ipc` run failed
+   (`Messaging::stopped_by`) and the pty test's failure messages print it.
+   **That hypothesis is falsified:** the next recurrence (`dad2f48f`, Windows
+   leak-guard job, 2026-10-15) printed `peer open: true, stopped by: None` — the
+   peer was serving throughout. The listing again took 215 ms, one
+   `PROBE_RETRY_DELAY`, and held the two other sessions, so this peer's probe
+   failed fast twice in a row while its server ran. The cause is in the probe
+   exchange, and `Messaging::discover` drops every probe error
+   (`Err(_) => None`), so nothing says which. Next step: make that error
+   observable — e.g. `discover` reporting why each candidate was skipped, which
+   the `sessions` tool could also surface. Not reproduced locally (12 runs of
+   the two messaging tests together, 6 of the full `tui_pty` suite, Windows,
+   pinned host). No test covers `stopped_by` being set: nothing can make a pipe
+   accept fail on demand. Same day, one parallel `local_ipc` run failed
    `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
    stalling for 43s; four reruns passed in ~5s. Real-process coverage:
    `tests/tui_pty.rs` (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`:
