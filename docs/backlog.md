@@ -2139,6 +2139,20 @@ re-derives them.
 Recorded so the next audit does not re-litigate them — if you disagree, argue
 with the reason, don't re-file the finding.
 
+- **Making `remove_lock_file_if_owned` atomic — declined 2026-10-16.** It reads
+  the lock's pid, then deletes by path, so a reap and reclaim between the two
+  would delete the new holder's lock. Three reasons not to change it alone.
+  There is no portable atomic compare-and-delete for a plain file: renaming the
+  lock aside first only moves the window, since restoring a lock taken by
+  mistake can clobber or briefly unlock the next holder. The precondition is a
+  contender judging a LIVE holder stale (`is_stale_lock`), which needs an
+  unprobeable lease and `process_alive` reporting a running pid dead. And the
+  reaper's own path (`is_stale_lock`, then delete) carries the same
+  read-then-delete window, already accepted as hardening. Closing either for
+  real means an OS advisory lock (`flock` / `LockFileEx`) under the lock file —
+  a redesign of the store-lock scheme, worth doing only with a reproduced
+  failure.
+
 - **Batched `edits[]` on the `edit` tool — declined 2026-07-26.** The design was
   worked through (flat `edits: [{path, old_string, new_string}]`, anchors
   resolved against as-read content, two-phase all-or-nothing) and rejected on
@@ -3020,14 +3034,14 @@ lock-held-empty case, which is finding 2).
 
 **Hardening (correct today, fragile):**
 
-- `remove_lock_file_if_owned` is read-then-delete, not atomic
-  (`store_lock.rs:284-298`) — a concurrent reap+reclaim between the read and the
-  `remove_file` can still delete the new holder's lock. Same class as the
-  documented write-path TOCTOU; pre-dates `2823fc2`.
-- The completion cache key omits `suppress_completions` — safe today because the
-  suppressed path returns `None` before the cache and every unsuppress path
-  accompanies a content change; a future unsuppress without a content change
-  would serve a stale entry.
+- `remove_lock_file_if_owned` read-then-delete — declined 2026-10-16; see
+  Considered and declined.
+- The completion cache key omits `suppress_completions` — cleared 2026-10-16,
+  not a defect: `active_completions` returns `None` before the cache while
+  suppressed, and suppression is not an input to `compute_completions`, so the
+  cached value for a given content and `completion_generation` is the same
+  either way. Only a completion input changing without a generation bump could
+  serve a stale entry, and that holds for every input, not this flag.
 - `agent_names`/`agent_cwd` are "best-effort under lock" (`helpers.rs:386-402`);
   the memoization turned their transient wrong answer into a persistent one
   (finding 2). The `/cwd`-during-a-running-turn overlap leaves the file index
