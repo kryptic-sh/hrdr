@@ -321,8 +321,7 @@ mod tests {
             &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
         )
         .unwrap();
-        let _peer = ClientOptions::new().open(&listener.name).unwrap();
-        let handle = listener.pending.as_raw_handle() as usize;
+        let mut peer = ClientOptions::new().open(&listener.name).unwrap();
         let mut sender = listener.accept().await.unwrap();
         let payload = vec![42; super::super::MAX_FRAME_BYTES];
         let result = sender
@@ -331,7 +330,7 @@ mod tests {
         // Check the native resource before the result: the old implementation
         // reports success with an outstanding write, and drop leaves it alive.
         drop(sender);
-        assert_handle_released(handle).await;
+        assert_server_end_closed(&mut peer).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
@@ -346,8 +345,7 @@ mod tests {
             &crate::local_ipc::storage::MutationGuard::acquire(&directory).unwrap(),
         )
         .unwrap();
-        let _peer = ClientOptions::new().open(&listener.name).unwrap();
-        let handle = listener.pending.as_raw_handle() as usize;
+        let mut peer = ClientOptions::new().open(&listener.name).unwrap();
         let mut sender = listener.accept().await.unwrap();
         let payload = vec![42; super::super::MAX_FRAME_BYTES];
         let mut write = Box::pin(sender.write_frame(&payload, Duration::from_secs(30)));
@@ -357,26 +355,25 @@ mod tests {
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         drop(write);
-        assert_handle_released(handle).await;
+        assert_server_end_closed(&mut peer).await;
     }
 
-    async fn assert_handle_released(handle: usize) {
+    /// The server's pipe handle is closed once the client reads past whatever
+    /// was buffered to the end of the pipe. While a pending write still holds
+    /// the handle, the read just waits. Polling the handle *value* instead
+    /// cannot tell: Windows reissues a freed value at once, and parallel tests
+    /// keep opening handles.
+    async fn assert_server_end_closed(peer: &mut tokio::net::windows::named_pipe::NamedPipeClient) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0; 64 * 1024];
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let mut flags = 0;
-                // SAFETY: this API accepts a handle value and reports invalid
-                // handles; flags is writable. No new handles are opened here.
-                let success = unsafe {
-                    windows_sys::Win32::Foundation::GetHandleInformation(handle as _, &mut flags)
-                };
-                if success == 0 {
-                    assert_eq!(
-                        io::Error::last_os_error().raw_os_error(),
-                        Some(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32)
-                    );
-                    return;
+                match peer.read(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return,
+                    Err(error) => panic!("reading the peer end: {error}"),
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
