@@ -46,6 +46,13 @@ only the list. Delete a line when its question is answered.
   was held back, because the failing `Package` step is today the only thing that
   stops a `wip/…` dispatch from publishing. _Session coordination, queue
   item 9._
+- **A failed OAuth token save goes unnoticed**, and the uncalled public
+  `valid_access_token`. Pick how a refresh whose rotated token could not be
+  saved is surfaced (a status line through the frontend, a returned warning, or
+  failing the request), and whether to drop the unused re-export — an API break
+  for an outside user of `hrdr-agent`, like `apply_cache_breakpoints`. _Test
+  coverage → "Config-mutation path tests" paragraph, Session coordination
+  section._
 - **CRLF through `replace` and `write`** — preserve a file's dominant line
   ending or write what was given. _Windows support review 2026-09-15._
 - **`cwd_slug` hash and migration.** _Windows support review 2026-09-15._
@@ -436,7 +443,15 @@ source-inspected rather than covered by a network/save integration test.
 Credential replacement-failure coverage uses a Windows readonly fixture; the
 corresponding Unix failure branch has not been exercised. Blob lock and OAuth
 refresh persistence errors remain ignored, with native labels in those discarded
-errors.
+errors. The OAuth one is a question for the owner (see the index):
+`coordinated_oauth_access` passes `coordinated_access_core` a persist callback
+that drops `save_oauth_entry_at`'s error, so a failed save of a rotated refresh
+token goes unnoticed until the next start cannot refresh. `hrdr-agent` has no
+logging channel, and failing the request would throw away an access token that
+is valid for this session, so surfacing it means choosing a channel.
+`valid_access_token`, the uncoordinated variant that drops the same error, has
+no caller in the tree — it survives only as a public re-export of a published
+crate (found 2026-10-16).
 
 Intermittent failures seen in runs during the messaging work and not
 root-caused: watch-delivery timing and session-save timing. (The third,
