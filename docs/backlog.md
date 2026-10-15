@@ -164,12 +164,16 @@ push each verified slice to `main` before proceeding to the next slice.
    next recurrence's request body names the reason. Note for whoever reads it:
    an unavailable-classed connect error comes back as `answered Unavailable` and
    is not retried (only `Err` is), which would drop a peer on one transient
-   connect failure. Not reproduced locally (12 runs of the two messaging tests
-   together, 6 of the full `tui_pty` suite, Windows, pinned host). No test
-   covers `stopped_by` being set: nothing can make a pipe accept fail on demand.
-   Same day, one parallel `local_ipc` run failed
-   `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
-   stalling for 43s; four reruns passed in ~5s. Real-process coverage:
+   connect failure. Next recurrence (`a78abc90`, 2026-10-15) moved to the
+   release smoke job and past discovery: the peer was listed, then never
+   received the message (`peer open: true, stopped by: None`). The mock model
+   says `SENT_TO_PEER` whatever `message_session` returned, so the test now
+   prints that tool's answer on this failure too. Not reproduced locally (12
+   runs of the two messaging tests together, 6 of the full `tui_pty` suite,
+   Windows, pinned host). No test covers `stopped_by` being set: nothing can
+   make a pipe accept fail on demand. Same day, one parallel `local_ipc` run
+   failed `native_cross_process_rejects_malformed_truncated_and_stalled_frames`
+   after stalling for 43s; four reruns passed in ~5s. Real-process coverage:
    `tests/tui_pty.rs` (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`:
    tools, peer wake, shutdown leaves discovery) and
    `tests/headless_messaging.rs` (busy delivery, disabling), on the CI matrix;

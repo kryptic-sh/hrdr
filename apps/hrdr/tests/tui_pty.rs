@@ -1095,11 +1095,21 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
         if let Some(message) = peer.dequeue() {
             break message;
         }
+        // The mock model says SENT_TO_PEER whatever `message_session`
+        // answered, so the answer itself is what explains a miss.
         assert!(
             start.elapsed() < EXIT,
-            "the peer never received the message (peer open: {}, stopped by: {:?})",
+            "the peer never received the message (peer open: {}, stopped by: {:?}); \
+             message_session answered: {}",
             peer.is_open(),
-            peer.stopped_by()
+            peer.stopped_by(),
+            bodies[2]["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .map_or_else(
+                    || bodies[2].to_string(),
+                    |result| result["content"].to_string()
+                )
         );
         std::thread::sleep(Duration::from_millis(50));
     };
