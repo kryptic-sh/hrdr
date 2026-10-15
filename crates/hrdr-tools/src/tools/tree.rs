@@ -821,20 +821,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.txt"), "").unwrap();
 
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.path().join("file.txt"), dir.path().join("link.txt"))
-                .unwrap();
-            let c = ToolContext::new(dir.path().to_path_buf());
-            let out = TreeTool
-                .execute(
-                    serde_json::json!({"path": dir.path().to_str().unwrap(), "max_depth": 1}),
-                    &c,
-                )
-                .await
-                .unwrap();
-            assert!(out.contains("link.txt@"), "symlink mark: {out}");
+        if !hrdr_test_support::symlink_or_skip(
+            &dir.path().join("file.txt"),
+            &dir.path().join("link.txt"),
+        ) {
+            return;
         }
+        let c = ToolContext::new(dir.path().to_path_buf());
+        let out = TreeTool
+            .execute(
+                serde_json::json!({"path": dir.path().to_str().unwrap(), "max_depth": 1}),
+                &c,
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("link.txt@"), "symlink mark: {out}");
     }
 
     #[tokio::test]

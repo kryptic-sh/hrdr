@@ -4024,8 +4024,9 @@ b:2:y"
         // Create a symlink inside the project pointing outside.
         let outside = dir.path().join("outside_file");
         std::fs::write(&outside, "content").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+        if !hrdr_test_support::symlink_or_skip(&outside, &cwd.join("link")) {
+            return;
+        }
 
         // Path using the symlink component + `..` escape in unresolved suffix.
         // project/link/../../outside/other — `link` follows to `outside_file`,
@@ -4303,12 +4304,13 @@ b:2:y"
         std::fs::create_dir_all(root.join("nested/child")).unwrap();
         std::fs::write(root.join("nested/note.txt"), "body").unwrap();
         #[cfg(unix)]
-        {
-            std::fs::write(root.join(r"nested/literal\name"), "body").unwrap();
-            std::os::unix::fs::symlink("note.txt", root.join("nested/link")).unwrap();
-        }
+        std::fs::write(root.join(r"nested/literal\name"), "body").unwrap();
+        let linked = hrdr_test_support::symlink_or_skip(
+            std::path::Path::new("note.txt"),
+            &root.join("nested/link"),
+        );
         for style in [false, true] {
-            let mut expected = [
+            let mut expected = vec![
                 if cfg!(windows) && !style {
                     "child\\"
                 } else {
@@ -4316,10 +4318,11 @@ b:2:y"
                 },
                 "note.txt",
                 #[cfg(unix)]
-                "link@",
-                #[cfg(unix)]
                 r"literal\name",
             ];
+            if linked {
+                expected.push("link@");
+            }
             expected.sort();
             assert_eq!(
                 read_attach_dir("nested", root, style).unwrap(),
