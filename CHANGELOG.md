@@ -222,6 +222,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **During a running turn, `@file` completion, `!command` and image paste use
+  the session's directory.** While a turn held the agent, they fell back to the
+  directory hrdr was started in, so after `/cwd` or resuming a session from
+  elsewhere they indexed, ran in, and saved pasted images to the wrong directory
+  (`crates/hrdr-tui`).
 - **The request wire log no longer follows a symlink on Windows.** Its open
   refused a symlink at the log's path only on unix (`O_NOFOLLOW`); on Windows a
   link swapped in after the preflight check was followed, so the log could be

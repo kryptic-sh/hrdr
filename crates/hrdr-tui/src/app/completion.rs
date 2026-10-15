@@ -199,7 +199,7 @@ impl super::App {
         if self.file_index_building {
             return;
         }
-        let cwd = hrdr_app::agent_cwd(&self.agent);
+        let cwd = self.tools_cwd();
         if self.file_index_cwd.as_deref() == Some(cwd.as_path()) {
             return;
         }

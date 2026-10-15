@@ -1819,7 +1819,7 @@ impl App {
             args: serde_json::json!({"command": command}).to_string(),
         });
         let task_id = id.clone();
-        let cwd = hrdr_app::agent_cwd(&self.agent);
+        let cwd = self.tools_cwd();
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<String>(256);
         let mut ctx = hrdr_tools::ToolContext::new(&cwd);
         ctx.stream = Some(stream_tx);
@@ -2018,7 +2018,7 @@ impl App {
     /// at what is actually on the clipboard instead of asking the user to know.
     /// A text-only clipboard behaves exactly as it did.
     fn paste_clipboard(&mut self) {
-        let cwd = hrdr_app::agent_cwd(&self.agent);
+        let cwd = self.tools_cwd();
         let stem = format!("pasted-{}", self.paste_seq + 1);
         match hrdr_app::clipboard_paste(&self.clipboard, &cwd, &stem, self.unix_style_paths()) {
             hrdr_app::ClipboardPaste::Media(a) => {
@@ -2938,13 +2938,16 @@ impl App {
     /// The tools' current working directory: the agent's, or — while a turn
     /// holds the agent lock — the copy every cwd change keeps in `dir_cwd`. Not
     /// the process cwd: `/cwd` and resume move the tools without moving the
-    /// process, and a session is filed by this string, so a save mid-turn would
-    /// land in the directory hrdr was started from.
-    fn current_cwd(&self) -> String {
+    /// process, so the `@file` index, a `!command`, a paste or a mid-turn save
+    /// would otherwise land in the directory hrdr was started from.
+    pub(crate) fn tools_cwd(&self) -> std::path::PathBuf {
         self.with_agent(|a| a.cwd())
             .unwrap_or_else(|| self.dir_cwd.clone())
-            .display()
-            .to_string()
+    }
+
+    /// [`Self::tools_cwd`] as the string a session is filed by.
+    fn current_cwd(&self) -> String {
+        self.tools_cwd().display().to_string()
     }
 
     /// Switch the tools' working directory: update the agent and the status bar.

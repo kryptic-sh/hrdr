@@ -3069,10 +3069,12 @@ lock-held-empty case, which is finding 2).
   cached value for a given content and `completion_generation` is the same
   either way. Only a completion input changing without a generation bump could
   serve a stale entry, and that holds for every input, not this flag.
-- `agent_names`/`agent_cwd` are "best-effort under lock" (`helpers.rs:386-402`);
-  the memoization turned their transient wrong answer into a persistent one
-  (finding 2). The `/cwd`-during-a-running-turn overlap leaves the file index
-  built from the fallback process cwd, not the agent's new cwd.
+- `agent_names` is "best-effort under lock" (`hrdr-app` `helpers.rs`): empty
+  while a turn holds the agent, so `@name` completion offers no sub-agents
+  mid-turn; the completion memo is invalidated on `TurnMsg::Done`, so the empty
+  answer no longer sticks. (Its `agent_cwd` twin fell back to the process cwd;
+  the TUI now uses `App::tools_cwd`, which falls back to the app's own `dir_cwd`
+  — fixed 2026-10-16.)
 
 **Coverage:** reviewed in depth — the three post-sweep commits and every file
 they touch (`session.rs` lock/reserve/save paths, `store_lock.rs`,

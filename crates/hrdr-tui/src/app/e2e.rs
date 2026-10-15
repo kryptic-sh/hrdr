@@ -2779,6 +2779,22 @@ async fn the_context_window_is_probed_from_the_endpoint_on_startup() {
     assert_eq!(h.app.state().usage.context_window, Some(1000));
 }
 
+/// While a turn holds the agent lock, the tools' cwd is the one the app last
+/// moved to — not the process cwd, which `/cwd` and resume never move. The
+/// `@file` index, a `!command` and a paste all resolve against it.
+#[tokio::test]
+async fn the_tools_cwd_survives_a_held_agent_lock() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let moved = tempfile::tempdir().unwrap();
+    let moved = moved.path().to_path_buf();
+    assert_ne!(Some(moved.clone()), std::env::current_dir().ok());
+    h.app.apply_cwd(moved.clone());
+    let agent = h.app.agent.clone();
+    let _turn = agent.lock().await;
+    assert_eq!(h.app.tools_cwd(), moved);
+}
+
 /// Mid-turn durability: a `History` snapshot (emitted after each committed
 /// tool round) persists the session *while the turn is still running* — the
 /// regular autosave can't (the turn holds the agent lock). A crash mid-turn
