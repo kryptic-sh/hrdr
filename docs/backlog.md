@@ -1911,9 +1911,8 @@ property of code that still exists. Read before "simplifying" any of them.
 `ProcessLease`, and `is_stale_lock` reaps a lock whose pid now belongs to a
 different process. What is left: a lock written by an older hrdr (no lease), or
 one whose owner cannot be probed (`ProcessLiveness::Unknown`), still falls back
-to the pid alone; the wrap-up round shares `overflow_compacted`
-(`turn_loop.rs:524, 842`) — a second overflow on the forced wrap-up errors the
-turn.
+to the pid alone; the wrap-up round shares `overflow_compacted` (`turn_loop.rs`)
+— a second overflow on the forced wrap-up errors the turn.
 
 **From the 2026-08-05 correctness pass:** `fetch`'s `is_blocked_host` is
 advisory — correctness rests on the connect-time `SsrfGuardResolver`, one
@@ -1921,46 +1920,46 @@ refactor from being the only guard (`web.rs`).
 
 **From the 2026-08-05 security audit:** the verification-gate prompt section is
 repo-authored content the trust gate does not cover — `Gate::detect` runs
-unconditionally (`lib.rs:1818`, `:2211`) and `gate_section`
-(`prompt.rs:574-612`) renders the parsed CI commands as authoritative fact ("run
-them … before you report work finished"), even from an untrusted directory;
-inert today because `JAIL_TOOLS` (`hrdr-tools/src/ lib.rs:1549` =
-read/grep/find/ls/tree) has no shell or `verify` and the runner line is skipped
-when `verify` isn't registered (`prompt.rs:582-589`), but it is the one
-instruction surface the trust gate does not protect, and it becomes a live
-injection vector if jail ever gains `verify`/`shell`; `atomic_write` write-path
-TOCTOU (`tools/mutation.rs:149-154` — admitted in the comment; requires a
-hostile process racing the agent's own edits); MCP tool descriptions ride into
-the tools cache block unwrapped (`mcp/client.rs:366-370`, `Box::leak`) — a
-compromised operator-installed server can steer the model through its
-descriptions, where results are wrapped as untrusted; `/export` writes to any
-absolute path the user names (`conversation.rs:29` — equivalent to the user's
-own shell redirection, but the transcript contains model output).
+unconditionally (at agent construction, hrdr-agent `lib.rs`) and `gate_section`
+(`prompt.rs`) renders the parsed CI commands as authoritative fact ("run them …
+before you report work finished"), even from an untrusted directory; inert today
+because `JAIL_TOOLS` (`hrdr-tools/src/lib.rs`: read/grep/find/ls/tree) has no
+shell or `verify` and `gate_section` skips the runner line when `verify` isn't
+registered, but it is the one instruction surface the trust gate does not
+protect, and it becomes a live injection vector if jail ever gains
+`verify`/`shell`; `atomic_write` write-path TOCTOU (`tools/mutation.rs` —
+admitted in the comment; requires a hostile process racing the agent's own
+edits); MCP tool descriptions ride into the tools cache block unwrapped
+(`handshake_and_list` in `mcp/client.rs`, `Box::leak`) — a compromised
+operator-installed server can steer the model through its descriptions, where
+results are wrapped as untrusted; `/export` writes to any absolute path the user
+names (`export_conversation` — equivalent to the user's own shell redirection,
+but the transcript contains model output).
 
 **From the 2026-08-06 correctness pass:**
 
-- `turn_loop.rs:547-549` — `max_steps` is no longer a hard per-turn cap: every
-  delivered steer resets the round budget, so sustained steering (or a held key)
-  keeps the turn alive indefinitely; the cap only binds once steers stop.
-  Deliberate and test-pinned, but the meaning changed.
-- `turn_loop.rs:800-813` — the checkpoint note's "the turn ends at Y" is
-  computed from the current budget, so after a reset the model can be told the
-  turn ends at `max_steps` when further steers will extend it (advisory text
-  only).
-- `compaction.rs:908` — `context_after` is a ~4-bytes/token local estimate, not
-  a provider reading; the post-compaction gauge drifts from the provider's real
+- `Agent::run`'s round loop (`turn_loop.rs`) — `max_steps` is no longer a hard
+  per-turn cap: every delivered steer resets the round budget, so sustained
+  steering (or a held key) keeps the turn alive indefinitely; the cap only binds
+  once steers stop. Deliberate and test-pinned, but the meaning changed.
+- The checkpoint note (`checkpoint_warning_round`, `turn_loop.rs`) — its "the
+  turn ends at Y" is computed from the current budget, so after a reset the
+  model can be told the turn ends at `max_steps` when further steers will extend
+  it (advisory text only).
+- `context_after` (`compaction.rs`) is a ~4-bytes/token local estimate, not a
+  provider reading; the post-compaction gauge drifts from the provider's real
   `prompt_tokens` (the estimator deliberately under-counts).
 
 **From the 2026-08-06 security audit.** One claim was demoted from a finding to
 hardening, with the trace that disproved the repro: the claim
 "`SandboxMode::Read` does not confine the `memory` tool's writes"
-(`memory.rs:253, 292, 305` use bare `fs::write`/`remove_file`; in `Read` mode
-`writable_roots` is empty by construction, `sandbox.rs:198`). Traced unreachable
-in the default configuration: `effective_sandbox` floors a write-capable
-session's `read` request to `Write` (`config.rs:1797`, test-pinned at
-`:2737-2745`), so `SandboxMode::Read` is only ever entered with
-`read_only = true` — and the read-only tool scoping withholds `memory` (a write
-tool; `Tool::read_only` defaults false, `lib.rs:1289`, and `MemoryTool` never
+(`MemoryTool::execute` uses bare `fs::write`/`remove_file`; in `Read` mode
+`SandboxPolicy::writable_roots` is empty by construction). Traced unreachable in
+the default configuration: `effective_sandbox` floors a write-capable session's
+`read` request to `Write` (test-pinned by
+`effective_sandbox_matches_the_decision_table`), so `SandboxMode::Read` is only
+ever entered with `read_only = true` — and the read-only tool scoping withholds
+`memory` (a write tool; `Tool::read_only` defaults false, and `MemoryTool` never
 overrides it). Residual, recorded as hardening below.
 
 - **The `memory` tool writes outside the sandbox roots in every mode**, by
@@ -1969,8 +1968,9 @@ overrides it). Residual, recorded as hardening below.
   can only narrow its read-only set (`Agent::new`; test
   `a_read_only_allow_list_cannot_add_a_write_tool`).
 - The OpenRouter callback server reflects the attacker's own (escaped) state
-  string (`oauth.rs:259`); the comment at `:255-257` should be preserved — a
-  future "echo the expected value" change would leak the CSRF token.
+  string (`parse_callback`, `oauth.rs`); its comment against echoing
+  `expected_state` should be preserved — a future "echo the expected value"
+  change would leak the CSRF token.
 - `trust::trust` opens the trusted-dirs store with `create(true)`: a
   pre-existing world-readable file keeps its mode and a symlink is followed. The
   mode half is mitigated (re-checked 2026-10-15): the store's directory is
@@ -1978,13 +1978,13 @@ overrides it). Residual, recorded as hardening below.
   directories included), so no other user can reach the file. The symlink half
   is same-user only. Low sensitivity (directory paths).
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
-  then `atomic_write` re-opens the path (`mutation.rs:150-153`); a symlink swap
-  between the two could redirect a write. Same-user, no privilege boundary.
+  then `atomic_write` re-opens the path; a symlink swap between the two could
+  redirect a write. Same-user, no privilege boundary.
 - Landlock grants full `AccessFs::from_all` (incl. `REFER`) on writable roots —
   safe only because the `/` rule lacks REFER on the source side of a cross-root
   rename; the `NotEnforced` → refuse-spawn check is the backstop.
 - Seatbelt profiles are author-written and unvalidated on real macOS
-  (`sandbox.rs:1358-1364`); only a macOS run can validate them.
+  (`seatbelt_profile`, `sandbox.rs`); only a macOS run can validate them.
 
 ---
 
