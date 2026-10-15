@@ -462,3 +462,22 @@ fn find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     }
     None
 }
+
+/// A registered session that answers a probe without admitting messages is
+/// left out of the live list but still reported, with the answer it gave —
+/// what lets a listing say why a session the user can see is missing.
+#[tokio::test]
+async fn discovery_reports_a_session_that_did_not_accept_and_why() {
+    let root = root();
+    let a = runtime(root.path(), "a", "/one").await;
+    let b = runtime(root.path(), "b", "/two").await;
+    b.shared.state.lock().unwrap().open = false;
+
+    let found = a.discover_detailed().await.unwrap();
+    assert_eq!(found.live, vec![a.descriptor()]);
+    assert_eq!(found.unreachable.len(), 1, "{:?}", found.unreachable);
+    let (session, reason) = &found.unreachable[0];
+    assert_eq!(session, &b.descriptor());
+    assert_eq!(reason, "answered Unavailable");
+    assert_eq!(a.discover().await.unwrap(), vec![a.descriptor()]);
+}

@@ -81,9 +81,12 @@ impl Tool for SessionsTool {
             bail!("sessions accepts no arguments");
         }
         let runtime = running(&self.view).await?;
-        let sessions: Vec<Value> = peers(&runtime)
-            .await?
+        let own = runtime.descriptor().endpoint;
+        let found = runtime.discover_detailed().await?;
+        let sessions: Vec<Value> = found
+            .live
             .into_iter()
+            .filter(|session| session.endpoint != own)
             .map(|session| {
                 json!({
                     "session_id": session.session_id,
@@ -92,7 +95,26 @@ impl Tool for SessionsTool {
                 })
             })
             .collect();
-        let body = serde_json::to_string_pretty(&json!({ "sessions": sessions }))?;
+        // Registered but not answering: listed apart, with why, so a session the
+        // user can see running is not silently missing from the answer.
+        let unreachable: Vec<Value> = found
+            .unreachable
+            .into_iter()
+            .filter(|(session, _)| session.endpoint != own)
+            .map(|(session, reason)| {
+                json!({
+                    "session_id": session.session_id,
+                    "name": session.session_name,
+                    "cwd": session.working_directory,
+                    "reason": reason,
+                })
+            })
+            .collect();
+        let mut listing = json!({ "sessions": sessions });
+        if !unreachable.is_empty() {
+            listing["unreachable"] = Value::Array(unreachable);
+        }
+        let body = serde_json::to_string_pretty(&listing)?;
         Ok(hrdr_tools::wrap_untrusted("peer sessions", &body))
     }
 }

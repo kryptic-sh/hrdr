@@ -163,6 +163,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The `sessions` tool says which sessions it could not reach, and why.** A
+  running session that failed its liveness probe used to be left out of the list
+  silently; it is now listed under `unreachable` with the reason
+  (`crates/hrdr-tui`, `crates/hrdr-agent`).
 - **A streaming reply redraws at most once per frame.** The TUI drew a full
   frame after every burst of tokens, so a fast endpoint re-rendered the whole
   growing reply dozens of times a second. Frames woken only by the agent now

@@ -59,6 +59,14 @@ struct Refresh {
     reply: oneshot::Sender<io::Result<()>>,
 }
 
+/// What [`Messaging::discover_detailed`] found: the sessions that answered a
+/// probe, and the registered ones that did not, with why.
+#[derive(Debug, Default)]
+pub struct Discovery {
+    pub live: Vec<SessionDescriptor>,
+    pub unreachable: Vec<(SessionDescriptor, String)>,
+}
+
 /// Owns listener lifetime. Explicitly close and drain pending messages before drop
 /// when the frontend must report cancellation. Drop aborts all transport workers.
 pub struct Messaging {
@@ -139,6 +147,14 @@ impl Messaging {
     /// one incompatible session must not hide every other one. The retry keeps a
     /// live session that was momentarily too loaded to answer in the list.
     pub async fn discover(&self) -> io::Result<Vec<SessionDescriptor>> {
+        Ok(self.discover_detailed().await?.live)
+    }
+
+    /// [`Self::discover`], keeping the candidates it left out and why: the
+    /// status a probe was answered with, or the error it failed with. A session
+    /// that is registered but cannot be reached is otherwise indistinguishable
+    /// from one that is not there at all.
+    pub async fn discover_detailed(&self) -> io::Result<Discovery> {
         use futures_util::StreamExt;
 
         let candidates = retry(|| self.directory.list_candidates()).await?;
@@ -149,24 +165,29 @@ impl Messaging {
         }
         let probes = futures_util::stream::iter(candidates)
             .map(|candidate| async move {
-                match exchange(&self.directory, &candidate, Payload::Probe).await {
+                let probe = match exchange(&self.directory, &candidate, Payload::Probe).await {
                     Err(_) => {
                         sleep(PROBE_RETRY_DELAY).await;
                         exchange(&self.directory, &candidate, Payload::Probe).await
                     }
                     probe => probe,
-                }
+                };
+                (candidate, probe)
             })
             .buffered(PROBE_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
-        Ok(probes
-            .into_iter()
-            .filter_map(|probe| match probe {
-                Ok((SendStatus::Accepted, descriptor)) => Some(descriptor),
-                _ => None,
-            })
-            .collect())
+        let mut discovery = Discovery::default();
+        for (candidate, probe) in probes {
+            match probe {
+                Ok((SendStatus::Accepted, descriptor)) => discovery.live.push(descriptor),
+                Ok((status, _)) => discovery
+                    .unreachable
+                    .push((candidate, format!("answered {status:?}"))),
+                Err(error) => discovery.unreachable.push((candidate, error.to_string())),
+            }
+        }
+        Ok(discovery)
     }
 
     pub async fn send(&self, target: &SessionDescriptor, text: String) -> io::Result<SendStatus> {
