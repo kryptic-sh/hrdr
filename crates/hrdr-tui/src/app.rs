@@ -817,11 +817,11 @@ pub(crate) struct App {
     /// group is open its calls render as child items inside its summary; a
     /// click on the summary toggles it. Session-lifetime view state — never
     /// persisted.
-    pub(crate) tool_groups: HashMap<hrdr_app::PaneId, std::collections::HashSet<String>>,
+    pub(crate) tool_groups: HashMap<hrdr_app::PaneId, std::collections::HashSet<EntryId>>,
     /// Individual calls inside an expanded group that the reader opened in
     /// full (keyed by pane and tool-call id): every other call shows its preview
     /// (tail/head) until clicked. `verbose` shows every call in full at once.
-    pub(crate) tool_open: HashMap<hrdr_app::PaneId, std::collections::HashSet<String>>,
+    pub(crate) tool_open: HashMap<hrdr_app::PaneId, std::collections::HashSet<EntryId>>,
     /// Thinking entries the reader opened while reasoning is hidden, keyed by
     /// stable entry identity so pruning cannot retarget an open thought.
     pub(crate) thinking_open: std::collections::HashSet<EntryId>,
@@ -2249,14 +2249,13 @@ impl App {
         }
         // One expansion level: any click on a grouped tool — the summary
         // header or one of its rendered calls — folds or fans out the whole
-        // group, keyed by the group head's tool-call id.
+        // group, keyed by the group head's entry — not its tool-call id, which a
+        // backend numbering ids per request (llama.cpp's `call_0`, …) reuses
+        // every turn.
         let Some(head) = crate::ui::tool_group_head(transcript, hit) else {
             return;
         };
-        let id = transcript
-            .get(head)
-            .and_then(|e| crate::ui::tool_call_id(&e.kind))
-            .map(str::to_owned);
+        let id = transcript.get(head).map(Entry::id);
         if let Some(id) = id {
             let pane = self.panes.active();
             let removed = self
@@ -2291,8 +2290,8 @@ impl App {
         };
         let Some(id) = transcript
             .get(idx)
-            .and_then(|e| crate::ui::tool_call_id(&e.kind))
-            .map(str::to_owned)
+            .filter(|e| crate::ui::tool_call_id(&e.kind).is_some())
+            .map(Entry::id)
         else {
             return;
         };
@@ -2808,13 +2807,11 @@ impl App {
         // another pane's open thought must survive main scrollback pruning.
         for entry in &self.panes.main().transcript()[head..keep_start] {
             self.thinking_open.remove(&entry.id());
-            if let EntryKind::Tool { id, .. } = &entry.kind {
-                if let Some(open) = self.tool_open.get_mut(&hrdr_app::PaneId::MAIN) {
-                    open.remove(id);
-                }
-                if let Some(groups) = self.tool_groups.get_mut(&hrdr_app::PaneId::MAIN) {
-                    groups.remove(id);
-                }
+            if let Some(open) = self.tool_open.get_mut(&hrdr_app::PaneId::MAIN) {
+                open.remove(&entry.id());
+            }
+            if let Some(groups) = self.tool_groups.get_mut(&hrdr_app::PaneId::MAIN) {
+                groups.remove(&entry.id());
             }
         }
         if self
@@ -2840,33 +2837,46 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(crate) fn active_tool_groups_mut(&mut self) -> &mut std::collections::HashSet<String> {
+    pub(crate) fn active_tool_groups_mut(&mut self) -> &mut std::collections::HashSet<EntryId> {
         self.tool_groups.entry(self.panes.active()).or_default()
     }
 
     #[cfg(test)]
-    pub(crate) fn active_tool_open_mut(&mut self) -> &mut std::collections::HashSet<String> {
+    pub(crate) fn active_tool_open_mut(&mut self) -> &mut std::collections::HashSet<EntryId> {
         self.tool_open.entry(self.panes.active()).or_default()
     }
 
-    pub(crate) fn active_tool_groups(&self) -> Option<&std::collections::HashSet<String>> {
+    pub(crate) fn active_tool_groups(&self) -> Option<&std::collections::HashSet<EntryId>> {
         self.tool_groups.get(&self.panes.active())
     }
 
-    pub(crate) fn active_tool_open(&self) -> Option<&std::collections::HashSet<String>> {
+    pub(crate) fn active_tool_open(&self) -> Option<&std::collections::HashSet<EntryId>> {
         self.tool_open.get(&self.panes.active())
     }
 
-    pub(crate) fn active_tool_group_is_open(&self, id: &str) -> bool {
+    pub(crate) fn active_tool_group_is_open(&self, id: EntryId) -> bool {
         self.tool_groups
             .get(&self.panes.active())
-            .is_some_and(|groups| groups.contains(id))
+            .is_some_and(|groups| groups.contains(&id))
     }
 
-    pub(crate) fn active_tool_is_open(&self, id: &str) -> bool {
+    pub(crate) fn active_tool_is_open(&self, id: EntryId) -> bool {
         self.tool_open
             .get(&self.panes.active())
-            .is_some_and(|open| open.contains(id))
+            .is_some_and(|open| open.contains(&id))
+    }
+
+    /// The active pane's latest tool entry with provider call id `call_id` — what
+    /// a test means by "this call", now that expansion is keyed by entry.
+    #[cfg(test)]
+    pub(crate) fn active_tool_entry(&self, call_id: &str) -> EntryId {
+        self.panes
+            .active_transcript()
+            .iter()
+            .rev()
+            .find(|e| crate::ui::tool_call_id(&e.kind) == Some(call_id))
+            .map(Entry::id)
+            .unwrap_or_else(|| panic!("no tool call `{call_id}` in the active pane"))
     }
 
     /// Invalidate assembled transcript views after an expansion state change.
@@ -4260,50 +4270,46 @@ mod tests {
     #[test]
     fn pruning_main_does_not_clear_sub_agent_tool_expansion() {
         let (mut app, _key, _tmp) = app_viewing_a_sub_agent();
-        let id = "shared-tool-id".to_string();
-        app.scrollback = 1;
-        app.active_tool_groups_mut().insert(id.clone());
-        app.active_tool_open_mut().insert(id.clone());
-        app.panes
-            .main_mut()
-            .append_transcript(Entry::now(EntryKind::Tool {
-                id: id.clone(),
+        // The same provider call id on both panes — a backend numbering ids
+        // per request — still names two entries, each with its own state.
+        let call = || {
+            Entry::now(EntryKind::Tool {
+                id: "shared-tool-id".to_string(),
                 name: "shell".to_string(),
                 args: "{}".to_string(),
                 result: String::new(),
                 ok: true,
                 done: true,
-            }));
+            })
+        };
+        let sub = call().id();
+        app.scrollback = 1;
+        app.active_tool_groups_mut().insert(sub);
+        app.active_tool_open_mut().insert(sub);
+        app.panes.main_mut().append_transcript(call());
 
         app.prune_scrollback();
 
-        assert!(app.active_tool_group_is_open(&id));
-        assert!(app.active_tool_is_open(&id));
+        assert!(app.active_tool_group_is_open(sub));
+        assert!(app.active_tool_is_open(sub));
     }
 
     #[test]
     fn prune_and_clear_remove_evicted_tool_expansion_state() {
         let (mut app, _key, _tmp) = app_viewing_a_sub_agent();
-        let id = "evicted-tool".to_string();
         app.scrollback = 1;
-        app.panes
-            .main_mut()
-            .append_transcript(Entry::now(EntryKind::Tool {
-                id: id.clone(),
-                name: "shell".to_string(),
-                args: "{}".to_string(),
-                result: String::new(),
-                ok: true,
-                done: true,
-            }));
-        app.tool_groups
-            .entry(PaneId::MAIN)
-            .or_default()
-            .insert(id.clone());
-        app.tool_open
-            .entry(PaneId::MAIN)
-            .or_default()
-            .insert(id.clone());
+        let evicted = Entry::now(EntryKind::Tool {
+            id: "evicted-tool".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+            result: String::new(),
+            ok: true,
+            done: true,
+        });
+        let id = evicted.id();
+        app.panes.main_mut().append_transcript(evicted);
+        app.tool_groups.entry(PaneId::MAIN).or_default().insert(id);
+        app.tool_open.entry(PaneId::MAIN).or_default().insert(id);
         app.prune_scrollback();
         assert!(
             !app.tool_groups
@@ -4316,7 +4322,7 @@ mod tests {
                 .is_some_and(|open| open.contains(&id))
         );
 
-        app.active_tool_groups_mut().insert(id.clone());
+        app.active_tool_groups_mut().insert(id);
         app.active_tool_open_mut().insert(id);
         app.clear_transcript();
         assert!(app.tool_groups.is_empty());

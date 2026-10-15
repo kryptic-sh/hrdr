@@ -202,6 +202,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Expanding a tool group no longer expands later groups with local models.**
+  Expansion was remembered by the provider's tool-call id, and servers like
+  llama.cpp number those per request (`call_0`, `call_1`, …), so opening a group
+  in one turn opened the same-numbered group in every later turn. It is now
+  remembered per transcript entry (`crates/hrdr-tui`).
 - **Search output from a secret file is hidden even when the file's name looks
   like a line number.** The filter that keeps credential files out of `shell`
   search results read each line's path from its first `-NN-` run, so a secret

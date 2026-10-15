@@ -3313,8 +3313,7 @@ fn assemble_transcript(
             let head = i == 0 || !is_groupable_tool(&transcript[i - 1].kind);
             if head {
                 let end = tool_group_end(transcript, i);
-                let id = tool_call_id(&entry.kind).unwrap_or_default();
-                let expanded = app.verbose || app.active_tool_group_is_open(id);
+                let expanded = app.verbose || app.active_tool_group_is_open(entry.id());
                 let tool_bg = BlockKind::Tool.bg(theme);
                 // Absorbed empty-assistant turns still count as messages (for
                 // `/find` jumps to them), landing on the summary block.
@@ -4164,7 +4163,6 @@ fn tool_fits_preview(name: &str, args: &str, result: &str, unix_style_paths: boo
 fn tool_call_block(app: &App, member: &Entry, idx: usize, w: usize) -> PendingBlock {
     let theme = &app.theme;
     let EntryKind::Tool {
-        id,
         name,
         args,
         result,
@@ -4176,7 +4174,7 @@ fn tool_call_block(app: &App, member: &Entry, idx: usize, w: usize) -> PendingBl
         unreachable!("only tool members render as tool blocks");
     };
     let small = *done && tool_fits_preview(name, args, result, app.unix_style_paths());
-    let full = app.verbose || app.active_tool_is_open(id) || small;
+    let full = app.verbose || app.active_tool_is_open(member.id()) || small;
     let body_key = (
         member.content_hash,
         w as u16,
@@ -4779,6 +4777,43 @@ mod cache_tests {
             .collect()
     }
 
+    /// A backend that numbers tool-call ids per request (llama.cpp's `call_0`,
+    /// …) reuses them every turn. Expanding one turn's group opens that group,
+    /// not every later group that happens to reuse its id.
+    #[test]
+    fn expanding_a_group_does_not_open_a_later_group_reusing_its_call_id() {
+        clear_transcript_cache();
+        let (_tmp, mut app) = test_app();
+        app.transcript_mut().clear();
+        let call = |command: &str| {
+            Entry::now(EntryKind::Tool {
+                id: "call_0".into(),
+                name: "shell".into(),
+                args: serde_json::json!({ "command": command }).to_string(),
+                result: "done".into(),
+                ok: true,
+                done: true,
+            })
+        };
+        let first = call("echo FIRST_TURN");
+        let opened = first.id();
+        app.transcript_mut().push(first);
+        app.transcript_mut().push(Entry::user("next turn"));
+        app.transcript_mut().push(call("echo SECOND_TURN"));
+        app.active_tool_groups_mut().insert(opened);
+
+        let (chunks, _, _) = test_transcript_chunks!(&mut app, 80);
+        let screen = format!("{:?}", chunk_snapshot(chunks));
+        assert!(
+            screen.contains("FIRST_TURN"),
+            "the opened group shows its call: {screen}"
+        );
+        assert!(
+            !screen.contains("SECOND_TURN"),
+            "the later group stays folded: {screen}"
+        );
+    }
+
     #[test]
     fn interleaved_apps_do_not_share_transcript_assemblies() {
         clear_transcript_cache();
@@ -4913,7 +4948,8 @@ mod cache_tests {
         }
         app.transcript_mut().push(tool("first"));
         app.transcript_mut().push(Entry::assistant(""));
-        app.active_tool_groups_mut().insert("first".to_string());
+        let entry = app.active_tool_entry("first");
+        app.active_tool_groups_mut().insert(entry);
         let _ = test_transcript_chunks!(&mut app, 80);
 
         app.panes.main_mut().append_transcript(tool("second"));
@@ -5113,7 +5149,8 @@ mod cache_tests {
         let reasoning_id = app.transcript_mut()[1].id();
         let _ = test_transcript_chunks!(&mut app, 80);
 
-        app.active_tool_groups_mut().insert("tool-1".to_string());
+        let entry = app.active_tool_entry("tool-1");
+        app.active_tool_groups_mut().insert(entry);
         app.invalidate_transcript_view();
         reset_assembly_entry_visits();
         let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
@@ -5126,7 +5163,8 @@ mod cache_tests {
         let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(group_open, (chunk_snapshot(chunks), msg_at, panel_above));
 
-        app.active_tool_open_mut().insert("tool-1".to_string());
+        let entry = app.active_tool_entry("tool-1");
+        app.active_tool_open_mut().insert(entry);
         app.invalidate_transcript_view();
         reset_assembly_entry_visits();
         let (chunks, msg_at, panel_above) = test_transcript_chunks!(&mut app, 80);
@@ -5190,7 +5228,8 @@ mod cache_tests {
 
         let (_, collapsed_msg_at, _) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(collapsed_msg_at, vec![0]);
-        app.active_tool_groups_mut().insert("first".to_string());
+        let entry = app.active_tool_entry("first");
+        app.active_tool_groups_mut().insert(entry);
         app.invalidate_transcript_view();
         let (_, expanded_msg_at, _) = test_transcript_chunks!(&mut app, 80);
         assert_eq!(expanded_msg_at, vec![0]);
@@ -5498,7 +5537,8 @@ mod cache_tests {
         });
         app.transcript_mut().push(running.clone());
         if !standalone {
-            app.active_tool_groups_mut().insert("tool-1".into());
+            let entry = app.active_tool_entry("tool-1");
+            app.active_tool_groups_mut().insert(entry);
         }
 
         let render = |app: &mut App, frame: u64| {
@@ -5538,7 +5578,11 @@ mod cache_tests {
             "two spinner frames render static tool rows only on the cold frame"
         );
 
-        app.transcript_mut()[0] = append;
+        // Updated in place, as the transcript fold does: the entry — and the
+        // expansion keyed by it — is the same one, only its content changed.
+        let entry = &mut app.transcript_mut()[0];
+        entry.kind = append.kind;
+        entry.refresh_hash();
         let append_rows = render(&mut app, 0);
         assert_ne!(
             first_rows, append_rows,
@@ -5550,7 +5594,9 @@ mod cache_tests {
             "content append rebuilds static tool rows once"
         );
 
-        app.transcript_mut()[0] = settled;
+        let entry = &mut app.transcript_mut()[0];
+        entry.kind = settled.kind;
+        entry.refresh_hash();
         let settled_rows = render(&mut app, 3);
         let settled_tick_rows = render(&mut app, 6);
         assert!(settled_rows.contains('✓'));

@@ -1936,16 +1936,6 @@ own shell redirection, but the transcript contains model output).
 - `compaction.rs:908` — `context_after` is a ~4-bytes/token local estimate, not
   a provider reading; the post-compaction gauge drifts from the provider's real
   `prompt_tokens` (the estimator deliberately under-counts).
-- `tool_groups`/`tool_open` keyed by the provider-supplied tool-call id
-  (`turn_loop.rs:1078`): backends that number ids per request (llama.cpp-style
-  `call_0`, `call_1`) reuse ids across turns, so a group/call expanded in turn 1
-  makes turn 2's same-named group render expanded without a click. **Reachable,
-  re-checked 2026-10-15:** hrdr runs local models, and llama.cpp-style servers
-  number ids per request. Cosmetic only (expansion state, in memory, never
-  persisted). **Deferred as its own refactor, not a decision:** key both sets by
-  the entry's `EntryId` (as `thinking_open` already does) — the key is derived
-  in three places (`App` group toggles and `ui.rs`'s group render), but 18 e2e
-  test sites insert raw call ids into the sets and would move with it.
 
 **From the 2026-08-06 security audit.** One claim was demoted from a finding to
 hardening, with the trace that disproved the repro: the claim

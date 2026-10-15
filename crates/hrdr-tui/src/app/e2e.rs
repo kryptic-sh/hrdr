@@ -5100,7 +5100,8 @@ async fn collapsing_a_tool_group_keeps_its_summary_at_the_top_of_the_view() {
         h.app.push_entry(Entry::assistant(format!("filler {i}")));
     }
     // The group is expanded: the calls fan out and the transcript is tall.
-    h.app.active_tool_groups_mut().insert("c1".to_string());
+    let entry = h.app.active_tool_entry("c1");
+    h.app.active_tool_groups_mut().insert(entry);
 
     let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -5284,7 +5285,8 @@ async fn a_running_call_renders_only_its_summary_until_expanded() {
     );
 
     // Expanding reveals every call — the newest included — as a child item.
-    h.app.active_tool_groups_mut().insert("a".to_string());
+    let entry = h.app.active_tool_entry("a");
+    h.app.active_tool_groups_mut().insert(entry);
     let screen = h.render();
     assert!(
         screen.contains("✓ shell") && screen.contains("✓ read"),
@@ -5402,7 +5404,8 @@ async fn an_expanded_group_previews_calls_until_clicked() {
         ok: true,
         done: true,
     }));
-    h.app.active_tool_groups_mut().insert("a".to_string());
+    let entry = h.app.active_tool_entry("a");
+    h.app.active_tool_groups_mut().insert(entry);
 
     let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -5450,7 +5453,8 @@ async fn clicking_a_call_preview_expands_just_that_call() {
         ok: true,
         done: true,
     }));
-    h.app.active_tool_groups_mut().insert("a".to_string());
+    let entry = h.app.active_tool_entry("a");
+    h.app.active_tool_groups_mut().insert(entry);
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -5464,7 +5468,7 @@ async fn clicking_a_call_preview_expands_just_that_call() {
         "clicking the preview expands the full body:\n{screen}"
     );
     assert!(
-        h.app.active_tool_is_open("a"),
+        h.app.active_tool_is_open(h.app.active_tool_entry("a")),
         "the clicked call is marked open"
     );
     assert!(
@@ -5511,7 +5515,8 @@ async fn clicking_a_gap_between_previews_collapses_the_group() {
         ok: true,
         done: true,
     }));
-    h.app.active_tool_groups_mut().insert("a".to_string());
+    let entry = h.app.active_tool_entry("a");
+    h.app.active_tool_groups_mut().insert(entry);
 
     let mut term = Terminal::new(TestBackend::new(60, 30)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
@@ -5798,7 +5803,8 @@ async fn a_tool_summary_has_no_pad_above_and_one_blank_below() {
     );
 
     // Expanded: summary, one blank, then the first call's box.
-    h.app.active_tool_groups_mut().insert("a".to_string());
+    let entry = h.app.active_tool_entry("a");
+    h.app.active_tool_groups_mut().insert(entry);
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
     let buf = term.backend().buffer();
     let row_of = |needle: &str| -> u16 {
@@ -5967,7 +5973,8 @@ async fn an_expanded_group_growing_keeps_the_scrolled_up_viewport() {
     h.app.push_entry(Entry::assistant("PIN-MARKER"));
     h.app.push_entry(tool("a", "shell"));
     h.app.push_entry(tool("b", "read"));
-    h.app.active_tool_groups_mut().insert("a".to_string());
+    let entry = h.app.active_tool_entry("a");
+    h.app.active_tool_groups_mut().insert(entry);
     for i in 0..12 {
         h.app.push_entry(Entry::assistant(format!("filler {i}")));
     }
@@ -6468,7 +6475,8 @@ async fn toggle_tool_call_pins_the_group_summary_row_not_the_click_row() {
     h.app.push_entry(tool("a", long.clone()));
     h.app.push_entry(tool("b", long.clone()));
     // Expand the group so every call renders as its own block under the summary.
-    h.app.active_tool_groups_mut().insert("a".to_string());
+    let entry = h.app.active_tool_entry("a");
+    h.app.active_tool_groups_mut().insert(entry);
     let mut term = Terminal::new(TestBackend::new(60, 50)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
 
@@ -6662,7 +6670,8 @@ async fn a_trailing_tinted_block_ends_with_a_blank_row() {
     }));
     // The lone call collapses behind its summary; fan it out so its box — the
     // surface these background assertions check — renders.
-    h.app.active_tool_groups_mut().insert("c1".to_string());
+    let entry = h.app.active_tool_entry("c1");
+    h.app.active_tool_groups_mut().insert(entry);
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
     term.draw(|f| ui::draw(f, &mut h.app)).unwrap();
