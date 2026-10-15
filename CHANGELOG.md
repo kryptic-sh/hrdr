@@ -202,6 +202,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A read-only agent's `tools:` list can no longer grant it a write tool.** An
+  explicit allow-list replaced the read-only tool set outright, so a read-only
+  profile that named `memory` got it — and `memory` writes outside the sandbox's
+  roots by design. The allow-list now only narrows a read-only agent's tools
+  (`crates/hrdr-agent`).
 - **The `todo` tool accepts a task list sent as a JSON string.** Some models
   encode a structured argument as a string; `todo` rejected such a list as
   malformed and the model had to retry. It now reads the list inside

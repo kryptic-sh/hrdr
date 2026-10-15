@@ -262,7 +262,22 @@ impl Agent {
         // Scope the tool set for a restricted sub-agent: an explicit allow-list
         // wins; else, for a read-only agent, the plain read-only set.
         if let Some(allow) = &config.allowed_tools {
-            tools.retain_only(allow);
+            // A read-only agent's allow-list can only narrow its read-only set,
+            // never add a write tool to it: `memory` writes outside every
+            // sandbox root by design, so naming it on a read-only profile would
+            // have been a write the "read-only" promise does not allow.
+            let allow: Vec<String> = if config.read_only {
+                let mut permitted = tools.read_only_names();
+                permitted.extend(shell_tool_names(&tools));
+                allow
+                    .iter()
+                    .filter(|name| permitted.contains(name))
+                    .cloned()
+                    .collect()
+            } else {
+                allow.clone()
+            };
+            tools.retain_only(&allow);
         } else if config.read_only {
             let mut keep = tools.read_only_names();
             // …plus a SHELL. A read-only agent is confined by

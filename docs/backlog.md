@@ -1959,14 +1959,11 @@ session's `read` request to `Write` (`config.rs:1797`, test-pinned at
 tool; `Tool::read_only` defaults false, `lib.rs:1289`, and `MemoryTool` never
 overrides it). Residual, recorded as hardening below.
 
-- **The `memory` tool writes outside the sandbox roots in every mode**
-  (`memory.rs:253, 292, 305`; the out-of-roots write is by design,
-  `lib.rs:1542-1543`, and Read mode is unreachable for a memory-holding agent
-  per the trace above). The residual is a profile whose explicit `tools:`
-  allow-list names `memory` on a read-only agent — that agent would hold the
-  tool and its writes would bypass the "write NOWHERE" boundary. If the promise
-  must hold absolutely, route memory mutations through `resolve_write` or drop
-  the tool from read-only sessions.
+- **The `memory` tool writes outside the sandbox roots in every mode**, by
+  design. The one path to it on a read-only agent — an explicit `tools:`
+  allow-list naming it — is closed (2026-10-15): a read-only agent's allow-list
+  can only narrow its read-only set (`Agent::new`; test
+  `a_read_only_allow_list_cannot_add_a_write_tool`).
 - The OpenRouter callback server reflects the attacker's own (escaped) state
   string (`oauth.rs:259`); the comment at `:255-257` should be preserved — a
   future "echo the expected value" change would leak the CSRF token.

@@ -2425,6 +2425,40 @@ mod tests {
         assert_eq!(widened, vec!["read".to_string()], "narrowing still applies");
     }
 
+    /// A read-only agent's `tools:` allow-list narrows its read-only set and
+    /// cannot add a write tool back. `memory` above all: it writes outside every
+    /// sandbox root by design, so the sandbox would not stop it.
+    #[test]
+    fn a_read_only_allow_list_cannot_add_a_write_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            read_only: true,
+            memory: true,
+            allowed_tools: Some(vec![
+                "read".to_string(),
+                "memory".to_string(),
+                "write".to_string(),
+            ]),
+            ..Default::default()
+        })
+        .unwrap();
+        let names: Vec<String> = agent.tools().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["read".to_string()], "{names:?}");
+
+        // A write-capable agent's allow-list is untouched.
+        let writer = Agent::new(AgentConfig {
+            cwd: dir.path().to_path_buf(),
+            memory: true,
+            allowed_tools: Some(vec!["read".to_string(), "memory".to_string()]),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut names: Vec<String> = writer.tools().into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        assert_eq!(names, vec!["memory".to_string(), "read".to_string()]);
+    }
+
     /// The delegation guidance reaches an agent that can actually delegate.
     ///
     /// `task` and `models` are registered by `Agent::new`, so this is the only
