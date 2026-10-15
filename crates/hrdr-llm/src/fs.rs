@@ -95,10 +95,12 @@ fn harden_owner_only(opts: &mut std::fs::OpenOptions) {
 #[cfg(not(unix))]
 fn harden_owner_only(_opts: &mut std::fs::OpenOptions) {}
 
-/// [`owner_only_options`] plus, on unix, `O_NOFOLLOW`: if the final path
-/// component is a symlink at open time the open fails with `ELOOP` instead of
-/// following it, so the open *is* the symlink check and no attacker can swap a
-/// link in between a caller's preflight `symlink_metadata` and this open.
+/// [`owner_only_options`] that never follows a final-component symlink, so no
+/// attacker can swap a link in between a caller's preflight `symlink_metadata`
+/// and this open. On unix that is `O_NOFOLLOW`: the open fails with `ELOOP`. On
+/// Windows it is `FILE_FLAG_OPEN_REPARSE_POINT`: the open lands on the link
+/// itself, never its target — so it may succeed, and a caller that must refuse
+/// a link checks the opened handle's file type (it is not a regular file).
 ///
 /// A separate constructor rather than a flag on [`owner_only_options`]: refusing
 /// to follow a link is a different guarantee from keeping the bytes private,
@@ -106,10 +108,8 @@ fn harden_owner_only(_opts: &mut std::fs::OpenOptions) {}
 /// can be aimed at an attacker-controlled directory), and a bare `true` at the
 /// call site would say nothing about which of the two it turns on.
 ///
-/// Residual, on unix: `O_NOFOLLOW` covers only the final component — a symlinked
-/// *parent directory* is still traversed. On Windows this is exactly
-/// [`owner_only_options`]; there is no `O_NOFOLLOW` equivalent applied, so a
-/// caller that relies on it must keep its own preflight check.
+/// Residual, on both: only the final component is covered — a symlinked
+/// *parent directory* is still traversed.
 pub fn owner_only_options_no_follow() -> std::fs::OpenOptions {
     let mut opts = owner_only_options();
     refuse_symlinks(&mut opts);
@@ -124,9 +124,19 @@ fn refuse_symlinks(opts: &mut std::fs::OpenOptions) {
     opts.custom_flags(libc::O_NOFOLLOW);
 }
 
-/// The non-unix half of [`owner_only_options_no_follow`]: no `O_NOFOLLOW`
-/// equivalent, so nothing is set and callers keep their own preflight check.
-#[cfg(not(unix))]
+/// The Windows half of [`owner_only_options_no_follow`]: open a reparse point
+/// (a symlink or junction) itself rather than what it points at.
+#[cfg(windows)]
+fn refuse_symlinks(opts: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `FILE_FLAG_OPEN_REPARSE_POINT` (winbase.h), a fixed Win32 ABI value.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+/// Elsewhere hrdr does not build; nothing is set, and a caller relying on the
+/// guarantee must keep its own preflight check.
+#[cfg(not(any(unix, windows)))]
 fn refuse_symlinks(_opts: &mut std::fs::OpenOptions) {}
 
 /// Write `data` to `path` atomically: write to a temp file in the same
@@ -326,6 +336,33 @@ mod tests {
             .unwrap();
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "mode={mode:#o}");
+    }
+
+    /// The guarantee on every platform: a no-follow open of a DANGLING link
+    /// never reaches its target. A followed open with `create(true)` would
+    /// create the target; unix refuses the open (`O_NOFOLLOW`), Windows opens
+    /// the link itself (`FILE_FLAG_OPEN_REPARSE_POINT`), which is not a regular
+    /// file. Skips on a Windows machine that may not create symlinks (never on
+    /// CI).
+    #[test]
+    fn owner_only_options_no_follow_never_reaches_a_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("does-not-exist.log");
+        let link = dir.path().join("link.log");
+        if !hrdr_test_support::symlink_or_skip(&target, &link) {
+            return;
+        }
+        let opened = owner_only_options_no_follow()
+            .append(true)
+            .create(true)
+            .open(&link);
+        if let Ok(file) = opened {
+            assert!(
+                !file.metadata().unwrap().file_type().is_file(),
+                "an open that succeeds must be on the link, not a file"
+            );
+        }
+        assert!(!target.exists(), "the link's target was never created");
     }
 
     #[test]

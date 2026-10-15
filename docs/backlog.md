@@ -1626,11 +1626,12 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   labels), added to `hrdr-llm`; the cost is the code to build the DACL and its
   tests. Leaving it means a credential file is protected only by the profile
   directory's inherited ACL, which on a standard install is already per-user.
-- **`O_NOFOLLOW` covers only the final path component.** A symlinked _parent_
-  directory is still traversed on the wire-log open, and there is no Windows
-  equivalent at all, so callers relying on it keep their own preflight check.
-  Recorded on `owner_only_options_no_follow`; closing it properly means
-  resolving the whole path under a directory handle.
+- **The no-follow open covers only the final path component.** A symlinked
+  _parent_ directory is still traversed on the wire-log open, on unix
+  (`O_NOFOLLOW`) and Windows (`FILE_FLAG_OPEN_REPARSE_POINT`, since 2026-10-16)
+  alike. Recorded on `owner_only_options_no_follow`; closing it properly means
+  resolving the whole path under a directory handle (`openat` on unix,
+  `NtCreateFile` relative to a directory handle on Windows).
 - **`CommandHost`'s text-fallback defaults are now test-only.** **[Deferred —
   question for the owner; see the index at the top]** Found in the 2026-08-02
   web-removal sweep, not fixed — the parent's call, and the Standing-constraints

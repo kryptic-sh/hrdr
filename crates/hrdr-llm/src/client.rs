@@ -129,16 +129,17 @@ fn open_wire_log(path: &Path) -> Option<std::fs::File> {
     let mut opts = crate::fs::owner_only_options_no_follow();
     opts.create(true).append(true);
     let file = opts.open(path).ok()?;
+    // Post-open descriptor check: confirm the opened handle refers to a regular
+    // file. On Windows this is what refuses a final-component link — the
+    // no-follow open lands on the link itself, which is not a regular file. On
+    // unix O_NOFOLLOW already rejected it, so this guards non-regular targets
+    // reachable without a final symlink (a pre-existing FIFO or device node).
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // Post-open descriptor check: confirm the opened handle refers to a
-        // regular file.  O_NOFOLLOW already rejects a final-component symlink,
-        // so this now mainly guards non-regular targets reachable without a
-        // final symlink (e.g. a pre-existing FIFO or device node).
-        if !file.metadata().ok()?.file_type().is_file() {
-            return None;
-        }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .ok()?;
     }

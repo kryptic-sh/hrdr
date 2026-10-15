@@ -222,6 +222,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The request wire log no longer follows a symlink on Windows.** Its open
+  refused a symlink at the log's path only on unix (`O_NOFOLLOW`); on Windows a
+  link swapped in after the preflight check was followed, so the log could be
+  appended to the link's target. The open now uses
+  `FILE_FLAG_OPEN_REPARSE_POINT`, and the opened handle must be a regular file
+  on every platform (`crates/hrdr-llm`).
 - **The path guard now follows a dangling symlink in the middle of a path.**
   `canonicalize_nearest` resolved a symlink whose target does not exist only
   when it was the path's last component, so `link/file` under a dangling `link`
