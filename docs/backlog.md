@@ -2729,9 +2729,17 @@ and **not** fixed.
   `#[tokio::test]` runtime; nothing in `hrdr-app` sets env vars, and
   `with_test_env` moves only `XDG_DATA_HOME`. `hrdr-agent` writes `config.toml`
   only through `persist_setting`/`remove_setting`, so agent construction
-  (`TestHost::new`) is out too. Still unexplained. The test now reports the
-  file's contents when the save unexpectedly succeeds, so the next failure shows
-  what rewrote it.
+  (`TestHost::new`) is out too. Also ruled out by reading, 2026-10-16: another
+  test binary (the test-support ctor's sandbox root is per pid, and `cargo test`
+  runs binaries one at a time); the config root moving mid-test
+  (`hjkl_xdg::config_dir` reads `XDG_CONFIG_HOME`, which only the ctor sets —
+  `with_test_env` moves `XDG_DATA_HOME`, and no runtime code sets either);
+  `persist_setting` resolving a different path (it calls `config_file_path` like
+  the test); the login hosts (`RouteTestHost::persist_setting` is a no-op, and
+  the direct write in `browser_login_completion_line` needs
+  `token_saved: true`). Still unexplained. The test now reports the file's
+  contents when the save unexpectedly succeeds, so the next failure shows what
+  rewrote it.
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
