@@ -83,7 +83,6 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             let agent = host.agent();
             let model = host.model();
             let base_url = host.base_url();
-            let cwd = host.cwd();
             let unix_style_paths = host.unix_style_paths();
             let session = match (host.session_id(), host.session_label()) {
                 (Some(id), Some(name)) => format!("{id}  (name: {name})"),
@@ -120,9 +119,17 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
                 })
                 .unwrap_or_default();
             host.spawn_popup(Box::pin(async move {
-                let (temp, messages, cache) = {
+                // The viewed agent's own directory, read with its counts: a
+                // sub-agent's pane must not show the session's cwd beside the
+                // sub-agent's message count.
+                let (temp, messages, cache, cwd) = {
                     let a = agent.lock().await;
-                    (a.temperature(), a.message_count(), a.prompt_cache_active())
+                    (
+                        a.temperature(),
+                        a.message_count(),
+                        a.prompt_cache_active(),
+                        a.cwd(),
+                    )
                 };
                 let dir = hrdr_agent::display_dir_with_style(&cwd, unix_style_paths);
                 let branch = crate::git_branch(&cwd).unwrap_or_else(|| "—".to_string());
@@ -257,13 +264,30 @@ pub fn dispatch(host: &mut dyn CommandHost, input: &str) -> bool {
             }
         }
         "cwd" => {
-            let cur = host.cwd();
+            // Commands act on the agent on screen, so a bare `/cwd` on a
+            // sub-agent's pane reports that agent's directory. Moving one is the
+            // session's move — its chrome, file index and instructions follow the
+            // main agent — so it is refused there rather than half-applied.
+            let viewing_sub_agent = host.viewing_sub_agent();
+            let cur = if viewing_sub_agent {
+                crate::agent_cwd(&host.agent())
+            } else {
+                host.cwd()
+            };
             let unix_style_paths = host.unix_style_paths();
             if arg.is_empty() {
                 host.info(format!(
                     "cwd: {}",
                     hrdr_tools::display_path(&cur, unix_style_paths)
                 ));
+                return true;
+            }
+            if viewing_sub_agent {
+                host.info(
+                    "/cwd moves the session's working directory — switch to the main pane to \
+                     move it. A sub-agent's directory is set by the task that started it."
+                        .to_string(),
+                );
                 return true;
             }
             if host.is_busy() {
@@ -715,6 +739,8 @@ mod tests {
         cache: Option<(f64, usize, usize)>,
         /// What `/paste` reads back, when a test sets it.
         clipboard: Option<String>,
+        /// Whether the agent on screen is a sub-agent (`viewing_sub_agent`).
+        sub_agent: Option<Arc<Mutex<Agent>>>,
         resumed: Option<(String, Session)>,
     }
 
@@ -745,6 +771,7 @@ mod tests {
                 cache: None,
                 clipboard: None,
                 resumed: None,
+                sub_agent: None,
             }
         }
     }
@@ -760,10 +787,14 @@ mod tests {
             self.cache
         }
         fn agent(&self) -> Arc<Mutex<Agent>> {
-            self.agent.clone()
+            // The agent on screen, as the TUI's host returns it.
+            self.sub_agent.clone().unwrap_or_else(|| self.agent.clone())
         }
         fn cwd(&self) -> std::path::PathBuf {
             self.cwd.clone()
+        }
+        fn viewing_sub_agent(&self) -> bool {
+            self.sub_agent.is_some()
         }
         fn unix_style_paths(&self) -> bool {
             self.unix_style_paths
@@ -1379,6 +1410,55 @@ mod tests {
     /// deleted, or a `return false` that slipped into a handler; a name added
     /// to `SLASH_COMMANDS` without an arm fails this test until it gets one.
     /// `tokio` because several arms post their output through spawned tasks.
+    /// On a sub-agent's pane `/cwd` names that agent's directory, and moving
+    /// is refused rather than moving the sub-agent while the session's chrome,
+    /// file index and instructions follow the main agent.
+    #[tokio::test]
+    async fn cwd_on_a_sub_agent_pane_reports_it_and_refuses_to_move() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let sub_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mut host = TestHost::new(main_dir.path().to_path_buf());
+        let sub = Agent::new(AgentConfig {
+            cwd: sub_dir.path().to_path_buf(),
+            model: "local://test-model".parse().unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+        let sub = Arc::new(Mutex::new(sub));
+        host.sub_agent = Some(Arc::clone(&sub));
+
+        assert!(dispatch(&mut host, "/cwd"));
+        let reported = host.info_log.last().unwrap().clone();
+        assert!(
+            reported.contains(&hrdr_tools::display_path(sub_dir.path(), true)),
+            "{reported}"
+        );
+
+        assert!(dispatch(
+            &mut host,
+            &format!("/cwd {}", elsewhere.path().display())
+        ));
+        assert!(
+            host.info_log
+                .last()
+                .unwrap()
+                .contains("switch to the main pane"),
+            "{:?}",
+            host.info_log
+        );
+        assert_eq!(sub.lock().await.cwd(), sub_dir.path());
+
+        // `/status` reports the same agent's directory beside its counts.
+        assert!(dispatch(&mut host, "/status"));
+        settle(|| !host.async_log.lock().unwrap().is_empty()).await;
+        let status = host.async_log.lock().unwrap().join("\n");
+        assert!(
+            status.contains(&hrdr_agent::display_dir_with_style(sub_dir.path(), true)),
+            "{status}"
+        );
+    }
+
     #[tokio::test]
     async fn every_registered_command_is_recognized_by_dispatch() {
         let _guard = CONFIG_LOCK.lock().await;

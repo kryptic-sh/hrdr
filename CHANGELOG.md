@@ -208,6 +208,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`/cwd` and `/status` on a sub-agent's pane describe that sub-agent.** Both
+  showed the session's directory while the rest of `/status` described the
+  sub-agent, and `/cwd <path>` moved only the sub-agent while the status bar,
+  file index and instructions acted as if the session had moved. A bare `/cwd`
+  and `/status` now report the viewed agent's directory, and moving is refused
+  on a sub-agent's pane (`crates/hrdr-app`, `crates/hrdr-tui`).
 - **A running session no longer drops out of `sessions` on one failed connect.**
   Discovery retried a probe that errored but not one whose connection was
   refused or reset, which it reports as unavailable, so a live session that

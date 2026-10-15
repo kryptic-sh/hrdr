@@ -42,8 +42,6 @@ only the list. Delete a line when its question is answered.
   _Windows support review → `sandbox_denial_note`._
 - **Owner-only DACL on Windows credential/session files.** _Consistency /
   robustness → "hrdr sets no Windows ACL"._
-- **`/cwd` on a sub-agent pane** — move that agent only, or refuse (recommended:
-  refuse). _dispatch.rs review 2026-08-02._
 - **`/trust revoke`** and whether it downgrades the running session. _Tooling /
   agent capability._
 - **Windows `write`-mode OS confinement** (Low-integrity relabelling of writable
@@ -1790,25 +1788,11 @@ session-wide while the compaction is now per-pane:
 its sibling modules, the `CommandHost` trait and its call site. The finding
 below is traced from source — nothing was reproduced at runtime.
 
-**`/cwd` writes one agent and reads another.** **[Deferred — question for the
-owner; see the index at the top]** `dispatch.rs` resolves the argument against
-`host.cwd()` and writes `host.agent()`, and those are different agents (`cwd()`
-is main-derived, `agent()` is the active pane). On a sub-agent pane, a relative
-`/cwd` resolves against main's cwd, moves only the sub-agent, then repoints the
-global chrome as if main had moved. A bare `/cwd` afterwards contradicts the
-status bar. `/status` has the same split — main's cwd beside the active agent's
-message count. Needs a call: derive the base from `host.agent()`, or add
-`active_cwd()` so both halves name one agent. **Re-checked 2026-10-15, still
-true:** `TuiHost::agent` is `active_agent()` ("commands act on the agent you are
-looking at") while `TuiHost::cwd` is `agent_cwd(&self.app.agent)`, and
-`cwd_changed` → `App::apply_cwd_view` repoints session-wide state (status-bar
-dir, git branch, file index and watcher, `rediscover`). **Question for the
-owner**, options: (a) `/cwd` on a sub-agent pane reports and moves that
-sub-agent only, leaving session chrome alone (needs `active_cwd()` and a
-`cwd_changed` that knows which agent moved); (b) bare `/cwd` reports the viewed
-agent's directory, but moving one is refused on a sub-agent pane ("`/cwd` moves
-the session — switch to the main pane"). Recommended: (b) — small, and a
-sub-agent's directory is fixed by the `task` that started it.
+**`/cwd` and `/status` on a sub-agent pane — resolved 2026-10-15 by the owner's
+call.** Both read the viewed agent's directory now; `/cwd <path>` is refused
+there ("switch to the main pane"), since moving is the session's move
+(`CommandHost::viewing_sub_agent`; test
+`cwd_on_a_sub_agent_pane_reports_it_and_refuses_to_move`).
 
 **Checked and fine, so nobody re-derives it:** the `bool` contract is sound —
 every in-arm return is `true`, only the unknown arm and the non-`/` guard return

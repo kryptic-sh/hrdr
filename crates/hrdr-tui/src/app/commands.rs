@@ -310,6 +310,9 @@ impl hrdr_app::CommandHost for TuiHost<'_> {
     fn cwd(&self) -> std::path::PathBuf {
         hrdr_app::agent_cwd(&self.app.agent)
     }
+    fn viewing_sub_agent(&self) -> bool {
+        self.app.panes.active() != hrdr_app::PaneId::MAIN
+    }
     fn unix_style_paths(&self) -> bool {
         self.app.unix_style_paths()
     }

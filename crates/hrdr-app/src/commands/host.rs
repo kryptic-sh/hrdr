@@ -57,6 +57,12 @@ pub trait CommandHost {
 
     /// Working directory the tools operate in.
     fn cwd(&self) -> PathBuf;
+    /// Whether the agent on screen — the one [`Self::agent`] returns — is a
+    /// sub-agent rather than the session's own. `/cwd` reads the viewed agent's
+    /// directory but moves only the session's, so it needs to know which it has.
+    fn viewing_sub_agent(&self) -> bool {
+        false
+    }
 
     /// Path-label style currently used by the frontend's chrome.
     fn unix_style_paths(&self) -> bool;
