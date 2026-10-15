@@ -2599,15 +2599,20 @@ and **not** fixed.
   and on lookup fall back to the legacy slug, moving the folder when found? Or
   keep today's keys and accept both risks? The fallback costs one extra
   directory probe per session lookup and a rename on first use.
-- **`sandbox_denial_note` only recognises EROFS wording — needs evidence.** A
-  Low-integrity write refusal on Windows reads "Access is denied", so Windows
-  `read` mode never gets the explanatory note. Not changed: the note claims the
-  failure IS the sandbox, and an existing test
-  (`sandbox_denial_note(..., "Permission denied")` is `None`) guards against
-  false positives — on Windows an ordinary ACL refusal prints the same words.
-  Before extending it, capture what a confined write actually prints under the
-  Windows sandbox and find a marker the ordinary error lacks; if there is none,
-  the note would have to hedge ("may be the sandbox").
+- **`sandbox_denial_note` only recognises EROFS wording — question for the
+  owner.** A Low-integrity write refusal on Windows gives no marker of its own;
+  evidence captured 2026-10-15 on Windows 11 with a Low-labelled `cmd.exe`
+  (`whoami /groups` confirmed `Low Mandatory Level`): `cmd` prints
+  `Access is denied.` and PowerShell prints
+  `Access to the path '<path>' is denied.` — word for word what an ordinary ACL
+  `deny` on the same user prints. So the note, which says the failure IS the
+  sandbox, cannot fire on Windows without false positives (an existing test
+  guards that: `"Permission denied"` yields `None`). Options: (a) leave Windows
+  without the note; (b) a hedged note on Windows `read`/`write` mode only —
+  "this may be hrdr's sandbox (it confines writes to …)" — whenever a command
+  output contains an access-denied message, accepting that it also fires on
+  plain ACL refusals. Recommended: (b), worded as a possibility, since an agent
+  told nothing tends to report the tool as broken.
 - **Path presentation verification follow-up.** Config-diagnostic regressions
   passed Linux/macOS CI in `37912493951`; the bounded consumer audit found no
   further active gaps, not exhaustive proof. Startup diagnostics recover a typed
