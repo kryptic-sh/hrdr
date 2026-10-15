@@ -394,6 +394,34 @@ const TUI_EVENT_CAP: usize = 1024;
 /// during a stall, applying real (async) backpressure at the turn boundary. A
 /// closed receiver (the app shutting down) turns every send into a no-op error
 /// rather than a block, so a producer awaiting capacity can never deadlock.
+/// The on-disk position of the session's round journal: the `.json` holds the
+/// first `base` messages (anchored by `base_anchor`), and the journal carries
+/// them up to `written` (anchored by `written_anchor`). A mid-turn save whose
+/// history extends exactly `written` appends only the new tail.
+#[derive(Clone)]
+pub(crate) struct RoundCursor {
+    id: String,
+    base: usize,
+    base_anchor: String,
+    written: usize,
+    written_anchor: String,
+}
+
+impl RoundCursor {
+    /// The cursor once a full save has written `messages` for session `id`: the
+    /// `.json` holds them all and no journal is open yet.
+    pub(crate) fn after_full_save(id: &str, messages: &[hrdr_agent::Message]) -> Self {
+        let anchor = hrdr_agent::journal_anchor(messages);
+        Self {
+            id: id.to_string(),
+            base: messages.len(),
+            base_anchor: anchor.clone(),
+            written: messages.len(),
+            written_anchor: anchor,
+        }
+    }
+}
+
 struct EventSender {
     tx: mpsc::Sender<TurnMsg>,
     backlog: std::collections::VecDeque<TurnMsg>,
@@ -529,6 +557,13 @@ pub(crate) struct App {
     /// enqueue time, so a `/rename` or `/clear` after that point cannot
     /// interleave with a stale write. `Some` implies [`Self::save_in_flight`].
     pending_save: Option<hrdr_app::SessionState>,
+    /// Whether any save folded into `pending_save` needed the full `.json`
+    /// rather than a round-journal append (see [`RoundCursor`]).
+    pending_full: bool,
+    /// What the session's files on disk hold, for deciding whether a mid-turn
+    /// save can append the round to the journal instead of rewriting the
+    /// `.json`. `None` → the next save is a full one.
+    round_cursor: Option<RoundCursor>,
     /// Whether a session-save task is currently writing (serialize + atomic
     /// fs write, both off the UI thread).
     save_in_flight: bool,
@@ -1037,6 +1072,8 @@ impl App {
             session_notice_pending: false,
             session_save_error: None,
             pending_save: None,
+            pending_full: false,
+            round_cursor: None,
             save_in_flight: false,
             save_done: Arc::new(tokio::sync::Notify::new()),
             handoff_gate: recovery.is_some(),

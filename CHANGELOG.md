@@ -169,6 +169,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A tool round no longer rewrites the whole session file.** Each round's new
+  messages are appended to a sibling `<id>.rounds` journal, and the full `.json`
+  is rewritten only at turn end, so a long session no longer writes its entire
+  history to disk on every tool call. Loading a session replays the journal onto
+  the `.json` it extends, and ignores a stale journal left by a crash. A crash
+  mid-turn still keeps every finished round's messages, but may lose that turn's
+  todo, goal and cron changes (`crates/hrdr-agent`, `crates/hrdr-tui`).
 - **Background sub-agents save their snapshot once, when the run ends.** Each
   tool round of every background sub-agent used to deep-copy its whole history
   and rewrite `<stem>.json` with two fsyncs, for a file nothing loads; the cost

@@ -30,11 +30,6 @@ Everything below that waits on an owner decision rather than on work. Each line
 names the entry holding the options; the entry is the source of truth, this is
 only the list. Delete a line when its question is answered.
 
-- **Main-session save per tool round** — journal each round's messages and
-  rewrite the full `.json` only at turn end (O(n) instead of O(n²) bytes), at
-  the cost of "at most one round lost" becoming "at most one turn lost" unless
-  the journal records messages. _Performance review — second pass 2026-08-04
-  #1._
 - **CRLF through `replace` and `write`** — preserve a file's dominant line
   ending or write what was given. _Windows support review 2026-09-15._
 - **`cwd_slug` hash and migration.** _Windows support review 2026-09-15._
@@ -532,25 +527,6 @@ from the run was dropped (item 4).
 **Status: item 1 open (needs a decision); items 2-4 dropped — not fixable as
 proposed, or disproved at review time.** Each item carries its own tag below.
 
-1. **Per-round full-history save with two fsyncs — still the dominant cost of a
-   **[Deferred — question for the owner; see the index at the top]** long
-   session.** **[needs direction — pick the crash-durability tradeoff]**
-   `turn_loop.rs:785` clones the whole `messages` on every tool round and emits
-   `AgentEvent::History`; the frontend clones again (`hrdr-tui/src/app.rs:2748`)
-   into `persist_mid_turn`, which clones the whole `SessionState`
-   (`app/session.rs:302`), `Session::new(snapshot.persisted())` (`:325`) clones
-   once more (`session.rs:341`), `Session::save` clones again and re-serializes
-   everything (`session.rs:778`/`:785`), and `write_atomic` does two fsyncs
-   (`auth.rs:116`, dir fsync `:135-138`) — per round, on the save task. O(N) per
-   round over a history that grows every round → O(N²) bytes written per
-   session. The transcript already got the append-only jsonl fix
-   (`session.rs:115-123` names the O(n²) it removed); `messages` has the same
-   problem remaining. Sub-agents pay the same synchronously on their turn task
-   (`delegation.rs:374-379` → `RunSnapshot::save` `:149-166`). Fix: write the
-   round's appended messages to the append-only jsonl and keep full `.json`
-   serialization for turn end; move (don't clone) the messages into the save
-   path. Tradeoff: mid-turn crash durability drops from "at most one round lost"
-   to "at most one turn lost" unless the jsonl also records messages.
 2. **~3-4 heap allocations per streamed token.** **[dropped — infeasible: the
    event must survive to the frontend's `on_event` (`registry.rs:880-883`), so
    `record` cannot give ownership to `from_event`; a borrowed-`Record` variant
@@ -2959,8 +2935,11 @@ offsets, and the attachment digest memo. 2 open (deferred, reasons inline).**
 1. **The whole message history is deep-cloned per committed round.** The
    sub-agent half shipped 2026-10-15: a background run no longer snapshots per
    round, so its clone went with the write. What remains is the main session's
-   own copies — the TUI's `app.rs` History handler and `app/session.rs` — which
-   belong to the main-session save change (see the index).
+   own copies — the TUI's `app.rs` History handler clones the history into
+   `persist_mid_turn`, and `enqueue_save` clones the state per save. The writes
+   they feed are now a round-journal append (2026-10-15), so the bytes written
+   per round are O(round); the in-memory copies are still O(history). Left: pass
+   the `Arc` through instead of cloning.
 2. **The memory mtime-cache hit `cloned()`s the whole memory**
    (`hrdr-tools/src/memory.rs`) before the mtime filter, once per opening user
    message. The other half of this item — lowercasing every body per recall
@@ -3348,20 +3327,11 @@ hrdr-test-support + apps full incl. all test binaries.
 `:perf` over the whole tree (clean), split across four sub-agents; findings
 re-verified at cited lines (top items by the sweep lead). Two prior backlog
 items re-found (see cross-list). **Status 2026-10-15: 1 shipped and removed (the
-owner chose to write the sub-agent snapshot once, at run end); 2 open (the
-main-session save, owner-decided); 3 declined; 4 merged; the running-tool
-re-render finding shipped (`ChunkRows::AnimatedChrome`) and is removed.**
+owner chose to write the sub-agent snapshot once, at run end); 2 shipped and
+removed (the round journal, owner-decided); 3 declined; 4 merged; the
+running-tool re-render finding shipped (`ChunkRows::AnimatedChrome`) and is
+removed.**
 
-2. **HIGH — main-agent session `.json` is a full rewrite of every message every
-   tool round.** `Session::save` (comment there confirms: "rewritten on every
-   tool round") — `attachment_refs` full scan + whole-body serialize +
-   `write_atomic` 2 fsyncs per round, per `History`. The TUI coalesces saves
-   (good), but each landed save is still O(history) → O(n²) over the session.
-   Fix: delta-journal the round's new messages (the `<id>.jsonl` already exists)
-   and coalesce a full rewrite on turn end / occasionally; recovery folds
-   snapshot+journal like the transcript fold. This is backlog item
-   `## Performance review — second pass 2026-08-04` #1 (still open, needing the
-   crash-durability decision) re-found with specifics — **cross-listed**.
 3. **Streaming markdown re-rendered in full per frame — declined 2026-10-15,
    measured.** The body key is the `content_hash`, which changes per delta, so a
    streaming reply re-runs `markdown_lines` once per frame (paced by
@@ -3729,11 +3699,6 @@ perf pass itself.
 
 Ranked by impact, biggest first:
 
-2. **HIGH (re-confirmed, 08-30 #2) — main-session `.json` fully rewritten every
-   tool round.** Design stated at `session.rs:512` ("a session file is rewritten
-   on every tool round"); save still whole-body `write_atomic`
-   (`session.rs:880`). TUI coalesces; each landed save is still O(history). Open
-   — the delta-journal fix from 08-30 stands.
 3. **Unchanged frames still materialize every assembled block** — merged into
    `## Frame cost measured 2026-08-13` #1.
 4. **08-30 #12/#13/#16/#17 (LOW), settled 2026-10-14.** #12 (`replace`'s literal

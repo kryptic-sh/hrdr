@@ -2815,6 +2815,65 @@ async fn history_snapshot_persists_the_session_mid_turn() {
     );
 }
 
+/// A tool round that only adds messages appends them to the round journal and
+/// leaves the session `.json` untouched; a load still sees every message. A
+/// history the round did not simply extend — a compaction rewrote it — gets a
+/// full save, which folds the journal in and removes it.
+#[tokio::test]
+async fn a_growing_history_journals_rounds_and_a_rewrite_saves_whole() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    let round = |messages: Vec<hrdr_agent::Message>| {
+        hrdr_agent::AgentEvent::History(std::sync::Arc::new(messages))
+    };
+    let first = vec![
+        hrdr_agent::Message::user("do the thing"),
+        hrdr_agent::Message::assistant("on it"),
+    ];
+    h.inject(round(first.clone()));
+    h.save_drain().await;
+    let id = h
+        .app
+        .state()
+        .id
+        .clone()
+        .expect("the first round minted an id");
+    let cwd = h.app.current_cwd();
+    let json = hrdr_app::session_file_path(&cwd, &id);
+    let journal = json.with_file_name(format!("{id}.rounds"));
+    let written = std::fs::read(&json).unwrap();
+    assert!(!journal.exists(), "the first round is a full save");
+
+    let mut grown = first.clone();
+    grown.push(hrdr_agent::Message::assistant("step two"));
+    grown.push(hrdr_agent::Message::assistant("step three"));
+    h.inject(round(grown.clone()));
+    h.save_drain().await;
+    assert_eq!(
+        std::fs::read(&json).unwrap(),
+        written,
+        "the .json was not rewritten"
+    );
+    assert!(journal.exists(), "the round went to the journal");
+    let loaded = hrdr_app::Session::load(&cwd, &id, true).unwrap();
+    assert_eq!(loaded.state.messages.len(), grown.len());
+
+    let compacted = vec![
+        hrdr_agent::Message::user("summary of what came before"),
+        hrdr_agent::Message::assistant("carrying on"),
+    ];
+    h.inject(round(compacted.clone()));
+    h.save_drain().await;
+    assert!(!journal.exists(), "a rewritten history is saved whole");
+    let loaded = hrdr_app::Session::load(&cwd, &id, true).unwrap();
+    assert_eq!(
+        loaded.state.messages[0].content.as_deref(),
+        Some("summary of what came before")
+    );
+    assert_eq!(loaded.state.messages.len(), compacted.len());
+}
+
 #[tokio::test]
 async fn session_write_path_style_save_done_keeps_spawn_preference() {
     let _home = isolated_data_home();

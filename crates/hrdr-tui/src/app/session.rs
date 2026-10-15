@@ -265,8 +265,11 @@ impl super::App {
         if self.state().id.is_some() {
             // The id (and its open-lock) was minted synchronously — at turn
             // start by `reserve_session_id`, or by the first sync save below.
-            // Only the write goes off-thread.
-            self.enqueue_save();
+            // Only the write goes off-thread, and it is a round-journal append
+            // when the history only grew (the owner's call: the full `.json` is
+            // rewritten at turn end, so a crash mid-turn keeps every committed
+            // round's messages but may lose that turn's todo/goal/cron changes).
+            self.enqueue_save_as(false);
             return;
         }
         // No id yet (near-unreachable — `reserve_session_id` runs at turn
@@ -283,6 +286,15 @@ impl super::App {
             }
             self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();
+            self.note_full_save();
+        }
+    }
+
+    /// A synchronous full save just wrote the current state: the next round's
+    /// journal starts on top of it.
+    fn note_full_save(&mut self) {
+        if let Some(id) = self.state().id.clone() {
+            self.round_cursor = Some(RoundCursor::after_full_save(&id, &self.state().messages));
         }
     }
 
@@ -423,6 +435,7 @@ impl super::App {
             }
             self.state_mut().id = Some(o.id);
             self.refresh_subagent_dir();
+            self.note_full_save();
         }
     }
 
@@ -434,16 +447,25 @@ impl super::App {
     /// enqueue supersedes it (latest-wins: at most one save task runs, and a
     /// newer snapshot is always what it writes next).
     fn enqueue_save(&mut self) {
+        self.enqueue_save_as(true);
+    }
+
+    /// [`Self::enqueue_save`], saying whether the save must rewrite the whole
+    /// `.json` (`full`) or may append the round to the journal. Coalesced saves
+    /// keep the strongest request: one full save among them makes the next
+    /// write full.
+    fn enqueue_save_as(&mut self, full: bool) {
         let snapshot = self.state().clone();
         if self.save_in_flight {
             self.pending_save = Some(snapshot);
+            self.pending_full |= full;
             return;
         }
         // A pending first-save reservation rides into the task: it must stay
         // alive until the write attempt ends (its drop removes the `.id.lock`
         // a failed first write would otherwise leave behind).
         let reservation = self.pending_reservation.take();
-        self.spawn_save(snapshot, reservation);
+        self.spawn_save(snapshot, reservation, full);
     }
 
     /// Spawn the serialize + atomic-write for `snapshot`. The id is captured
@@ -455,12 +477,56 @@ impl super::App {
         &mut self,
         snapshot: hrdr_app::SessionState,
         reservation: Option<hrdr_agent::Reservation>,
+        full: bool,
     ) {
         let id = self
             .state()
             .id
             .clone()
             .expect("a save is only spawned after the id exists");
+        if !full
+            && reservation.is_none()
+            && let Some(cursor) = self.round_cursor.clone()
+            && let Some(tail) = journal_tail(&cursor, &id, &snapshot.messages)
+        {
+            if tail.is_empty() {
+                // Nothing new since the last write: the files already hold it.
+                self.promote_pending_save();
+                return;
+            }
+            self.round_cursor = Some(RoundCursor {
+                written: snapshot.messages.len(),
+                written_anchor: hrdr_agent::journal_anchor(&snapshot.messages),
+                ..cursor.clone()
+            });
+            self.save_in_flight = true;
+            let tx = self.tx.clone();
+            let save_done = self.save_done.clone();
+            let unix_style_paths = self.unix_style_paths();
+            let cwd = snapshot.cwd.clone();
+            let fresh = cursor.written == cursor.base;
+            tokio::spawn(async move {
+                let res = hrdr_app::Session::append_journal(
+                    &cwd,
+                    &id,
+                    cursor.base,
+                    &cursor.base_anchor,
+                    fresh,
+                    &tail,
+                    unix_style_paths,
+                );
+                let _ = tx
+                    .send(TurnMsg::SaveDone(
+                        res.map(|()| id).map_err(|e| e.to_string()),
+                    ))
+                    .await;
+                save_done.notify_one();
+            });
+            return;
+        }
+        // A full save puts the whole history in the `.json` and drops the
+        // journal: the next round starts a fresh one on top of it.
+        self.round_cursor = Some(RoundCursor::after_full_save(&id, &snapshot.messages));
         self.save_in_flight = true;
         let tx = self.tx.clone();
         let save_done = self.save_done.clone();
@@ -490,6 +556,9 @@ impl super::App {
         match result {
             Ok(_) => self.session_save_error = None,
             Err(error) => {
+                // The files may not hold what the cursor says: the next save
+                // rewrites the `.json` whole.
+                self.round_cursor = None;
                 self.note_save_error(error);
             }
         }
@@ -502,11 +571,12 @@ impl super::App {
     /// new one's filename — drop it instead (the session it belonged to was
     /// deliberately discarded).
     fn promote_pending_save(&mut self) {
+        let full = std::mem::take(&mut self.pending_full);
         if let Some(next) = self.pending_save.take()
             && next.id.as_deref() == self.state().id.as_deref()
         {
             let reservation = self.pending_reservation.take();
-            self.spawn_save(next, reservation);
+            self.spawn_save(next, reservation, full);
         }
     }
 
@@ -772,4 +842,27 @@ impl super::App {
             ));
         }
     }
+}
+
+/// The messages a round-journal append would write: those `messages` hold past
+/// what `cursor` says is on disk — or `None` when the history did not simply
+/// grow (another session; a compaction rewrote it; it shrank) or a new message
+/// carries attachments, whose bytes only a full save stores. `None` means
+/// "rewrite the `.json`".
+fn journal_tail(
+    cursor: &RoundCursor,
+    id: &str,
+    messages: &[hrdr_agent::Message],
+) -> Option<Vec<hrdr_agent::Message>> {
+    if cursor.id != id || messages.len() < cursor.written {
+        return None;
+    }
+    if hrdr_agent::journal_anchor(&messages[..cursor.written]) != cursor.written_anchor {
+        return None;
+    }
+    let tail = &messages[cursor.written..];
+    if tail.iter().any(|m| !m.attachments.is_empty()) {
+        return None;
+    }
+    Some(tail.to_vec())
 }

@@ -1107,14 +1107,16 @@ impl Session {
     /// cheap per-round write: the full `.json` is rewritten only by
     /// [`Self::save`], at turn end, which also drops the journal.
     ///
-    /// `base` is the `.json`'s message history as it stands on disk. With
-    /// `fresh` the journal is started over for that base; otherwise the chunk is
-    /// appended to the journal already open for it, and a missing journal is an
-    /// error (the caller falls back to a full save).
+    /// `base` and `base_anchor` describe the `.json` as it stands on disk — its
+    /// message count and [`journal_anchor`] of its history. With `fresh` the
+    /// journal is started over for that base; otherwise the chunk is appended to
+    /// the journal already open for it, and a missing journal is an error (the
+    /// caller falls back to a full save).
     pub fn append_journal(
         cwd: &str,
         id: &str,
-        base: &[Message],
+        base: usize,
+        base_anchor: &str,
         fresh: bool,
         messages: &[Message],
         unix_style_paths: bool,
@@ -1123,8 +1125,8 @@ impl Session {
         let mut out = String::new();
         if fresh {
             out.push_str(&serde_json::to_string(&JournalHead {
-                base: base.len(),
-                anchor: journal_anchor(base),
+                base,
+                anchor: base_anchor.to_string(),
             })?);
             out.push('\n');
         }
@@ -2787,8 +2789,26 @@ mod tests {
             let base = st.messages.clone();
             let round = |text: &str| vec![Message::assistant(text)];
 
-            Session::append_journal(&cwd, "rounds", &base, true, &round("one"), true).unwrap();
-            Session::append_journal(&cwd, "rounds", &base, false, &round("two"), true).unwrap();
+            Session::append_journal(
+                &cwd,
+                "rounds",
+                base.len(),
+                &journal_anchor(&base),
+                true,
+                &round("one"),
+                true,
+            )
+            .unwrap();
+            Session::append_journal(
+                &cwd,
+                "rounds",
+                base.len(),
+                &journal_anchor(&base),
+                false,
+                &round("two"),
+                true,
+            )
+            .unwrap();
             let loaded = Session::load(&cwd, "rounds", true).unwrap();
             let texts: Vec<_> = loaded
                 .state
@@ -2821,7 +2841,16 @@ mod tests {
             assert!(!journal.exists());
 
             // A stale journal for an older base is never replayed onto this one.
-            Session::append_journal(&cwd, "rounds", &base, true, &round("stale"), true).unwrap();
+            Session::append_journal(
+                &cwd,
+                "rounds",
+                base.len(),
+                &journal_anchor(&base),
+                true,
+                &round("stale"),
+                true,
+            )
+            .unwrap();
             assert_eq!(
                 Session::load(&cwd, "rounds", true)
                     .unwrap()
