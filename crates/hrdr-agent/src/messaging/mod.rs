@@ -165,8 +165,12 @@ impl Messaging {
         }
         let probes = futures_util::stream::iter(candidates)
             .map(|candidate| async move {
+                // Retried once on an error AND on `Unavailable`: `exchange`
+                // reports a connect that failed as unavailable (refused, reset,
+                // not found) as that status, not as an error, so a live session
+                // missing one connect would otherwise drop out on its first try.
                 let probe = match exchange(&self.directory, &candidate, Payload::Probe).await {
-                    Err(_) => {
+                    Err(_) | Ok((SendStatus::Unavailable, _)) => {
                         sleep(PROBE_RETRY_DELAY).await;
                         exchange(&self.directory, &candidate, Payload::Probe).await
                     }

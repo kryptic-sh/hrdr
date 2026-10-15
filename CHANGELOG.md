@@ -202,6 +202,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A running session no longer drops out of `sessions` on one failed connect.**
+  Discovery retried a probe that errored but not one whose connection was
+  refused or reset, which it reports as unavailable, so a live session that
+  missed a single connect was left out of the list (`crates/hrdr-agent`).
 - **Expanding a tool group no longer expands later groups with local models.**
   Expansion was remembered by the provider's tool-call id, and servers like
   llama.cpp number those per request (`call_0`, `call_1`, …), so opening a group

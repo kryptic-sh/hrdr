@@ -481,3 +481,24 @@ async fn discovery_reports_a_session_that_did_not_accept_and_why() {
     assert_eq!(reason, "answered Unavailable");
     assert_eq!(a.discover().await.unwrap(), vec![a.descriptor()]);
 }
+
+/// A session answering `Unavailable` once — the shape a connect that failed
+/// transiently takes — gets the same single retry a failed probe does, so a
+/// live session is not dropped from the listing on one miss.
+#[tokio::test]
+async fn discovery_retries_a_session_that_was_unavailable_once() {
+    let root = root();
+    let a = runtime(root.path(), "a", "/one").await;
+    let b = runtime(root.path(), "b", "/two").await;
+    b.shared.state.lock().unwrap().open = false;
+    let shared = Arc::clone(&b.shared);
+    let reopen = tokio::spawn(async move {
+        tokio::time::sleep(PROBE_RETRY_DELAY / 4).await;
+        shared.state.lock().unwrap().open = true;
+    });
+
+    let found = a.discover_detailed().await.unwrap();
+    reopen.await.unwrap();
+    assert!(found.live.contains(&b.descriptor()), "{found:?}");
+    assert!(found.unreachable.is_empty(), "{found:?}");
+}

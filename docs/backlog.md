@@ -161,14 +161,16 @@ push each verified slice to `main` before proceeding to the next slice.
    (`Err(_) => None`), so nothing said which. Now `Messaging::discover_detailed`
    keeps each skipped candidate with the status it answered or the error it
    failed with, and the `sessions` tool lists them under `unreachable`, so the
-   next recurrence's request body names the reason. Note for whoever reads it:
-   an unavailable-classed connect error comes back as `answered Unavailable` and
-   is not retried (only `Err` is), which would drop a peer on one transient
-   connect failure. Next recurrence (`a78abc90`, 2026-10-15) moved to the
-   release smoke job and past discovery: the peer was listed, then never
-   received the message (`peer open: true, stopped by: None`). The mock model
-   says `SENT_TO_PEER` whatever `message_session` returned, so the test now
-   prints that tool's answer on this failure too. Not reproduced locally (12
+   next recurrence's request body names the reason. An unavailable-classed
+   connect error came back as `answered Unavailable` and was not retried (only
+   `Err` was), dropping a peer on one transient connect failure; since
+   2026-10-15 both get the single retry
+   (`discovery_retries_a_session_that_was_unavailable_once`). Whether that was
+   the flake's cause is not yet shown. Next recurrence (`a78abc90`, 2026-10-15)
+   moved to the release smoke job and past discovery: the peer was listed, then
+   never received the message (`peer open: true, stopped by: None`). The mock
+   model says `SENT_TO_PEER` whatever `message_session` returned, so the test
+   now prints that tool's answer on this failure too. Not reproduced locally (12
    runs of the two messaging tests together, 6 of the full `tui_pty` suite,
    Windows, pinned host). No test covers `stopped_by` being set: nothing can
    make a pipe accept fail on demand. Same day, one parallel `local_ipc` run
