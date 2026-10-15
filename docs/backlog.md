@@ -3295,11 +3295,7 @@ keys; TLS rustls, no cert bypass; OAuth CSRF/ state/PKCE; blob traversal;
 session/transcript 100 MiB caps; untrusted-content envelope nonce forgery —
 `wrap_untrusted` verifies the nonce absent from the body.
 
-**Hardening (correct today, fragile):** intermediate dangling-symlink
-canonicalization in `canonicalize_nearest` widens the documented write-TOCTOU on
-software-guard-only hosts (Windows / Linux without Landlock, where `shell` is
-already unconfined and noticed) — resolve remaining dangling intermediates by
-hand or re-check inside `atomic_write`; `verify` executes gate commands parsed
+**Hardening (correct today, fragile):** `verify` executes gate commands parsed
 from repo CI YAML — keep out of `JAIL_ TOOLS` (already is) and consider a
 `--dry-run`; session-file `read_only` and identity are still trusted from disk
 at resume (same-user files; the `cwd` is re-checked against the trust store

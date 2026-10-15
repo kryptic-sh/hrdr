@@ -222,6 +222,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The path guard now follows a dangling symlink in the middle of a path.**
+  `canonicalize_nearest` resolved a symlink whose target does not exist only
+  when it was the path's last component, so `link/file` under a dangling `link`
+  pointing outside the working directory was still reported inside it, and
+  passed the confinement check. It now resolves such a link at any depth
+  (`crates/hrdr-tools`).
 - **`/cwd` and `/status` on a sub-agent's pane describe that sub-agent.** Both
   showed the session's directory while the rest of `/status` described the
   sub-agent, and `/cwd <path>` moved only the sub-agent while the status bar,

@@ -795,36 +795,45 @@ pub fn resolve_under(base: &std::path::Path, path: &str) -> PathBuf {
 /// `cwd/nonexistent/../../etc/passwd` would pass a `starts_with(cwd)` check
 /// despite escaping the working directory.
 ///
-/// How many symlink hops [`canonicalize_nearest`] follows when resolving a
-/// dangling final-component symlink by hand. Matches Linux's MAXSYMLINKS.
-const MAX_CANON_SYMLINKS: usize = 40;
-
+/// A dangling symlink anywhere along the path is resolved to its target, not
+/// only in the final position: `cwd/link/file` under a dangling `link` names a
+/// path under the link's target, and reporting it under `cwd` would let it pass
+/// that same check.
 pub fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
     canonicalize_nearest_bounded(path, MAX_CANON_SYMLINKS)
 }
 
+/// How many symlink hops [`canonicalize_nearest`] follows when resolving a
+/// dangling symlink by hand. Matches Linux's MAXSYMLINKS.
+const MAX_CANON_SYMLINKS: usize = 40;
+
 fn canonicalize_nearest_bounded(path: &std::path::Path, budget: usize) -> PathBuf {
-    // A dangling symlink can't be canonicalized, but the guard needs to know
-    // where it points: a write through it lands at the target. Resolve the
-    // final component by hand; the budget stops a symlink loop (which a write
-    // couldn't go through anyway) from recursing forever.
-    if budget > 0
-        && let Ok(meta) = std::fs::symlink_metadata(path)
-        && meta.file_type().is_symlink()
-        && let Ok(target) = std::fs::read_link(path)
-    {
-        let resolved = if target.is_absolute() {
-            target
-        } else {
-            path.parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(&target)
-        };
-        return canonicalize_nearest_bounded(&resolved, budget - 1);
-    }
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
+        // A dangling symlink can't be canonicalized, but the guard needs to
+        // know where it points: a write through it lands at the target. Resolve
+        // it by hand, carrying the components below it over; the budget stops a
+        // symlink loop (which a write couldn't go through anyway) from
+        // recursing forever.
+        if budget > 0
+            && let Ok(meta) = std::fs::symlink_metadata(existing)
+            && meta.file_type().is_symlink()
+            && let Ok(target) = std::fs::read_link(existing)
+        {
+            let mut resolved = if target.is_absolute() {
+                target
+            } else {
+                existing
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(&target)
+            };
+            for c in rest.iter().rev() {
+                resolved.push(c);
+            }
+            return canonicalize_nearest_bounded(&resolved, budget - 1);
+        }
         if let Ok(canon) = existing.canonicalize() {
             let mut out = canon;
             for c in rest.iter().rev() {
@@ -4079,6 +4088,29 @@ b:2:y"
         assert!(
             !canon.starts_with(&tmp),
             "resolved path {canon:?} must not stay under tmp {tmp:?}"
+        );
+    }
+
+    /// A dangling symlink in the MIDDLE of the path resolves too: a path below
+    /// it lies under the link's target, so `tmp/link/file` with
+    /// `link -> ../outside` must not be reported under `tmp`.
+    #[test]
+    fn canonicalize_nearest_resolves_a_dangling_symlink_mid_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // `tmp/link -> tmp/../outside`, a directory that does not exist.
+        let link = tmp.join("link");
+        if !hrdr_test_support::symlink_or_skip(std::path::Path::new("../outside"), &link) {
+            return;
+        }
+
+        let canon = canonicalize_nearest(&link.join("sub").join("file.txt"));
+        assert_eq!(canon, root.join("outside").join("sub").join("file.txt"));
+        assert!(
+            !canon.starts_with(&tmp),
+            "{canon:?} must not stay under {tmp:?}"
         );
     }
 
