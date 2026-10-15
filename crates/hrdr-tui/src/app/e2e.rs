@@ -10250,6 +10250,30 @@ async fn path_style_completion_nonpath_rows_stay_verbatim() {
     }
 }
 
+/// A reload of a VALID config applies it and says so: the hot reload (the mtime
+/// poll) names the file in the style the new config chose, and `/reload` shows
+/// the manual notice.
+#[tokio::test]
+async fn a_successful_config_reload_applies_it_and_says_so() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let path = hrdr_agent::config_file_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for style in [true, false] {
+        std::fs::write(&path, format!("unix_style_paths = {style}\n")).unwrap();
+        h.app.config_mtime = None;
+        h.app.maybe_reload_config();
+        assert_eq!(h.app.cfg.unix_style_paths, style, "the reload applied");
+        let expected = hrdr_app::reload_hot_message(style);
+        assert_eq!(h.app.toasts.last_body(), Some(expected.as_str()));
+
+        std::fs::write(&path, format!("unix_style_paths = {}\n", !style)).unwrap();
+        h.submit("/reload").await;
+        assert_eq!(h.app.cfg.unix_style_paths, !style, "the reload applied");
+        assert_eq!(h.app.toasts.last_body(), Some(hrdr_app::RELOAD_MANUAL_MSG));
+    }
+}
+
 #[tokio::test]
 async fn config_diagnostic_path_style_reload_failures_keep_active_state() {
     let _home = isolated_data_home();

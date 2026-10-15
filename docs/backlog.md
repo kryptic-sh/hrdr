@@ -2705,10 +2705,12 @@ and **not** fixed.
   further active gaps, not exhaustive proof. Startup diagnostics recover a typed
   preference from valid TOML or default to `true`; failed reloads retain the
   active style. The reload regression exercises manual dispatch and the mtime
-  handler, not the watcher/event loop; successful hot-reload notices and
-  independently exact reload parser reasons are not asserted. Preserve
-  filesystem identities, Unix literal backslashes, parser excerpts, protocol
-  URIs, and captured shell output.
+  handler, not the watcher/event loop; a successful reload's notice is asserted
+  (`a_successful_config_reload_applies_it_and_says_so`), but the failure test
+  derives its expected parser reason from `reload_checked` itself, so the exact
+  wording is not independently checked. Preserve filesystem identities, Unix
+  literal backslashes, parser excerpts, protocol URIs, and captured shell
+  output.
 - **Completion identity verification gaps:** Unix collision tests in
   `hrdr-app/src/util.rs` and `hrdr-tui/src/app/e2e.rs` passed Linux/macOS CI in
   `37912493951`; local verification was Windows-only, including a failing
