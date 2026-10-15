@@ -66,6 +66,11 @@ only the list. Delete a line when its question is answered.
   per-call escalation, a "something changed" channel, session env vars for shell
   commands (default off), and a truncation-cap experiment. _Peer-comparison
   findings still open._
+- **Drop the `apply_cache_breakpoints` re-export from `hrdr-llm`** — a
+  public-API break for a published crate. _Tidy review 2026-08-04 #9._
+- **Manual smokes that need the owner's environment** — `watch` against a real
+  GitHub run, and the DeepSeek provider with a real `DEEPSEEK_API_KEY`. _Test
+  coverage gaps._
 - **`CommandHost` text-fallback defaults; `gate_rank`/`kind_rank` merge;
   verbose-gating the session banner; `jail` write floor and read-only git.**
   Smaller calls recorded where each lives.
