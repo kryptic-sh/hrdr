@@ -55,6 +55,17 @@ only the list. Delete a line when its question is answered.
   coordination and queued work._
 - **Replacing `serde_yaml_ng`.** _Needs a decision 2026-10-14._
 - **Which built-ins become skills.** _Needs a decision 2026-08-09._
+- **Project-writable instruction surfaces** — a write sub-agent can edit
+  `AGENTS.md` mid-session, and project commands/skills shadow built-ins by name;
+  both left open on purpose, the second the stronger candidate to close.
+  _Peer-comparison findings → Permissions, isolation, and state._
+- **Which peer-comparison features to build** — none is a fix; each is a product
+  choice: session search, prompt-size introspection, shell parsing instead of
+  regex guardrails, runtime tool descriptions, per-model behaviour as data,
+  deferred tool loading, an ask-the-user tool, one permission evaluator,
+  per-call escalation, a "something changed" channel, session env vars for shell
+  commands (default off), and a truncation-cap experiment. _Peer-comparison
+  findings still open._
 - **`CommandHost` text-fallback defaults; `gate_rank`/`kind_rank` merge;
   verbose-gating the session banner; `jail` write floor and read-only git.**
   Smaller calls recorded where each lives.
