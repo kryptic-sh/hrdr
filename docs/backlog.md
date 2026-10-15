@@ -2681,11 +2681,11 @@ and **not** fixed.
   sandbox escape; fails on Windows when dangling links go unresolved) and the
   symlink half of `a_writable_root_is_writable_all_the_way_down` — which cannot
   fail on Windows: the policy's roots are `\\?\`-prefixed there, so a raw
-  unresolved path is refused anyway. Also ported 2026-10-15:
-  `tree_symlink_marks` (its body was `cfg(unix)`, so it passed on Windows
-  checking nothing), `attachment_presentation_directory_suffixes`' link case,
-  and `normalize_path_handles_existing_and_nonexistent_symlink_targets` — which
-  is weak everywhere: its "must not start with cwd" holds with or without the
+  unresolved path is refused anyway. Earlier the same day: `tree_symlink_marks`
+  (its body was `cfg(unix)`, so it passed on Windows checking nothing),
+  `attachment_presentation_directory_suffixes`' link case, and
+  `normalize_path_handles_existing_and_nonexistent_symlink_targets` — which is
+  weak everywhere: its "must not start with cwd" holds with or without the
   symlink, since `link/../../other` leaves the project either way. The guards
   they cover do run on Windows. `hrdr_test_support::symlink_or_skip` is the
   portable helper — file or directory link by target kind, skipping locally
