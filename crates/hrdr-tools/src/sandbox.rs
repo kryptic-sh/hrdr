@@ -985,6 +985,23 @@ pub(crate) fn gpu_device_nodes() -> Vec<std::path::PathBuf> {
     out
 }
 
+/// What a write refused on Windows prints, in `cmd` (`Access is denied.`) and in
+/// PowerShell (`Access to the path '…' is denied.`) — captured from a
+/// Low-integrity process, and identical to an ordinary ACL refusal. Takes the
+/// lowercased output.
+fn is_access_denied(lower: &str) -> bool {
+    lower.contains("access is denied")
+        || (lower.contains("access to the path") && lower.contains("is denied"))
+}
+
+/// The hedged note for a refused write in Windows read-only mode — see
+/// [`sandbox_denial_note`].
+const WINDOWS_READ_DENIAL_NOTE: &str = "\n\n[sandbox] this \"access denied\" may be hrdr's \
+     sandbox: in read-only mode on Windows, commands run at Low integrity and cannot write \
+     anywhere — though an ordinary permission error prints the same words. If the write is \
+     genuinely needed, say so: the user can run the command themselves with `!<command>`. Do not \
+     report the tool as missing or broken.";
+
 /// The note alone — the only thing any caller wants, now that there is exactly one
 /// kind of denial to report.
 ///
@@ -1001,6 +1018,13 @@ pub fn sandbox_denial_note(
         return None;
     }
     let lower = output.to_ascii_lowercase();
+    // Windows confines read-only mode by running commands at Low integrity, and
+    // a write refused that way prints exactly what an ordinary ACL refusal does.
+    // So the note can only say it MAY be the sandbox — the owner's call, over
+    // saying nothing and letting the agent report a working tool as broken.
+    if cfg!(windows) && policy.mode == SandboxMode::Read && is_access_denied(&lower) {
+        return Some(WINDOWS_READ_DENIAL_NOTE.to_string());
+    }
     if !lower.contains("read-only file system") && !lower.contains("erofs") {
         return None;
     }
@@ -1784,6 +1808,44 @@ mod tests {
                 "{ordinary}"
             );
         }
+    }
+
+    /// The two refusals a Low-integrity write produces on Windows, as captured
+    /// from `cmd` and PowerShell, are recognized; a unix "Permission denied" and
+    /// unrelated failures are not.
+    #[test]
+    fn windows_access_denied_wordings_are_recognized() {
+        for denied in [
+            "Access is denied.",
+            r"Set-Content: Access to the path 'C:\work\out.txt' is denied.",
+        ] {
+            assert!(is_access_denied(&denied.to_ascii_lowercase()), "{denied}");
+        }
+        for other in [
+            "cat: /etc/shadow: Permission denied",
+            "error: could not compile `foo`",
+            "",
+        ] {
+            assert!(!is_access_denied(&other.to_ascii_lowercase()), "{other}");
+        }
+    }
+
+    /// On Windows only read-only mode is OS-confined, so only there does an
+    /// access-denied get the hedged note — `write` mode has no confinement to
+    /// blame it on.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_read_mode_access_denied_gets_the_hedged_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = SandboxPolicy::for_agent(SandboxMode::Read, dir.path(), &[]);
+        let note = sandbox_denial_note(&read, "Access is denied.", false)
+            .expect("read mode explains an access-denied");
+        assert!(note.contains("may be hrdr's sandbox"), "{note}");
+        let write = SandboxPolicy::for_agent(SandboxMode::Write, dir.path(), &[]);
+        assert_eq!(
+            sandbox_denial_note(&write, "Access is denied.", false),
+            None
+        );
     }
 
     /// **A refused write is the only thing the sandbox explains, and it names the

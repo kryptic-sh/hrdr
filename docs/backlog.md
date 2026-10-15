@@ -38,8 +38,6 @@ only the list. Delete a line when its question is answered.
 - **CRLF through `replace` and `write`** — preserve a file's dominant line
   ending or write what was given. _Windows support review 2026-09-15._
 - **`cwd_slug` hash and migration.** _Windows support review 2026-09-15._
-- **Windows sandbox refusal note** — hedged note or none (recommended: hedged).
-  _Windows support review → `sandbox_denial_note`._
 - **Owner-only DACL on Windows credential/session files.** _Consistency /
   robustness → "hrdr sets no Windows ACL"._
 - **`/trust revoke`** and whether it downgrades the running session. _Tooling /
@@ -2676,21 +2674,6 @@ and **not** fixed.
   and on lookup fall back to the legacy slug, moving the folder when found? Or
   keep today's keys and accept both risks? The fallback costs one extra
   directory probe per session lookup and a rename on first use.
-- **`sandbox_denial_note` only recognises EROFS wording — question for the
-  **[Deferred — question for the owner; see the index at the top]** owner.** A
-  Low-integrity write refusal on Windows gives no marker of its own; evidence
-  captured 2026-10-15 on Windows 11 with a Low-labelled `cmd.exe`
-  (`whoami /groups` confirmed `Low Mandatory Level`): `cmd` prints
-  `Access is denied.` and PowerShell prints
-  `Access to the path '<path>' is denied.` — word for word what an ordinary ACL
-  `deny` on the same user prints. So the note, which says the failure IS the
-  sandbox, cannot fire on Windows without false positives (an existing test
-  guards that: `"Permission denied"` yields `None`). Options: (a) leave Windows
-  without the note; (b) a hedged note on Windows `read`/`write` mode only —
-  "this may be hrdr's sandbox (it confines writes to …)" — whenever a command
-  output contains an access-denied message, accepting that it also fires on
-  plain ACL refusals. Recommended: (b), worded as a possibility, since an agent
-  told nothing tends to report the tool as broken.
 - **Path presentation verification follow-up.** Config-diagnostic regressions
   passed Linux/macOS CI in `37912493951`; the bounded consumer audit found no
   further active gaps, not exhaustive proof. Startup diagnostics recover a typed

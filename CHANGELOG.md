@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A refused write in Windows read-only mode now says it may be the sandbox.**
+  On Windows, read-only mode runs commands at Low integrity, and a write refused
+  that way prints the same "Access is denied" as an ordinary permission error,
+  so the agent had nothing to tell the two apart and could report a working tool
+  as broken. It now gets a note saying the refusal may be hrdr's sandbox and how
+  the user can run the command themselves (`crates/hrdr-tools`).
 - **`hrdr_llm::Accumulator::absorb`** merges a stream chunk like `push` without
   copying its text delta back out, for a caller that owns the chunk and can move
   the delta itself. hrdr's own turn loop now uses it, saving two allocations per
