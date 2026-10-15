@@ -33,6 +33,11 @@ only the list. Delete a line when its question is answered.
 - **Sub-agent `<stem>.json` snapshot** — delete, write once at run end, or keep
   per-round (recommended: write once). Settles the top HIGH perf item too.
   _Sandbox follow-ups → "Opened by the redesign"._
+- **Main-session save per tool round** — journal each round's messages and
+  rewrite the full `.json` only at turn end (O(n) instead of O(n²) bytes), at
+  the cost of "at most one round lost" becoming "at most one turn lost" unless
+  the journal records messages. _Performance review — second pass 2026-08-04
+  #1._
 - **CRLF through `replace` and `write`** — preserve a file's dominant line
   ending or write what was given. _Windows support review 2026-09-15._
 - **`cwd_slug` hash and migration.** _Windows support review 2026-09-15._
