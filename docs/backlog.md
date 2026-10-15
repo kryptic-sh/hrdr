@@ -212,29 +212,31 @@ push each verified slice to `main` before proceeding to the next slice.
    findings were removed from their sections. Gaps: an audit judged by reading,
    so an entry it could not decide stayed; the queue above was not audited this
    way.
-4. **LLM-managed session names.** Generate the default session name through the
-   LLM on its first turn. Let the agent rename the session when its direction,
-   goal, or progress changes enough that the existing name no longer fits.
-   Implement and test initial naming and subsequent meaningful renaming after
-   the preceding queued work. **Deferred 2026-10-14 — questions for the owner
-   before implementation:** (a) Should the agent ever rename a session the user
-   named explicitly (`/new <name>`, `/rename`)? Recommended: never — a user name
-   is pinned until the user clears or changes it — with the alternative being
-   that the agent may propose a rename the user confirms. (b) How is the name
+4. **LLM-managed session names.** **[Deferred — question for the owner; see the
+   index at the top]** Generate the default session name through the LLM on its
+   first turn. Let the agent rename the session when its direction, goal, or
+   progress changes enough that the existing name no longer fits. Implement and
+   test initial naming and subsequent meaningful renaming after the preceding
+   queued work. **Deferred 2026-10-14 — questions for the owner before
+   implementation:** (a) Should the agent ever rename a session the user named
+   explicitly (`/new <name>`, `/rename`)? Recommended: never — a user name is
+   pinned until the user clears or changes it — with the alternative being that
+   the agent may propose a rename the user confirms. (b) How is the name
    produced? Options: a separate small model request after the first turn (one
    extra request per session, works with any model), or a `rename_session` tool
    the model calls itself (no extra request, but depends on the model choosing
    to call it). (c) Which model pays for (b)'s first option — the session's
    model or the configured `subagent_model`? Today a session is named from the
    first line of its first message (`session_name_from`).
-5. **Terminal titles — Windows report unresolved.** The status/cwd/name title
-   shipped (`hrdr-tui`'s `app::title`), and `tests/tui_pty.rs` shows on Windows
-   that the OSC title reaches a ConPTY client. The reported Windows symptom (the
-   tab staying `PowerShell`) was not reproduced, so its cause is unknown: a
-   terminal setting such as Windows Terminal's `suppressApplicationTitle`, or a
-   host that ignores OSC titles, would produce it with hrdr working. **Question
-   for the owner:** which terminal and profile showed `PowerShell`? The macOS
-   and Linux pty runs are on CI only.
+5. **Terminal titles — Windows report unresolved.** **[Deferred — question for
+   the owner; see the index at the top]** The status/cwd/name title shipped
+   (`hrdr-tui`'s `app::title`), and `tests/tui_pty.rs` shows on Windows that the
+   OSC title reaches a ConPTY client. The reported Windows symptom (the tab
+   staying `PowerShell`) was not reproduced, so its cause is unknown: a terminal
+   setting such as Windows Terminal's `suppressApplicationTitle`, or a host that
+   ignores OSC titles, would produce it with hrdr working. **Question for the
+   owner:** which terminal and profile showed `PowerShell`? The macOS and Linux
+   pty runs are on CI only.
 6. **Selectable shells — macOS/Linux and hook/verify coverage.** Shipped: Git
    Bash first on Windows (`Shell::resolved`, `git_bash`), every installed shell
    offered through the `shell` tool's `shell` argument, and dialect sections for
@@ -341,7 +343,8 @@ push each verified slice to `main` before proceeding to the next slice.
    work, now in `main`) can be deleted — the first only on the owner's word,
    since it predates this session.
 10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
-    Deferred until the earlier queued work is finished. Compare hrdr's
+    **[Deferred — question for the owner; see the index at the top]** Deferred
+    until the earlier queued work is finished. Compare hrdr's
     OAuth-authenticated OpenAI requests with the official `openai/codex`
     implementation: usage accounting, request categorization, and credit usage
     as reflected in the GPT usage dashboard. Identify which request metadata,
@@ -435,6 +438,7 @@ root-caused:
 (`took_ms` mismatch), watch-delivery timing, and session-save timing.
 
 **The pty tests read the screen by stripping escapes — needs a decision.**
+**[Deferred — question for the owner; see the index at the top]**
 `apps/hrdr/tests/common` `visible` removes escape sequences instead of emulating
 a terminal, so text the renderer writes around cells it skips as unchanged
 (`P<skip>ER<skip>REPLY` for `PEER_REPLY_SEEN` over an earlier `SENT_TO_PEER`)
@@ -536,7 +540,8 @@ from the run was dropped (item 4).
 proposed, or disproved at review time.** Each item carries its own tag below.
 
 1. **Per-round full-history save with two fsyncs — still the dominant cost of a
-   long session.** **[needs direction — pick the crash-durability tradeoff]**
+   **[Deferred — question for the owner; see the index at the top]** long
+   session.** **[needs direction — pick the crash-durability tradeoff]**
    `turn_loop.rs:785` clones the whole `messages` on every tool round and emits
    `AgentEvent::History`; the frontend clones again (`hrdr-tui/src/app.rs:2748`)
    into `persist_mid_turn`, which clones the whole `SessionState`
@@ -594,8 +599,9 @@ its cited lines, behavior-preserving only, ranked by confidence.
 
 **Status: item 9 open (needs direction — external API); items 1-8 shipped.**
 
-9. **Low: unused re-export `apply_cache_breakpoints`.** **[needs direction —
-   removing a `pub use` from a published crate is an external-API decision]**
+9. **Low: unused re-export `apply_cache_breakpoints`.** **[Deferred — question
+   for the owner; see the index at the top]** **[needs direction — removing a
+   `pub use` from a published crate is an external-API decision]**
    `hrdr-llm/src/lib.rs:38` re-exports it; the only production caller uses
    `crate::types:: apply_cache_breakpoints` (`client.rs:1068`) and no workspace
    crate imports the re-export. Action: drop it — but hrdr-llm is a published
@@ -691,6 +697,9 @@ On 2026-10-14 `cargo update` took every compatible release and
 with nothing to do here.
 
 ## Needs a decision 2026-10-14 — replacing `serde_yaml_ng`
+
+**[Deferred — every item in this section is a question for the owner; see the
+index at the top]**
 
 The scheduled `cargo-deny` run began failing on RUSTSEC-2024-0449:
 `unsafe-libyaml` is unmaintained. It is an "unmaintained" advisory, not a
@@ -833,7 +842,8 @@ live here:
   live-panel chunk heights vs the transcript area.
 
 - **Hide `Notice` transcript entries unless verbose — the noise half is closed
-  by the notice redesign (`2bff248`).** The variant-mixing blocker is gone:
+  **[Deferred — question for the owner; see the index at the top]** by the
+  notice redesign (`2bff248`).** The variant-mixing blocker is gone:
   `App::system` and the `TurnMsg::System` handler now toast, and a slash
   command's data output opens an Esc-dismissible popup — so the
   `EntryKind::Notice` chrome this item named ("session saved as …", config
@@ -855,6 +865,9 @@ reads in `crates/hrdr-app/src/util.rs`
 (`read_attach_file`/`read_attach_dir`/`discover_commands`) are the site.
 
 ## Which built-ins should become skills — needs a decision, 2026-08-09
+
+**[Deferred — every item in this section is a question for the owner; see the
+index at the top]**
 
 With both mechanisms now shipped, four built-in commands are better as Agent
 Skill bundles, and the rest are not. Assessed against: skills take no arguments,
@@ -1142,6 +1155,9 @@ or a mandatory prompt-only reason). What it left open:
 
 ## Top of the list
 
+**[Deferred — every item in this section is a question for the owner; see the
+index at the top]**
+
 What is left here needs a decision, not work.
 
 1. **Content scanning for `AGENTS.md`, if ever wanted.** Largely superseded
@@ -1171,6 +1187,9 @@ What is left here needs a decision, not work.
 ---
 
 ## Peer-comparison findings still open
+
+**[Deferred — every item in this section is a question for the owner; see the
+index at the top]**
 
 Grouped by theme. Cross-harness agreement is noted because two harnesses
 reaching the same conclusion independently is the strongest signal in the
@@ -1290,16 +1309,18 @@ the working directory only, so nothing is inherited from an ancestor the user
 never answered for. What the gate does **not** answer is what a trusted
 directory's files may then do:
 
-- **Project `AGENTS.md` is writable by a write sub-agent** and read back as
-  project conventions on the parent's next prompt rebuild (`/clear`, `set_cwd`,
-  a new agent). The trust answer is given once, at open, so a sub-agent editing
-  the file mid-session changes what the parent reads next without being asked
-  again. Left open on purpose: `AGENTS.md` is also how a project legitimately
-  carries instructions, and narrowing it costs that. A `// NOTE:` sits on the
-  push site in `build_system_prompt_sections`. Closing it would mean the
-  `memory`-tool treatment (main agent only), which that tool could afford
-  because it had no second use.
-- **Project commands and skills shadow built-ins by name.** `command_dirs` and
+- **Project `AGENTS.md` is writable by a write sub-agent** **[Deferred —
+  question for the owner; see the index at the top]** and read back as project
+  conventions on the parent's next prompt rebuild (`/clear`, `set_cwd`, a new
+  agent). The trust answer is given once, at open, so a sub-agent editing the
+  file mid-session changes what the parent reads next without being asked again.
+  Left open on purpose: `AGENTS.md` is also how a project legitimately carries
+  instructions, and narrowing it costs that. A `// NOTE:` sits on the push site
+  in `build_system_prompt_sections`. Closing it would mean the `memory`-tool
+  treatment (main agent only), which that tool could afford because it had no
+  second use.
+- **Project commands and skills shadow built-ins by name.** **[Deferred —
+  question for the owner; see the index at the top]** `command_dirs` and
   `skill_dirs` both start with the working tree's own roots (`.hrdr/commands`,
   `.claude/commands`, `.opencode/command(s)`; `.hrdr/skills`, `.agents/skills`,
   `.claude/skills`, `.codex/skills`), all under the writable cwd, and a project
@@ -1490,8 +1511,9 @@ remains open:
   EROFS note now names the remedy (`sandbox_writable_roots`,
   `--sandbox-writable-root`, `!command`), which was most of what a pre-flight
   would have said.
-- **Windows `write` mode has no OS confinement** (`read` mode is confined by
-  Mandatory Integrity Control since 2026-08-02; `write` still takes
+- **Windows `write` mode has no OS confinement** **[Deferred — question for the
+  owner; see the index at the top]** (`read` mode is confined by Mandatory
+  Integrity Control since 2026-08-02; `write` still takes
   `NO_OS_SANDBOX_NOTICE`), and closing it costs something the other two backends
   do not. A Low-integrity child can only write to objects _labelled_ Low, so
   each writable root would have to be relabelled
@@ -1504,7 +1526,8 @@ remains open:
 
 Opened by the redesign:
 
-- **The sub-agent `<stem>.json` snapshot is written and never read.** It existed
+- **The sub-agent `<stem>.json` snapshot is written and never read.**
+  **[Deferred — question for the owner; see the index at the top]** It existed
   for `task_revive`, which is gone. Its only reader now is its own test
   (`background_subagent_persists_its_own_session_state`). Deleting it removes a
   per-turn-boundary write; keeping it keeps a crash-durable record of what a
@@ -1519,15 +1542,17 @@ Opened by the redesign:
   pay for a coalescing background writer, or change `SessionState.messages` to
   share the history, either a sizeable change on the persistence path for a file
   nothing reads. Recommended: (b), or (a) if no reader is planned.
-- **`--sandbox jail` cannot apply to a write-capable session**, so it floors at
-  `write` and emits a notice pointing at the `prisoner` agent. That is honest
-  but it is not what the word means. A jailed _main_ agent is coherent (five
-  tools, no shell — an audit session), and the write floor exists for sub-agents
-  that must write. Worth revisiting as "session jail means jail, and a
-  write-capable sub-agent under it is the thing that floors".
-- **`jail` loses `git log` on the audited repo** — real provenance value, and
-  the accepted cost of having no subprocess. Argues for a narrow read-only git
-  capability later, not a general shell.
+- **`--sandbox jail` cannot apply to a write-capable session** **[Deferred —
+  question for the owner; see the index at the top]**, so it floors at `write`
+  and emits a notice pointing at the `prisoner` agent. That is honest but it is
+  not what the word means. A jailed _main_ agent is coherent (five tools, no
+  shell — an audit session), and the write floor exists for sub-agents that must
+  write. Worth revisiting as "session jail means jail, and a write-capable
+  sub-agent under it is the thing that floors".
+- **`jail` loses `git log` on the audited repo** **[Deferred — question for the
+  owner; see the index at the top]** — real provenance value, and the accepted
+  cost of having no subprocess. Argues for a narrow read-only git capability
+  later, not a general shell.
 - **Package caches are writable and shared across projects.** Content-addressed
   and integrity-checked, which is what makes it acceptable, but poisoning
   `~/.cargo/registry` affects builds the user later runs by hand. Revisit if a
@@ -1549,18 +1574,18 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
 
 ## Tooling / agent capability
 
-- **Trust can be granted and never revoked.** `hrdr_agent::trust` has
-  `is_trusted` and `trust`; there is no `untrust`, no listing, and no command
-  that reaches either. Undoing an answer means finding
-  `$XDG_CACHE_HOME/hrdr/trusted-dirs` and editing it by hand — which is fine for
-  the owner and is not a thing a user can be expected to discover. The asymmetry
-  is deliberate as far as it goes (only the yes is stored, so declining needs no
-  undo), but a directory whose provenance turns out to be wrong is exactly the
-  case the gate exists for. Smallest honest version: a `/trust` command that
-  prints the store and takes `revoke [path]`, defaulting to the current
-  directory. Needs a decision about whether revoking mid-session also has to
-  downgrade the running session, which is the same terminal-ownership problem as
-  answering the question mid-session.
+- **Trust can be granted and never revoked.** **[Deferred — question for the
+  owner; see the index at the top]** `hrdr_agent::trust` has `is_trusted` and
+  `trust`; there is no `untrust`, no listing, and no command that reaches
+  either. Undoing an answer means finding `$XDG_CACHE_HOME/hrdr/trusted-dirs`
+  and editing it by hand — which is fine for the owner and is not a thing a user
+  can be expected to discover. The asymmetry is deliberate as far as it goes
+  (only the yes is stored, so declining needs no undo), but a directory whose
+  provenance turns out to be wrong is exactly the case the gate exists for.
+  Smallest honest version: a `/trust` command that prints the store and takes
+  `revoke [path]`, defaulting to the current directory. Needs a decision about
+  whether revoking mid-session also has to downgrade the running session, which
+  is the same terminal-ownership problem as answering the question mid-session.
 - **Memory drift detection.** A periodic prune/verify pass over the `memory`
   store — check each `<slug>.md` still has a `MEMORY.md` pointer (and vice
   versa) and flag/prune stale or contradicted memories. Cheap because
@@ -1596,11 +1621,12 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   only `write.md`; and the two pipe rules share one identical message string, so
   the table is keyed positionally rather than by message. Eliminating the
   duplication itself still wants runtime-composed descriptions.
-- **hrdr sets no Windows ACL on any file it writes.** The residual of the
-  Windows-drift audit pass, which **ran** and landed three fixes (`8e5bc9d`):
-  the credential `sync_all` gated on unix though portable, `atomic_write`'s
-  symlink guard likewise, and owner-only file creation re-decided at four sites.
-  All ~130 `cfg` gates were classified at the time; `proc.rs` and `prompt.rs`'s
+- **hrdr sets no Windows ACL on any file it writes.** **[Deferred — question for
+  the owner; see the index at the top]** The residual of the Windows-drift audit
+  pass, which **ran** and landed three fixes (`8e5bc9d`): the credential
+  `sync_all` gated on unix though portable, `atomic_write`'s symlink guard
+  likewise, and owner-only file creation re-decided at four sites. All ~130
+  `cfg` gates were classified at the time; `proc.rs` and `prompt.rs`'s
   package-manager names are deliberate and documented. (The unix-gated _tests_
   that pass called "not findings" were mostly shell and python tests Windows
   could run all along, and now does — see "Windows support review 2026-09-15".)
@@ -1620,10 +1646,11 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   equivalent at all, so callers relying on it keep their own preflight check.
   Recorded on `owner_only_options_no_follow`; closing it properly means
   resolving the whole path under a directory handle.
-- **`CommandHost`'s text-fallback defaults are now test-only.** Found in the
-  2026-08-02 web-removal sweep, not fixed — the parent's call, and the
-  Standing-constraints host seam is deliberately kept. `begin_login`,
-  `begin_model_selector`, `begin_model_selector_for`, `begin_session_selector`,
+- **`CommandHost`'s text-fallback defaults are now test-only.** **[Deferred —
+  question for the owner; see the index at the top]** Found in the 2026-08-02
+  web-removal sweep, not fixed — the parent's call, and the Standing-constraints
+  host seam is deliberately kept. `begin_login`, `begin_model_selector`,
+  `begin_model_selector_for`, `begin_session_selector`,
   `begin_command_selector`, `begin_effort_selector` and `begin_theme_selector`
   all carry default bodies that list the choices as text "for a frontend without
   modal support" — that frontend was `hrdr-web`. `TuiHost`
@@ -1641,17 +1668,18 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
 
 ## Test coverage gaps
 
-- **`watch` against a real GitHub run: manual smoke never ran.** The watch-tool
-  plan's last item (watch an actual tag-run CI run through `gh`) needs a live
-  GitHub run, so it was not runnable in the automated suite; every automated
-  slice shipped (the poller lifecycle, guardrails, cancel, delivery, schema
-  bounds, prompt rewiring). Run it before trusting the release flow's watch step
-  on a real run.
+- **`watch` against a real GitHub run: manual smoke never ran.** **[Deferred —
+  question for the owner; see the index at the top]** The watch-tool plan's last
+  item (watch an actual tag-run CI run through `gh`) needs a live GitHub run, so
+  it was not runnable in the automated suite; every automated slice shipped (the
+  poller lifecycle, guardrails, cancel, delivery, schema bounds, prompt
+  rewiring). Run it before trusting the release flow's watch step on a real run.
 
-- **DeepSeek built-in provider: manual smoke slice never ran.** The provider
-  plan's slice 7 (single-turn + agentic tool-call turn against the real API)
-  needs a live `DEEPSEEK_API_KEY` and was not runnable in the automated suite;
-  every other slice shipped. Run it before trusting a real DeepSeek session.
+- **DeepSeek built-in provider: manual smoke slice never ran.** **[Deferred —
+  question for the owner; see the index at the top]** The provider plan's slice
+  7 (single-turn + agentic tool-call turn against the real API) needs a live
+  `DEEPSEEK_API_KEY` and was not runnable in the automated suite; every other
+  slice shipped. Run it before trusting a real DeepSeek session.
 
 - **The warm models.dev catalog path is uncovered, deliberately.**
   `catalog::load_cached` reads process-global state (`HRDR_MODELS_PATH` / the
@@ -1688,6 +1716,9 @@ re-verified against the tree.
 ---
 
 ## Provider divergences left open by decision
+
+**[Deferred — every item in this section is a question for the owner; see the
+index at the top]**
 
 Each is pinned by a test and commented in the source; what is missing is a
 decision, not work — except the last, which is a missing feature.
@@ -1758,14 +1789,16 @@ The data-loss half is fixed: the TUI now summarizes the conversation on screen.
 Two residuals, both from the same root — the turn **handle** slot is
 session-wide while the compaction is now per-pane:
 
-- **The TUI can no longer Esc-cancel a sub-pane compaction.** `in_flight`,
-  `is_busy` and `cancel_turn` are all keyed to `MAIN_KEY`, so with the clock now
-  on the sub key they see nothing in flight. Before the fix Esc did cancel it —
-  while also stopping main's clock, which was the defect. Needs a decision on
-  per-pane cancellation, not a patch.
-- **The TUI's compaction result line lands in main's transcript** (`push_entry`
-  is main-scoped), so "compacted: N → M" appears in the main conversation even
-  when a sub-agent was summarized. TUI system lines are main-scoped generally;
+- **The TUI can no longer Esc-cancel a sub-pane compaction.** **[Deferred —
+  question for the owner; see the index at the top]** `in_flight`, `is_busy` and
+  `cancel_turn` are all keyed to `MAIN_KEY`, so with the clock now on the sub
+  key they see nothing in flight. Before the fix Esc did cancel it — while also
+  stopping main's clock, which was the defect. Needs a decision on per-pane
+  cancellation, not a patch.
+- **The TUI's compaction result line lands in main's transcript** **[Deferred —
+  question for the owner; see the index at the top]** (`push_entry` is
+  main-scoped), so "compacted: N → M" appears in the main conversation even when
+  a sub-agent was summarized. TUI system lines are main-scoped generally;
   changing that is a wider call.
 
 ---
@@ -1776,16 +1809,17 @@ session-wide while the compaction is now per-pane:
 its sibling modules, the `CommandHost` trait and its call site. The finding
 below is traced from source — nothing was reproduced at runtime.
 
-**`/cwd` writes one agent and reads another.** `dispatch.rs` resolves the
-argument against `host.cwd()` and writes `host.agent()`, and those are different
-agents (`cwd()` is main-derived, `agent()` is the active pane). On a sub-agent
-pane, a relative `/cwd` resolves against main's cwd, moves only the sub-agent,
-then repoints the global chrome as if main had moved. A bare `/cwd` afterwards
-contradicts the status bar. `/status` has the same split — main's cwd beside the
-active agent's message count. Needs a call: derive the base from `host.agent()`,
-or add `active_cwd()` so both halves name one agent. **Re-checked 2026-10-15,
-still true:** `TuiHost::agent` is `active_agent()` ("commands act on the agent
-you are looking at") while `TuiHost::cwd` is `agent_cwd(&self.app.agent)`, and
+**`/cwd` writes one agent and reads another.** **[Deferred — question for the
+owner; see the index at the top]** `dispatch.rs` resolves the argument against
+`host.cwd()` and writes `host.agent()`, and those are different agents (`cwd()`
+is main-derived, `agent()` is the active pane). On a sub-agent pane, a relative
+`/cwd` resolves against main's cwd, moves only the sub-agent, then repoints the
+global chrome as if main had moved. A bare `/cwd` afterwards contradicts the
+status bar. `/status` has the same split — main's cwd beside the active agent's
+message count. Needs a call: derive the base from `host.agent()`, or add
+`active_cwd()` so both halves name one agent. **Re-checked 2026-10-15, still
+true:** `TuiHost::agent` is `active_agent()` ("commands act on the agent you are
+looking at") while `TuiHost::cwd` is `agent_cwd(&self.app.agent)`, and
 `cwd_changed` → `App::apply_cwd_view` repoints session-wide state (status-bar
 dir, git branch, file index and watcher, `rediscover`). **Question for the
 owner**, options: (a) `/cwd` on a sub-agent pane reports and moves that
@@ -2645,7 +2679,8 @@ and **not** fixed.
 
 **Open — needs a decision:**
 
-- **CRLF files through `replace` and `write`.** `edit` recovers a CRLF file
+- **CRLF files through `replace` and `write`.** **[Deferred — question for the
+  owner; see the index at the top]** `edit` recovers a CRLF file
   (`is_crlf_dominant` in `edit.rs`), `replace` does not: a pattern containing
   `\n` never matches a CRLF file, and a `\n` in the replacement leaves mixed
   endings. `read` presents lines without `\r`, so a `write` of content built
@@ -2661,23 +2696,25 @@ and **not** fixed.
   bracketed-paste pty regressions run ungated on Linux, macOS and Windows CI.
   What is left is under queue item 9 at the top of this file.
 - **`cwd_slug` keys session folders on the raw cwd string, through an unstable
-  hash — needs a decision.** Two problems in `hrdr-agent`'s `paths::cwd_slug`.
-  (1) Windows keeps whatever drive and path case the shell was started with (VS
-  Code's terminal uses `c:\`), so one project can get two session folders and
-  `/resume` cannot see the other's sessions (inferred, not reproduced). (2) The
-  16-hex suffix comes from `std::hash::DefaultHasher`, whose algorithm Rust
-  documents as unspecified and free to change between releases: a toolchain bump
-  could re-key every session folder, hiding all saved sessions and per-project
-  memory at once (verified by reading the code; no release has done it yet).
-  Fixing either changes every existing slug, so it needs a migration. **Question
-  for the owner:** switch to a specified hash (e.g. SHA-256 via the existing
+  **[Deferred — question for the owner; see the index at the top]** hash — needs
+  a decision.** Two problems in `hrdr-agent`'s `paths::cwd_slug`. (1) Windows
+  keeps whatever drive and path case the shell was started with (VS Code's
+  terminal uses `c:\`), so one project can get two session folders and `/resume`
+  cannot see the other's sessions (inferred, not reproduced). (2) The 16-hex
+  suffix comes from `std::hash::DefaultHasher`, whose algorithm Rust documents
+  as unspecified and free to change between releases: a toolchain bump could
+  re-key every session folder, hiding all saved sessions and per-project memory
+  at once (verified by reading the code; no release has done it yet). Fixing
+  either changes every existing slug, so it needs a migration. **Question for
+  the owner:** switch to a specified hash (e.g. SHA-256 via the existing
   `hrdr_llm::sha256_hex`) over a normalized cwd (case-folded drive on Windows),
   and on lookup fall back to the legacy slug, moving the folder when found? Or
   keep today's keys and accept both risks? The fallback costs one extra
   directory probe per session lookup and a rename on first use.
 - **`sandbox_denial_note` only recognises EROFS wording — question for the
-  owner.** A Low-integrity write refusal on Windows gives no marker of its own;
-  evidence captured 2026-10-15 on Windows 11 with a Low-labelled `cmd.exe`
+  **[Deferred — question for the owner; see the index at the top]** owner.** A
+  Low-integrity write refusal on Windows gives no marker of its own; evidence
+  captured 2026-10-15 on Windows 11 with a Low-labelled `cmd.exe`
   (`whoami /groups` confirmed `Low Mandatory Level`): `cmd` prints
   `Access is denied.` and PowerShell prints
   `Access to the path '<path>' is denied.` — word for word what an ordinary ACL
@@ -3720,7 +3757,8 @@ closed 2026-09-04.)
 
 **Re-confirmed open from 2026-08-30:**
 
-- **08-30 #5, by decision** — `gate_rank` (gate.rs:75-83) vs `kind_rank`
+- **08-30 #5, by decision** **[Deferred — question for the owner; see the index
+  at the top]** — `gate_rank` (gate.rs:75-83) vs `kind_rank`
   (verification.rs:346-354): identical Format…Test mapping, still deliberately
   held apart by the comment at gate.rs:70-73 ("three different questions that
   only look alike"). Re-confirmed open; merged only if the duplication is wanted
