@@ -2747,9 +2747,7 @@ mod scoped_cwd_tests {
 
         // …including through a symlink, which is why the check is on the canonical
         // path rather than on the string.
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/", parent.join("escape")).unwrap();
+        if hrdr_test_support::symlink_or_skip(parent.parent().unwrap(), &parent.join("escape")) {
             let err = resolve_subagent_cwd(Some("escape"), &parent, SandboxMode::Jail, false)
                 .expect_err("a symlink out is still out")
                 .to_string();
