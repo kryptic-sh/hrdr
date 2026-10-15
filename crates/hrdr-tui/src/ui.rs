@@ -1610,7 +1610,9 @@ fn pack_loader_segments(segments: &[String], width: usize) -> Vec<String> {
             first = false;
         } else {
             let joined = format!("{line} · {seg}");
-            if joined.chars().count() <= width {
+            // Display cells, not chars: a wide (CJK) segment takes two cells
+            // per char and would overrun a row measured in chars.
+            if joined.width() <= width {
                 line = joined;
             } else {
                 out.push(std::mem::take(&mut line));
@@ -6668,6 +6670,27 @@ mod block_tests {
             pack_loader_segments(&[" ⠦ inferring".into(), "".into(), "3.0s".into()], 200),
             vec![" ⠦ inferring · 3.0s"]
         );
+    }
+
+    /// Rows are measured in display cells: a segment of wide characters (a CJK
+    /// session name, say) takes two cells per char, so packing by char count
+    /// would run past the row.
+    #[test]
+    fn loader_segments_pack_by_display_width() {
+        let segments = vec![
+            " ⠦ generating".to_string(),
+            "会话名称很长的会话".to_string(),
+        ];
+        // " ⠦ generating · " is 16 cells, the name 18: 34 in all, but 25 chars.
+        let lines = pack_loader_segments(&segments, 30);
+        assert_eq!(
+            lines.len(),
+            2,
+            "34 cells cannot share a 30-cell row: {lines:?}"
+        );
+        for line in &lines {
+            assert!(line.width() <= 30, "each row fits its cells: {line:?}");
+        }
     }
 
     /// A `task` call's long prompt renders in full — a tool call is either its
