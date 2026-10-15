@@ -524,8 +524,9 @@ A fresh `:perf` run over the whole tree (working tree clean at the time). Items
 Every finding was re-verified at its cited lines before recording; one candidate
 from the run was dropped (item 4).
 
-**Status: item 1 open (needs a decision); items 2-4 dropped — not fixable as
-proposed, or disproved at review time.** Each item carries its own tag below.
+**Status: item 1 (the per-round full-history save) shipped 2026-10-15 as the
+round journal; items 2-4 dropped — not fixable as proposed, or disproved at
+review time.** Each item carries its own tag below.
 
 2. **~3-4 heap allocations per streamed token.** **[dropped — infeasible: the
    event must survive to the frontend's `on_event` (`registry.rs:880-883`), so
@@ -556,10 +557,9 @@ proposed, or disproved at review time.** Each item carries its own tag below.
    archived #7's "per-stage history clone in the ladder sizing" was not examined
    here.
 
-**Not settled without profiling:** whether the per-round save (item 1) actually
-dominates wall time (the fsyncs are the suspect, not the serialize), the
-per-frame transcript layout loop (`ui.rs:880-916`) at very long transcripts, and
-item 2's real lock-contention timing.
+**Not settled without profiling:** the per-frame transcript layout loop
+(`ui.rs:880-916`) at very long transcripts, and item 2's real lock-contention
+timing.
 
 ## Tidy review 2026-08-04
 
@@ -582,15 +582,6 @@ its cited lines, behavior-preserving only, ranked by confidence.
 reasons); the `sandbox.rs:545` home_dir copy (wrong dependency direction); the
 `split_whitespace().join(" ")` idiom; `sandbox.rs:1255`'s `#[allow(dead_code)]`
 is a Windows-only backend in real use.
-
-## Correctness review 2026-08-04
-
-`:review` (low depth) over the whole tree, split across two passes (hrd-agent +
-hrd-llm; hrdr-tools + hrdr-tui + hrdr-app + hrdr-editor + apps/hrdr). Everything
-the passes suspected was disproved, shipped, or is hardening; the lists are
-under Cleared and Hardening notes.
-
-**Status: both findings shipped.**
 
 ## Deferred 2026-08-10 — strict YAML memory frontmatter
 
@@ -1759,14 +1750,9 @@ session-wide while the compaction is now per-pane:
 ## dispatch.rs review — findings 2026-08-02
 
 `hrdr-app/src/commands/dispatch.rs` was read in full for the first time, with
-its sibling modules, the `CommandHost` trait and its call site. The finding
-below is traced from source — nothing was reproduced at runtime.
-
-**`/cwd` and `/status` on a sub-agent pane — resolved 2026-10-15 by the owner's
-call.** Both read the viewed agent's directory now; `/cwd <path>` is refused
-there ("switch to the main pane"), since moving is the session's move
-(`CommandHost::viewing_sub_agent`; test
-`cwd_on_a_sub_agent_pane_reports_it_and_refuses_to_move`).
+its sibling modules, the `CommandHost` trait and its call site. Its one finding
+(`/cwd` and `/status` on a sub-agent pane) shipped 2026-10-15; what is left is
+the record of what was checked.
 
 **Checked and fine, so nobody re-derives it:** the `bool` contract is sound —
 every in-arm return is `true`, only the unknown arm and the non-`/` guard return
@@ -1790,6 +1776,15 @@ are `#[cfg]`- gated and were not compiled.
 ## Known behaviour to revisit
 
 Not bugs; things whose surprise is worth having written down.
+
+- **The memory cache can be off entirely on a Windows dev box.**
+  `mtime_granularity_is_fine` (`hrdr-tools/src/memory.rs`) probes three rapid
+  writes, and a root whose mtimes do not separate them is never cached, so
+  `load_memories` re-reads every file on each call. Observed 2026-10-16: in a
+  `tempfile` directory on this Windows 11 machine, two loads did not share the
+  cached memory until the test forced the verdict
+  (`a_cache_hit_shares_the_cached_memory`). Correct by design (a stale hit is
+  worse than a re-read); it only means the cache's win is platform-dependent.
 
 - **A worktree sharing `CARGO_TARGET_DIR` leaves stale guard binaries.**
   `hrdr-test-support`'s `workspace_root` is `env!("CARGO_MANIFEST_DIR")`, baked
@@ -2930,7 +2925,8 @@ sub-agents — hrdr-agent + hrdr-app + hrdr-editor; and hrdr-llm + hrdr-tools +
 hrdr-tui + hrdr-test-support + apps/hrdr. Every candidate re-traced at its cited
 lines by the sweep lead. **Status: 5 shipped 2026-08-14/15 — the TUI idle
 redraw + completion memo, tool-args parse-once, ToolEnd move, grep newline
-offsets, and the attachment digest memo. 2 open (deferred, reasons inline).**
+offsets, and the attachment digest memo; the memory cache serves a hit by `Arc`
+(2026-10-16). 1 open (deferred, reason inline).**
 
 1. **One whole-history copy is left per round, and only while a save is still
    writing.** The rest shipped 2026-10-15. A background run no longer snapshots
@@ -2943,25 +2939,18 @@ offsets, and the attachment digest memo. 2 open (deferred, reasons inline).**
    enqueue time on purpose, so a `/rename` or `/clear` cannot interleave with
    the write (see `enqueue_save`'s doc comment). Capturing it at promote time
    instead would change that contract, and this copy only happens when writes
-   back up.
-2. **The memory mtime-cache hit `cloned()`s the whole memory**
-   (`hrdr-tools/src/memory.rs`) before the mtime filter, once per opening user
-   message. The other half of this item — lowercasing every body per recall
-   token — was fixed 2026-10-14 (`Lowered`). Sub-millisecond, dwarfed by the LLM
-   round trip. **Deferred 2026-08-14 as "borderline micro — fix while touching
-   the code"** (serve the cached memory by `Arc`/`Rc`).
-
-**Already optimized (traced and cleared — do not re-hunt):** session save path
-(created-cache, compact JSON, transcript in a sibling jsonl, off-thread);
-session listing per `/resume` keystroke (mtime-keyed `meta_cache`); compaction
-(single elision build, estimator, ladder pre-sizing, `compaction_tail_start`
-bounded by `DEFAULT_TAIL_TURNS = 2`); streaming transcript fold (per-chunk hash
-fold, coalesced jsonl writes); per-turn tool-token estimate hoisted out of the
-round loop; memory recall mtime-cache; memoized cost rates; probed-once context
-window; editor wrap-layout memo per frame; file index lowercased once at build;
-SSE decode (`Cow::Borrowed` for valid UTF-8); catalog `cached_read` (mtime +
-`Arc`); shell ingest (memoized secret check, bounded to tool calls); sandbox
-`is_under_any` (linear over a handful of roots, per tool call).
+   back up. **Already optimized (traced and cleared — do not re-hunt):** session
+   save path (created-cache, compact JSON, transcript in a sibling jsonl,
+   off-thread); session listing per `/resume` keystroke (mtime-keyed
+   `meta_cache`); compaction (single elision build, estimator, ladder
+   pre-sizing, `compaction_tail_start` bounded by `DEFAULT_TAIL_TURNS = 2`);
+   streaming transcript fold (per-chunk hash fold, coalesced jsonl writes);
+   per-turn tool-token estimate hoisted out of the round loop; memory recall
+   mtime-cache; memoized cost rates; probed-once context window; editor
+   wrap-layout memo per frame; file index lowercased once at build; SSE decode
+   (`Cow::Borrowed` for valid UTF-8); catalog `cached_read` (mtime + `Arc`);
+   shell ingest (memoized secret check, bounded to tool calls); sandbox
+   `is_under_any` (linear over a handful of roots, per tool call).
 
 **Coverage:** traced end-to-end — hrdr-llm (sse, capped_read, client stream,
 retry, catalog, media, pdf), hrdr-tools (read, replace, shell, watch, find,
@@ -3294,14 +3283,11 @@ the traced interfaces.
 candidate verified at its cited lines (top items by the sweep lead; clippy
 `--workspace --all-targets --all-features -D warnings` is clean in all crates —
 compiler-verified dead code is none anywhere). **Status: eight items shipped
-2026-08-30 and are not listed; five remain open — recorded, not applied.**
-Findings 1–2 of wave 1 and 1–4 of wave 3 are safe, behavior-preserving dedups;
-nothing behavior-changing proposed.
+2026-08-30, and the `tool_lines` preview dedup shipped later; none are listed.
+Of what remains, one is declined and one is left to the owner.** Findings 1–2 of
+wave 1 and 1–4 of wave 3 are safe, behavior-preserving dedups; nothing
+behavior-changing proposed.
 
-1. **Tool-preview head/tail logic duplicated across three arms of `tool_lines`**
-   — `hrdr-tui/src/ui.rs`: mutation-preview head re-implements `preview_head`;
-   the two tail arms differ only in marker wording. Route all arms through
-   shared helpers.
 2. **Test-suite dedups — the rest declined 2026-10-14.** `tui_pty.rs` now reads
    through `common::drain_pty`. Declined: merging
    `chrome_line`/`chrome_fragment` (`apps/hrdr/src/main.rs`) — they differ in
