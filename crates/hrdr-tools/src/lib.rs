@@ -1500,7 +1500,7 @@ pub(crate) fn guard_secret_read(path: &std::path::Path, unix_style_paths: bool) 
 /// Context lines matter as much as match lines: with `-C`, a `.env` line adjacent
 /// to a match is emitted as `path-NN-SECRET=value`, the `-`-delimited form, and a
 /// filter that only recognised `path:NN:…` would let that straight through even
-/// though the *match* line for the same file was dropped. [`line_path_token`]
+/// though the *match* line for the same file was dropped. [`line_path_tokens`]
 /// recognises either delimiter.
 ///
 /// Verdicts are memoized per path token for the run's lifetime: `rg -n`/`grep -n`
@@ -1516,14 +1516,19 @@ pub(crate) struct SecretLineMemo {
 }
 
 impl SecretLineMemo {
+    /// Whether `line` came from a secret file. Every path the line could be read
+    /// as is checked, not only the first: a file named `notes-1-x` makes
+    /// `notes-1-x-12-KEY=…` parse as `notes` first, and a crafted name could
+    /// otherwise hide a secret line behind an innocent prefix. `--` group
+    /// separators and lines of neither shape ride along.
     pub(crate) fn is_secret_line(&mut self, line: &str, cwd: &std::path::Path) -> bool {
-        let Some(tok) = line_path_token(line) else {
-            return false; // `--` group separators and unrecognized lines ride along
-        };
-        if tok.is_empty() {
-            return false;
-        }
-        let joined = cwd.join(tok);
+        line_path_tokens(line)
+            .into_iter()
+            .filter(|tok| !tok.is_empty())
+            .any(|tok| self.is_secret_path(cwd.join(tok)))
+    }
+
+    fn is_secret_path(&mut self, joined: PathBuf) -> bool {
         if let Some(&verdict) = self.verdicts.get(&joined) {
             return verdict;
         }
@@ -1533,41 +1538,33 @@ impl SecretLineMemo {
     }
 }
 
-/// Extract the leading path token from a ripgrep/POSIX-`grep` `-C`-style
-/// search-output line: `path:NN:content` (a match) or `path-NN-content`
-/// (context), where `NN` is the line number. Tries the `:` form first, then
-/// the `-` form, since a match line's path could itself contain `-`. Returns
-/// `None` for a `--` group separator or any line that doesn't fit either
-/// shape (so it's left alone rather than misparsed).
-fn line_path_token(line: &str) -> Option<&str> {
+/// Every leading path token a ripgrep/POSIX-`grep` `-C`-style search-output
+/// line could carry: `path:NN:content` (a match) or `path-NN-content`
+/// (context), where `NN` is the line number. A path may itself contain such a
+/// run, so each `sep<digits>sep` run of either separator yields a candidate —
+/// the real path is one of them. Empty for a `--` group separator or a line of
+/// neither shape (left alone rather than misparsed).
+fn line_path_tokens(line: &str) -> Vec<&str> {
     if line == "--" {
-        return None;
+        return Vec::new();
     }
+    let mut tokens = Vec::new();
     for sep in [':', '-'] {
-        if let Some(tok) = path_token_with_sep(line, sep) {
-            return Some(tok);
+        let mut i = 0;
+        while let Some(rel) = line[i..].find(sep) {
+            let pos = i + rel;
+            let after = pos + sep.len_utf8();
+            let digits_end = line[after..]
+                .find(|c: char| !c.is_ascii_digit())
+                .map(|d| after + d)
+                .unwrap_or(line.len());
+            if digits_end > after && line[digits_end..].starts_with(sep) {
+                tokens.push(&line[..pos]);
+            }
+            i = after;
         }
     }
-    None
-}
-
-/// [`line_path_token`] for one candidate separator: scans for the first
-/// `sep<digits>sep` run and returns everything before it.
-fn path_token_with_sep(line: &str, sep: char) -> Option<&str> {
-    let mut i = 0;
-    while let Some(rel) = line[i..].find(sep) {
-        let pos = i + rel;
-        let after = pos + sep.len_utf8();
-        let digits_end = line[after..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map(|d| after + d)
-            .unwrap_or(line.len());
-        if digits_end > after && line[digits_end..].starts_with(sep) {
-            return Some(&line[..pos]);
-        }
-        i = pos + sep.len_utf8();
-    }
-    None
+    tokens
 }
 
 /// A model-callable tool.
@@ -3335,6 +3332,19 @@ mod tests {
         // The `-C` group separator between disjoint windows isn't mistaken for
         // a path.
         assert!(!memo.is_secret_line("--", dir.path()));
+    }
+
+    /// A secret file whose own name holds a `-NN-` run is still recognised: its
+    /// context line `notes-1-x.pem-3-…` first reads as the innocent `notes`, and
+    /// stopping at that first reading would let the key through.
+    #[test]
+    fn a_secret_line_is_caught_past_an_innocent_leading_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes"), "plain\n").unwrap();
+        std::fs::write(dir.path().join("notes-1-x.pem"), "PRIVATE KEY\n").unwrap();
+        let mut memo = SecretLineMemo::default();
+        assert!(memo.is_secret_line("notes-1-x.pem-3-PRIVATE KEY", dir.path()));
+        assert!(!memo.is_secret_line("notes-3-plain", dir.path()));
     }
 
     /// The memo's contract: a path's verdict is a per-run snapshot taken at

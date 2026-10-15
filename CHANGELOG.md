@@ -202,6 +202,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Search output from a secret file is hidden even when the file's name looks
+  like a line number.** The filter that keeps credential files out of `shell`
+  search results read each line's path from its first `-NN-` run, so a secret
+  file named like `notes-1-x.pem` was taken for `notes` and its lines shown. It
+  now checks every path the line could name (`crates/hrdr-tools`).
 - **A read-only agent's `tools:` list can no longer grant it a write tool.** An
   explicit allow-list replaced the read-only tool set outright, so a read-only
   profile that named `memory` got it — and `memory` writes outside the sandbox's

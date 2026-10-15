@@ -1976,10 +1976,6 @@ overrides it). Residual, recorded as hardening below.
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
   then `atomic_write` re-opens the path (`mutation.rs:150-153`); a symlink swap
   between the two could redirect a write. Same-user, no privilege boundary.
-- The secret-line filter's `-`-delimited token parse
-  (`SecretLineMemo::is_secret_line` → `line_path_token` in `hrdr-tools`) takes
-  the first `sep<digits>sep` run, so it can mis-attribute a line to a wrong path
-  prefix — a crafted filename can false-negative the courtesy filter.
 - Landlock grants full `AccessFs::from_all` (incl. `REFER`) on writable roots —
   safe only because the `/` rule lacks REFER on the source side of a cross-root
   rename; the `NotEnforced` → refuse-spawn check is the backstop.
