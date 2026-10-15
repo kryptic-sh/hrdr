@@ -66,6 +66,13 @@ only the list. Delete a line when its question is answered.
   per-call escalation, a "something changed" channel, session env vars for shell
   commands (default off), and a truncation-cap experiment. _Peer-comparison
   findings still open._
+- **The guardrail-to-model escalations** — `AGENTS.md` content scanning (wants
+  evidence of a real attempt first), teeth for the test nudge, and an evidence
+  gate that judges relevance. _Top of the list._
+- **Provider divergences** — reasoning replay keyed on the field rather than the
+  model, which statuses retry, more `retry_after` phrasings (wants real provider
+  messages), and unknown Anthropic stop reasons. Each is pinned by a test.
+  _Provider divergences left open by decision._
 - **Drop the `apply_cache_breakpoints` re-export from `hrdr-llm`** — a
   public-API break for a published crate. _Tidy review 2026-08-04 #9._
 - **Manual smokes that need the owner's environment** — `watch` against a real
