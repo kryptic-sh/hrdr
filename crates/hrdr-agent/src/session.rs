@@ -1040,7 +1040,114 @@ fn created_cache() -> &'static Mutex<HashMap<PathBuf, u64>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The first line of a session's journal: which `.json` it extends — how many
+/// messages that file holds, and an anchor on the last of them — so a journal
+/// left behind by a crash is never replayed onto a different history (a later
+/// full save, a compaction that happens to land on the same count).
+#[derive(Serialize, Deserialize)]
+struct JournalHead {
+    base: usize,
+    anchor: String,
+}
+
+/// One append to a session's journal: the messages one tool round added, in
+/// the same persisted form the `.json` uses.
+#[derive(Serialize, Deserialize)]
+struct JournalChunk {
+    #[serde(with = "persisted_messages")]
+    messages: Vec<Message>,
+}
+
+/// `<id>.rounds` beside `<id>.json`: the round journal. (Not the handoff
+/// journal, which is `<id>.handoff`.)
+fn journal_file(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{}.rounds", sanitize_name(id)))
+}
+
+/// What a journal's head anchors on: the SHA-256 of the last of `messages` in
+/// persisted form (empty for none). Stable across processes, unlike `Hash`.
+pub fn journal_anchor(messages: &[Message]) -> String {
+    messages.last().map_or_else(String::new, |last| {
+        let chunk = JournalChunk {
+            messages: vec![last.clone()],
+        };
+        serde_json::to_string(&chunk)
+            .map(|json| hrdr_llm::sha256_hex(json.as_bytes()))
+            .unwrap_or_default()
+    })
+}
+
+/// Append each journal chunk to `messages` when the journal extends exactly
+/// them; otherwise leave them untouched. A torn last line — a crash mid-append
+/// — ends the replay at the last complete chunk.
+fn replay_journal(path: &Path, messages: &mut Vec<Message>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut lines = text.lines();
+    let Some(head) = lines
+        .next()
+        .and_then(|line| serde_json::from_str::<JournalHead>(line).ok())
+    else {
+        return;
+    };
+    if head.base != messages.len() || head.anchor != journal_anchor(messages) {
+        return;
+    }
+    for line in lines {
+        let Ok(chunk) = serde_json::from_str::<JournalChunk>(line) else {
+            break;
+        };
+        messages.extend(chunk.messages);
+    }
+}
+
 impl Session {
+    /// Append one tool round's new `messages` to the session's journal, the
+    /// cheap per-round write: the full `.json` is rewritten only by
+    /// [`Self::save`], at turn end, which also drops the journal.
+    ///
+    /// `base` is the `.json`'s message history as it stands on disk. With
+    /// `fresh` the journal is started over for that base; otherwise the chunk is
+    /// appended to the journal already open for it, and a missing journal is an
+    /// error (the caller falls back to a full save).
+    pub fn append_journal(
+        cwd: &str,
+        id: &str,
+        base: &[Message],
+        fresh: bool,
+        messages: &[Message],
+        unix_style_paths: bool,
+    ) -> Result<()> {
+        let path = journal_file(&session_dir(cwd), id);
+        let mut out = String::new();
+        if fresh {
+            out.push_str(&serde_json::to_string(&JournalHead {
+                base: base.len(),
+                anchor: journal_anchor(base),
+            })?);
+            out.push('\n');
+        }
+        out.push_str(&serde_json::to_string(&JournalChunk {
+            messages: messages.to_vec(),
+        })?);
+        out.push('\n');
+        let mut opts = hrdr_llm::owner_only_options();
+        if fresh {
+            opts.write(true).create(true).truncate(true);
+        } else {
+            opts.append(true);
+        }
+        let shown = || hrdr_tools::display_path(&path, unix_style_paths);
+        let mut f = opts
+            .open(&path)
+            .with_context(|| format!("opening {}", shown()))?;
+        f.write_all(out.as_bytes())
+            .and_then(|()| f.sync_data())
+            .with_context(|| format!("writing {}", shown()))?;
+        Ok(())
+    }
+
     /// Save as `<cwd-slug>/<id>.json` (the cwd comes from `self.cwd`); returns
     /// the written path.
     pub fn save(&self, id: &str, unix_style_paths: bool) -> Result<PathBuf> {
@@ -1114,6 +1221,10 @@ impl Session {
         if compressed.exists() {
             let _ = std::fs::remove_file(&compressed);
         }
+        // The journal this save supersedes. Failing to remove it is harmless —
+        // its head no longer matches the history just written, so a load never
+        // replays it — and the next fresh journal truncates it.
+        let _ = std::fs::remove_file(journal_file(&dir, id));
         // The reservation lock (`.{id}.lock`) is NOT released here — that is
         // [`Reservation::drop`]'s job, and it is pid-guarded. Removing it here
         // by path would defeat the guard: a lock reaped as stale on a misjudged
@@ -1234,6 +1345,12 @@ impl Session {
             if jsonl.exists() {
                 session.state.transcript = crate::transcript_log::read_transcript(&jsonl);
             }
+            // The rounds committed since the last full save (see
+            // `append_journal`), when the journal extends exactly this file.
+            replay_journal(
+                &path.with_file_name(format!("{stem}.rounds")),
+                &mut session.state.messages,
+            );
         }
         // Put the attachment bytes back on the messages that reference them,
         // verifying each blob against the digest the file recorded. Anything that
@@ -1958,6 +2075,7 @@ fn sweep_dir(dir: &Path, compress_after: Option<u64>, purge_after: Option<u64>) 
                 Ok(s) if !s.state.named_by_user => {
                     let _ = std::fs::remove_file(&path);
                     let _ = std::fs::remove_file(dir.join(format!("{id}.jsonl")));
+                    let _ = std::fs::remove_file(journal_file(dir, &id));
                     let _ = std::fs::remove_dir_all(dir.join("subagents").join(&id));
                     // Its attachment blobs are shared with every other session in
                     // this directory, so they cannot be deleted from here — the
@@ -2653,6 +2771,66 @@ mod tests {
     fn unique_session_id_returns_plain_slug_when_dir_absent() {
         let (id, _res) = unique_session_id("/nonexistent/hrdr/test/path/12345", "my session");
         assert_eq!(id, "my-session");
+    }
+
+    /// The round journal's whole contract: rounds appended after a full save
+    /// come back on load, in order; a full save folds them in and drops the
+    /// journal; a journal that does not extend the file on disk — a stale one
+    /// left by a crash — is never replayed; and a torn last line ends the
+    /// replay at the last whole round.
+    #[test]
+    fn round_journal_replays_only_onto_the_history_it_extends() {
+        with_test_env(|tmp| {
+            let cwd = tmp.path().join("proj").to_string_lossy().to_string();
+            let mut st = state("rounds", &cwd);
+            Session::new(st.clone()).save("rounds", true).unwrap();
+            let base = st.messages.clone();
+            let round = |text: &str| vec![Message::assistant(text)];
+
+            Session::append_journal(&cwd, "rounds", &base, true, &round("one"), true).unwrap();
+            Session::append_journal(&cwd, "rounds", &base, false, &round("two"), true).unwrap();
+            let loaded = Session::load(&cwd, "rounds", true).unwrap();
+            let texts: Vec<_> = loaded
+                .state
+                .messages
+                .iter()
+                .map(|m| m.content.clone().unwrap_or_default())
+                .collect();
+            assert_eq!(texts, ["hi", "one", "two"]);
+
+            // A torn tail — a crash mid-append — ends the replay cleanly.
+            let journal = journal_file(&session_dir(&cwd), "rounds");
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal)
+                .unwrap()
+                .write_all(b"{\"messages\":[{\"role\":\"assi")
+                .unwrap();
+            assert_eq!(
+                Session::load(&cwd, "rounds", true)
+                    .unwrap()
+                    .state
+                    .messages
+                    .len(),
+                3
+            );
+
+            // A full save folds the rounds in and drops the journal.
+            st.messages = loaded.state.messages.clone();
+            Session::new(st.clone()).save("rounds", true).unwrap();
+            assert!(!journal.exists());
+
+            // A stale journal for an older base is never replayed onto this one.
+            Session::append_journal(&cwd, "rounds", &base, true, &round("stale"), true).unwrap();
+            assert_eq!(
+                Session::load(&cwd, "rounds", true)
+                    .unwrap()
+                    .state
+                    .messages
+                    .len(),
+                3
+            );
+        });
     }
 
     #[test]
