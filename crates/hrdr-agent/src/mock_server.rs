@@ -56,11 +56,16 @@ enum MockResp {
     /// can send a `Retry-After`, which the client reads off the real
     /// response headers (see `retry_after_from_headers`).
     HttpErrorWithHeaders(u16, Vec<(String, String)>),
+    /// Read the request and never answer it, holding the connection open: a
+    /// request that stays in flight until the test cancels whatever sent it.
+    Hang,
 }
 
 impl MockResp {
-    fn into_bytes(self) -> Vec<u8> {
-        match self {
+    /// The bytes to write back, or `None` for [`MockResp::Hang`].
+    fn into_bytes(self) -> Option<Vec<u8>> {
+        Some(match self {
+            MockResp::Hang => return None,
             MockResp::Sse(lines) => {
                 let mut body = String::new();
                 for line in &lines {
@@ -113,7 +118,7 @@ impl MockResp {
                 )
                 .into_bytes()
             }
-        }
+        })
     }
 }
 
@@ -166,7 +171,7 @@ impl MockServer {
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(
+        let queue: Arc<Mutex<VecDeque<Option<Vec<u8>>>>> = Arc::new(Mutex::new(
             responses.into_iter().map(MockResp::into_bytes).collect(),
         ));
         let on_request = Arc::new(on_request);
@@ -218,9 +223,16 @@ impl MockServer {
                         String::from_utf8_lossy(&buf[headers_end..headers_end + content_len]);
                     // Send the next queued response. Fire the hook first:
                     // it happens-before the client can observe this reply.
-                    if let Some(resp_bytes) = queue.lock().await.pop_front() {
+                    if let Some(reply) = queue.lock().await.pop_front() {
                         on_request(idx, &hdrs, &body);
-                        let _ = stream.write_all(&resp_bytes).await;
+                        match reply {
+                            Some(resp_bytes) => {
+                                let _ = stream.write_all(&resp_bytes).await;
+                            }
+                            // Keep `stream` alive: dropping it would close the
+                            // connection, which the client sees as an answer.
+                            None => std::future::pending::<()>().await,
+                        }
                     }
                 });
             }
@@ -6811,6 +6823,88 @@ async fn background_subagent_persists_its_own_session_state() {
         "load_path rebuilt the transcript from the sibling jsonl, tool args intact: {:?}",
         session.state.transcript
     );
+}
+
+/// A background run cancelled during a STEERED CONTINUATION is released: its
+/// entry ends neither running nor stuck in flight.
+///
+/// The delegation loop must hand the continuation's turn to its `RunGuard`
+/// (`begin_next_turn`); starting the turn any other way leaves the guard on the
+/// first turn's generation, and the abort then skips the cleanup. The steer is
+/// enqueued while turn 1's request is in flight — after the last point `run`
+/// drains steering — so turn 1's text-only answer ends `run` with it pending and
+/// `continue_or_finish` continues. The continuation's request never gets an
+/// answer, so the run is cancelled there.
+#[tokio::test]
+async fn a_run_cancelled_in_a_steered_continuation_is_released() {
+    use super::AgentRegistry;
+    use hrdr_tools::Tool;
+    let live = AgentRegistry::new();
+    let continuation = Arc::new(tokio::sync::Notify::new());
+    let server = {
+        let live = live.clone();
+        let continuation = Arc::clone(&continuation);
+        MockServer::start_with_hook(
+            vec![
+                MockResp::Sse(vec![
+                    text_chunk("c1", "first answer"),
+                    stop_chunk("c1"),
+                    "[DONE]".to_string(),
+                ]),
+                MockResp::Hang,
+            ],
+            move |idx| match idx {
+                0 => {
+                    let key = live.with(|v| v[0].key);
+                    live.enqueue(key, crate::Steer::plain("and one more thing"));
+                }
+                1 => continuation.notify_one(),
+                _ => {}
+            },
+        )
+        .await
+    };
+    let cwd = tempfile::tempdir().unwrap();
+    let mut cfg = test_cfg(server.base_url(), cwd.path());
+    cfg.read_only = true;
+    let runtime = super::new_delegation_runtime(&cfg, &super::ResolvedModel::from_config(&cfg));
+    let tool = SubagentTool::new(
+        cfg,
+        runtime,
+        Vec::new(),
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        std::sync::Arc::new(std::sync::Mutex::new(0.0f64)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
+        None,
+        live.clone(),
+    );
+    let ctx = hrdr_tools::ToolContext::new(cwd.path());
+    tool.execute(
+        json!({"prompt": "do the sub task", "description": "probe"}),
+        &ctx,
+    )
+    .await
+    .unwrap();
+
+    // The continuation's request is in flight: the steer took the run past
+    // turn 1. Cancel it there, as `task_cancel` does — abort, then await.
+    tokio::time::timeout(std::time::Duration::from_secs(30), continuation.notified())
+        .await
+        .expect("the steer started a continuation turn");
+    let handle = tool
+        .bg_handles
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("a background task handle")
+        .1;
+    handle.abort();
+    let _ = handle.await;
+
+    let (running, done) = live.with(|v| (v[0].running, v[0].done));
+    assert!(!running, "the cancelled continuation is not still running");
+    assert!(done, "and the sub-agent is finished, not stuck in flight");
 }
 
 /// A STEERED turn on a finished sub-agent persists to the SAME durable

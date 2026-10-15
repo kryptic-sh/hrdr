@@ -625,10 +625,10 @@ async fn spawn_background(
                 Ok(())
             }
             .await;
-            // Final snapshot from the agent's settled history: the closing assistant
-            // text lands AFTER the last `History` event, so the in-loop saves above
-            // miss it. Read the retained agent's final messages — the method the
-            // session agent's autosave uses.
+            // The run's one snapshot, from the agent's settled history: the closing
+            // assistant text lands AFTER the last `History` event, so only the
+            // retained agent's final messages hold it — the method the session
+            // agent's autosave uses.
             if snapshot.path.is_some() {
                 let messages = sub.lock().await.messages_owned();
                 snapshot.save(messages, live.usage(live_key).unwrap_or_default());

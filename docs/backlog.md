@@ -3240,9 +3240,9 @@ settled: the `task_cancel`/handle race was already fixed
 drains its live-output forwarders until they close, and `RunGuard` follows a
 steered continuation (`begin_next_turn`). Two of those were live defects — live
 output cut off after 128 chunks, and a sub-agent cancelled mid-continuation left
-`running` forever. Gap: the `RunGuard` regression test pins the guard, not the
-delegation loop's call to it; no test drives a background run through a steered
-continuation and then cancels it.**
+`running` forever. Both the guard and the delegation loop's call to it are
+pinned: `a_run_cancelled_in_a_steered_continuation_is_released` (mock server)
+drives a background run through a steered continuation and cancels it there.**
 
 **Cleared (top of the list):** sandbox escapes (`..` and dangling-symlink
 canonicalization — the dangling case is a documented accepted write-TOCTOU, and
