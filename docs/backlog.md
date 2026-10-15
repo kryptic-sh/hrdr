@@ -2627,9 +2627,9 @@ and **not** fixed.
   `37912493951`; local verification was Windows-only, including a failing
   separator-normalization mutation. Unix old-code red/green remains unrun.
   Directory collision tests assert indexing/acceptance, not distinct listing
-  resolution. The equal-length basename-ranking fixture cannot distinguish
-  lexical tie-breaking from a backslash-as-separator regression; add
-  unequal-length candidates when strengthening ranking coverage.
+  resolution. (The backslash-as-separator ranking regression the equal-length
+  fixture could not catch is now pinned on every platform by
+  `rank_file_matches_splits_basenames_on_slash_only`.)
 - **Cursor rendering verification gaps — reported 2026-10-09.** The user saw
   transcript-to-input cursor flicker in both Alacritty and Windows 11 Terminal.
   `cursor_backend::draw_frame` now hides before frame output and reveals only

@@ -491,6 +491,20 @@ mod tests {
         assert_eq!(rank_file_matches(&files, "").len(), 4);
     }
 
+    /// Only `/` separates index entries; a `\` is part of a unix file name. So
+    /// `x\b.txt` is one file whose name merely contains `b.txt`, and ranks below
+    /// a real `b.txt` basename even though its path is shorter. A ranking that
+    /// split on `\` too would put it first. (Equal-length candidates cannot tell
+    /// those apart: `/` also sorts before `\`.)
+    #[test]
+    fn rank_file_matches_splits_basenames_on_slash_only() {
+        let files: Vec<(String, String)> = [r"x\b.txt", "aa/b.txt"]
+            .into_iter()
+            .map(|p| (p.to_string(), p.to_string()))
+            .collect();
+        assert_eq!(rank_file_matches(&files, "b.txt"), ["aa/b.txt", r"x\b.txt"]);
+    }
+
     /// Ranking trusts the precomputed lowercase half of each entry — the
     /// case-insensitive contract is established when the index is built
     /// (`spawn_file_index`), not per keystroke. A mixed-case path must still
