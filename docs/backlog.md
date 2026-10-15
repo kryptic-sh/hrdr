@@ -2932,14 +2932,18 @@ lines by the sweep lead. **Status: 5 shipped 2026-08-14/15 — the TUI idle
 redraw + completion memo, tool-args parse-once, ToolEnd move, grep newline
 offsets, and the attachment digest memo. 2 open (deferred, reasons inline).**
 
-1. **The whole message history is deep-cloned per committed round.** The
-   sub-agent half shipped 2026-10-15: a background run no longer snapshots per
-   round, so its clone went with the write. What remains is the main session's
-   own copies — the TUI's `app.rs` History handler clones the history into
-   `persist_mid_turn`, and `enqueue_save` clones the state per save. The writes
-   they feed are now a round-journal append (2026-10-15), so the bytes written
-   per round are O(round); the in-memory copies are still O(history). Left: pass
-   the `Arc` through instead of cloning.
+1. **One whole-history copy is left per round, and only while a save is still
+   writing.** The rest shipped 2026-10-15. A background run no longer snapshots
+   per round. A main-session round copies only the messages it added into the
+   app's state (`persist_mid_turn` extends it, unless the anchor shows a
+   rewrite). A round-journal append needs no state copy at all
+   (`enqueue_save_as` → `plan_round`). What is left: when a round arrives while
+   the previous write is still in flight, `enqueue_save_as` clones the whole
+   `SessionState` into `pending_save`. Deferred: the snapshot is captured at
+   enqueue time on purpose, so a `/rename` or `/clear` cannot interleave with
+   the write (see `enqueue_save`'s doc comment). Capturing it at promote time
+   instead would change that contract, and this copy only happens when writes
+   back up.
 2. **The memory mtime-cache hit `cloned()`s the whole memory**
    (`hrdr-tools/src/memory.rs`) before the mtime filter, once per opening user
    message. The other half of this item — lowercasing every body per recall

@@ -248,7 +248,7 @@ impl super::App {
     /// The state mutation stays on the UI thread; the serialize + atomic write
     /// move to a spawned task once the session has an id (the mint — id +
     /// open-lock — is synchronous and only ever runs here on the UI thread).
-    pub(super) fn persist_mid_turn(&mut self, messages: Vec<hrdr_agent::Message>) {
+    pub(super) fn persist_mid_turn(&mut self, messages: &[hrdr_agent::Message]) {
         let todos = self.todos_snapshot();
         let goals = self.goals_snapshot();
         let crons = self.crons_snapshot();
@@ -257,7 +257,17 @@ impl super::App {
         // wrong cwd slug.
         let cwd = self.current_cwd();
         let state = self.state_mut();
-        state.messages = messages;
+        // A round only appends to the history: copy just what it added. A
+        // history it rewrote (a compaction) is copied whole.
+        let held = state.messages.len();
+        if held <= messages.len()
+            && hrdr_agent::journal_anchor(&messages[..held])
+                == hrdr_agent::journal_anchor(&state.messages)
+        {
+            state.messages.extend_from_slice(&messages[held..]);
+        } else {
+            state.messages = messages.to_vec();
+        }
         state.todos = todos;
         state.goals = goals;
         state.crons = crons;
@@ -455,9 +465,8 @@ impl super::App {
     /// keep the strongest request: one full save among them makes the next
     /// write full.
     fn enqueue_save_as(&mut self, full: bool) {
-        let snapshot = self.state().clone();
         if self.save_in_flight {
-            self.pending_save = Some(snapshot);
+            self.pending_save = Some(self.state().clone());
             self.pending_full |= full;
             return;
         }
@@ -465,7 +474,76 @@ impl super::App {
         // alive until the write attempt ends (its drop removes the `.id.lock`
         // a failed first write would otherwise leave behind).
         let reservation = self.pending_reservation.take();
+        // A round append needs only the round's messages, not a copy of the
+        // whole state.
+        if !full
+            && reservation.is_none()
+            && let Some(plan) = self.plan_round(&self.state().messages, &self.state().cwd)
+        {
+            self.spawn_round(plan);
+            return;
+        }
+        let snapshot = self.state().clone();
         self.spawn_save(snapshot, reservation, full);
+    }
+
+    /// The round-journal append that would bring the files on disk up to
+    /// `messages`, or `None` when they need a full save (see [`journal_tail`]).
+    fn plan_round(&self, messages: &[hrdr_agent::Message], cwd: &str) -> Option<RoundAppend> {
+        let id = self.state().id.clone()?;
+        let cursor = self.round_cursor.clone()?;
+        let tail = journal_tail(&cursor, &id, messages)?;
+        Some(RoundAppend {
+            next: RoundCursor {
+                written: messages.len(),
+                written_anchor: hrdr_agent::journal_anchor(messages),
+                ..cursor.clone()
+            },
+            cursor,
+            id,
+            cwd: cwd.to_string(),
+            tail,
+        })
+    }
+
+    /// Spawn the journal append `plan` describes, through the same single-writer
+    /// slot as a full save.
+    fn spawn_round(&mut self, plan: RoundAppend) {
+        if plan.tail.is_empty() {
+            // Nothing new since the last write: the files already hold it.
+            self.promote_pending_save();
+            return;
+        }
+        let RoundAppend {
+            cursor,
+            next,
+            id,
+            cwd,
+            tail,
+        } = plan;
+        self.round_cursor = Some(next);
+        self.save_in_flight = true;
+        let tx = self.tx.clone();
+        let save_done = self.save_done.clone();
+        let unix_style_paths = self.unix_style_paths();
+        let fresh = cursor.written == cursor.base;
+        tokio::spawn(async move {
+            let res = hrdr_app::Session::append_journal(
+                &cwd,
+                &id,
+                cursor.base,
+                &cursor.base_anchor,
+                fresh,
+                &tail,
+                unix_style_paths,
+            );
+            let _ = tx
+                .send(TurnMsg::SaveDone(
+                    res.map(|()| id).map_err(|e| e.to_string()),
+                ))
+                .await;
+            save_done.notify_one();
+        });
     }
 
     /// Spawn the serialize + atomic-write for `snapshot`. The id is captured
@@ -486,42 +564,9 @@ impl super::App {
             .expect("a save is only spawned after the id exists");
         if !full
             && reservation.is_none()
-            && let Some(cursor) = self.round_cursor.clone()
-            && let Some(tail) = journal_tail(&cursor, &id, &snapshot.messages)
+            && let Some(plan) = self.plan_round(&snapshot.messages, &snapshot.cwd)
         {
-            if tail.is_empty() {
-                // Nothing new since the last write: the files already hold it.
-                self.promote_pending_save();
-                return;
-            }
-            self.round_cursor = Some(RoundCursor {
-                written: snapshot.messages.len(),
-                written_anchor: hrdr_agent::journal_anchor(&snapshot.messages),
-                ..cursor.clone()
-            });
-            self.save_in_flight = true;
-            let tx = self.tx.clone();
-            let save_done = self.save_done.clone();
-            let unix_style_paths = self.unix_style_paths();
-            let cwd = snapshot.cwd.clone();
-            let fresh = cursor.written == cursor.base;
-            tokio::spawn(async move {
-                let res = hrdr_app::Session::append_journal(
-                    &cwd,
-                    &id,
-                    cursor.base,
-                    &cursor.base_anchor,
-                    fresh,
-                    &tail,
-                    unix_style_paths,
-                );
-                let _ = tx
-                    .send(TurnMsg::SaveDone(
-                        res.map(|()| id).map_err(|e| e.to_string()),
-                    ))
-                    .await;
-                save_done.notify_one();
-            });
+            self.spawn_round(plan);
             return;
         }
         // A full save puts the whole history in the `.json` and drops the
@@ -865,4 +910,14 @@ fn journal_tail(
         return None;
     }
     Some(tail.to_vec())
+}
+
+/// A planned round-journal append: the cursor the journal is at, the one it
+/// moves to, and the messages that take it there.
+struct RoundAppend {
+    cursor: RoundCursor,
+    next: RoundCursor,
+    id: String,
+    cwd: String,
+    tail: Vec<hrdr_agent::Message>,
 }

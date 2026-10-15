@@ -2859,10 +2859,16 @@ async fn a_growing_history_journals_rounds_and_a_rewrite_saves_whole() {
     let loaded = hrdr_app::Session::load(&cwd, &id, true).unwrap();
     assert_eq!(loaded.state.messages.len(), grown.len());
 
+    // Longer than what the app holds, so only the anchor tells it apart from
+    // a round that appended.
     let compacted = vec![
         hrdr_agent::Message::user("summary of what came before"),
         hrdr_agent::Message::assistant("carrying on"),
+        hrdr_agent::Message::assistant("step a"),
+        hrdr_agent::Message::assistant("step b"),
+        hrdr_agent::Message::assistant("step c"),
     ];
+    assert!(compacted.len() > grown.len());
     h.inject(round(compacted.clone()));
     h.save_drain().await;
     assert!(!journal.exists(), "a rewritten history is saved whole");
@@ -2886,10 +2892,10 @@ async fn session_write_path_style_save_done_keeps_spawn_preference() {
     for style in [true, false] {
         h.app.cfg.unix_style_paths = style;
         h.app
-            .persist_mid_turn(vec![hrdr_agent::Message::user(r"raw\message")]);
+            .persist_mid_turn(&[hrdr_agent::Message::user(r"raw\message")]);
         assert!(h.app.save_in_flight);
         h.app
-            .persist_mid_turn(vec![hrdr_agent::Message::user(r"pending\message")]);
+            .persist_mid_turn(&[hrdr_agent::Message::user(r"pending\message")]);
         assert!(h.app.pending_save.is_some());
         h.app.cfg.unix_style_paths = !style;
         h.wait_for("first failed save", |msg| {
