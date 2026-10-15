@@ -664,9 +664,11 @@ full-transcript layout walk (`ui.rs:2664` `transcript_chunks` + `:912-918`
 work cheap) and the per-frame cache/save pipeline (autosave turn-end, off-thread
 behind a coalescer).
 
-**Unsettled without profiling:** the per-frame transcript walk's actual share of
-frame time, and the streaming-body re-render per frame for in-flight tool calls
-(bounded by the block's size, but compounds with the walk for long streams).
+**Settled since (2026-10-15):** the per-frame transcript walk was measured — 329
+µs for an unchanged frame at 4800 entries, recorded under
+[Frame cost measured 2026-08-13](#frame-cost-measured-2026-08-13--one-fix-shipped-one-declined)
+— and an in-flight tool call no longer re-renders its body per frame: its static
+rows are cached and only the spinner changes (`ChunkRows::AnimatedChrome`).
 
 ## Dependency upgrades held back, 2026-10-14
 
