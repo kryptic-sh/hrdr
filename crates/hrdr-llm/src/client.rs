@@ -1978,7 +1978,7 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 /// integration binary, which drives the native backends through a `127.0.0.1`
 /// mock to assert the wire log's `sse` and `error_response` records.
 #[doc(hidden)]
-pub async fn serve_response(status_line: &'static str, body: &'static str) -> String {
+pub async fn serve_response(status_line: &'static str, body: impl Into<String>) -> String {
     serve_response_with_headers(status_line, "", body).await
 }
 
@@ -1989,11 +1989,12 @@ pub async fn serve_response(status_line: &'static str, body: &'static str) -> St
 pub(crate) async fn serve_response_with_headers(
     status_line: &'static str,
     extra_headers: &'static str,
-    body: &'static str,
+    body: impl Into<String>,
 ) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    let body = body.into();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -2046,7 +2047,7 @@ pub(crate) async fn serve_response_with_headers(
 /// Serve one canned `200 OK` SSE body like [`serve_response`], for the
 /// library's own unit tests.
 #[cfg(test)]
-pub(crate) async fn serve_once(body: &'static str) -> String {
+pub(crate) async fn serve_once(body: impl Into<String>) -> String {
     serve_response("HTTP/1.1 200 OK", body).await
 }
 
@@ -3268,8 +3269,7 @@ mod tests {
     #[tokio::test]
     async fn stream_decode_error_truncates_a_hostile_payload() {
         let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATAIL_SENTINEL_PAYLOAD_END";
-        let body = Box::leak(format!("{payload}\n\n").into_boxed_str());
-        let base_url = serve_once(body).await;
+        let base_url = serve_once(format!("{payload}\n\n")).await;
 
         let client = Client::new(base_url, None, "test-model");
         let mut stream = client.chat_stream(&[], &[]).await.unwrap();
@@ -3303,8 +3303,7 @@ mod tests {
             "{{\"a\":\"{}\"}}",
             "x".repeat(MAX_STRUCTURED_JSON_BYTES + 64 * 1024)
         );
-        let body = Box::leak(payload.into_boxed_str());
-        let base_url = serve_once(body).await;
+        let base_url = serve_once(payload).await;
 
         let client = Client::new(&base_url, None, "test-model");
         assert!(

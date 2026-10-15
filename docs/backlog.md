@@ -1659,10 +1659,6 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   binary. The cold path and the `ANTHROPIC_MAX_TOKENS` 8192 fallback are pinned;
   the warm resolution rules are covered separately in `catalog`'s own tests.
   Recorded so nobody "closes" it with a test that only appears to work.
-- **`serve_once` takes `&'static str`**, so every mock SSE body must be a
-  literal (the stop-reason tests `Box::leak` theirs). Fine today; it makes a
-  table-driven stream test awkward. `impl Into<String>` is a one-line change
-  when someone needs it.
 - **Host-keyed backend detection is why the native paths were untestable.**
   `detect_backend` reads the host, so every mock on `127.0.0.1` is
   `Backend::OpenAi`, and `Client::chat_stream` never dispatched to

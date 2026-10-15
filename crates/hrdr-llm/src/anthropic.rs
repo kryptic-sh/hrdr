@@ -2705,7 +2705,7 @@ mod tests {
     /// of this module would run. Everything after the byte loop above (the
     /// thinking-block flush, the missing-`message_stop` truncation error) is
     /// reachable from a test only this way.
-    async fn anthropic_stream(body: &'static str) -> (Vec<ChatChunk>, Option<anyhow::Error>) {
+    async fn anthropic_stream(body: impl Into<String>) -> (Vec<ChatChunk>, Option<anyhow::Error>) {
         let base_url = crate::client::serve_once(body).await;
         let mut client = crate::Client::new(base_url, Some("test-key".to_string()), "claude-test");
         client.set_backend_for_test(crate::client::Backend::Anthropic);
@@ -2993,13 +2993,9 @@ mod tests {
     }
 
     /// A one-event stream whose `message_delta` carries `stop_reason`.
-    ///
-    /// `chat_stream`'s mock server takes a `&'static str`, so the body is leaked
-    /// — a few hundred bytes per case, in a test binary that is about to exit.
-    fn stop_reason_stream(stop_reason: &str) -> &'static str {
-        Box::leak(
-            format!(
-                "event: message_start\n\
+    fn stop_reason_stream(stop_reason: &str) -> String {
+        format!(
+            "event: message_start\n\
                  data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":7}}}}}}\n\n\
                  event: content_block_delta\n\
                  data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"half an ans\"}}}}\n\n\
@@ -3007,13 +3003,11 @@ mod tests {
                  data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
                  event: message_stop\n\
                  data: {{\"type\":\"message_stop\"}}\n\n"
-            )
-            .into_boxed_str(),
         )
     }
 
     /// Fold a stream the way the agent's turn loop does.
-    async fn accumulate(body: &'static str) -> crate::Accumulator {
+    async fn accumulate(body: String) -> crate::Accumulator {
         let (chunks, err) = anthropic_stream(body).await;
         assert!(err.is_none(), "clean stream: {:#}", err.unwrap());
         let mut acc = crate::Accumulator::new();
