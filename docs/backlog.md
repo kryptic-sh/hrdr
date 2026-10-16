@@ -186,12 +186,20 @@ push each verified slice to `main` before proceeding to the next slice.
    moved to the release smoke job and past discovery: the peer was listed, then
    never received the message (`peer open: true, stopped by: None`). The mock
    model says `SENT_TO_PEER` whatever `message_session` returned, so the test
-   now prints that tool's answer on this failure too. Not reproduced locally (12
-   runs of the two messaging tests together, 6 of the full `tui_pty` suite,
-   Windows, pinned host). No test covers `stopped_by` being set: nothing can
-   make a pipe accept fail on demand. Same day, one parallel `local_ipc` run
-   failed `native_cross_process_rejects_malformed_truncated_and_stalled_frames`
-   after stalling for 43s; four reruns passed in ~5s. Real-process coverage:
+   now prints that tool's answer on this failure too. That answer arrived on the
+   next recurrence (`bbf1ddd4`, run 38952539010, Windows leak-guard job,
+   2026-10-16, `peer open: true, stopped by: None`): `message_session` said "no
+   running session has session_id … in "/pty-peer"" after 428 ms. The tool
+   re-runs discovery (`peers` in `messaging_tools.rs`) rather than reusing the
+   `sessions` listing, so this is the discovery flake again, not delivery: the
+   live peer dropped out of a second listing moments after the first one found
+   it. The same commit's tag run passed every job, this one included. Not
+   reproduced locally (12 runs of the two messaging tests together, 6 of the
+   full `tui_pty` suite, Windows, pinned host). No test covers `stopped_by`
+   being set: nothing can make a pipe accept fail on demand. Same day, one
+   parallel `local_ipc` run failed
+   `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
+   stalling for 43s; four reruns passed in ~5s. Real-process coverage:
    `tests/tui_pty.rs` (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`:
    tools, peer wake, shutdown leaves discovery) and
    `tests/headless_messaging.rs` (busy delivery, disabling), on the CI matrix;
