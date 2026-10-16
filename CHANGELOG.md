@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-17
+
+### Breaking
+
+- **Path-rendering library functions take a `unix_style_paths: bool`.** Every
+  public function that writes a path into user-visible text or onto disk now
+  takes the flag explicitly instead of reading it from global state, among them
+  `hrdr_agent::Session::{save, save_to_path, load, load_path, open, open_path, fork}`,
+  `list_sessions`, `resolve_session`, `save_session`, `trust`,
+  `save_auth_token`, `save_oauth`, `persist_setting`, `remove_setting`,
+  `discover_agent_profiles`, `write_blobs`, `skill_prompt`, `tool_display`,
+  `environment_section`, `sandbox_section`; `hrdr_app`'s `resume_plan`,
+  `prompt_entries`, `expand_mentions`, `session_list_text`, `theme_choices`,
+  `login_key_warning`, `reload_hot_message`; `hrdr_tools`'s `guard_not_swapped`,
+  `read_attach_dir`, `validate_attach_path`, `sandbox_denial_note`,
+  `SandboxPolicy::{check_read, check_write}` and
+  `LspRegistry::diagnostics_note`; and `hrdr_tui::trust_prompt::ask_trust`.
+- **`hrdr_llm::take_client_warning` returns `Option<ClientWarning>`** rather
+  than a bare string.
+- **`AgentRegistry::take_newest_pending` is now `take_newest_human_pending`**,
+  and skips peer messages, which keep their provenance.
+
 ### Added
 
 - **A refused write in Windows read-only mode now says it may be the sandbox.**
@@ -7973,7 +7995,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/kryptic-sh/hrdr/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/kryptic-sh/hrdr/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/kryptic-sh/hrdr/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/kryptic-sh/hrdr/compare/v0.15.2...v0.15.3
