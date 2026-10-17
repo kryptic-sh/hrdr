@@ -668,14 +668,16 @@ review time.** Each item carries its own tag below.
    running prompt-token estimate, add only messages appended since the last
    call. Same as the archived review's #5, still open.
 4. **Dropped: compaction "overlapping suffixes".** The run claimed
-   `compaction.rs:451-452` re-sums a growing slice per candidate turn — the
+   `compaction_tail_start` re-sums a growing slice per candidate turn — the
    archived first review's #7 made the same claim. It does not reproduce: the
    loop walks candidates newest→oldest with `tail_start` set to each `start`, so
    every `estimate_tokens_in_messages(&msgs[start..tail_start])` covers one
    disjoint turn; total work is O(tail), which the budget check needs.
-   `mega_turn_tail_start` (`:505-506`) estimates single messages — fine. The
-   archived #7's "per-stage history clone in the ladder sizing" was not examined
-   here.
+   `mega_turn_tail_start` estimates single messages — fine. The archived #7's
+   "per-stage history clone in the ladder sizing" does not reproduce either
+   (checked 2026-10-18): `first_viable_compact_stage` builds the elided history
+   once, memoized in its `elided` argument, and `estimate_tail_window` sizes
+   each tail stage over a slice of it.
 
 **Not settled without profiling:** the per-frame transcript layout loop
 (`draw_transcript`, `ui.rs`) at very long transcripts, and item 2's real
