@@ -1558,8 +1558,10 @@ impl App {
                 }
                 // Ctrl+G: hand the buffer off to $EDITOR (only when idle).
                 KeyCode::Char('g') if !self.running() => return Action::OpenEditor,
-                // Transcript scroll — Ctrl+U/Ctrl+D in vim Normal mode only
-                // (plain mode uses these for line editing; PageUp/Down scroll).
+                // Transcript scroll — Ctrl+U/Ctrl+D in vim Normal mode only,
+                // and only while idle: after `d`, Ctrl+D is the operator's
+                // motion (plain mode, always inserting, uses these for line
+                // editing; PageUp/Down scroll).
                 //
                 // Ctrl+D used to quit on an empty input, shell-style, and that
                 // arm sat above this one so it won even in Normal mode. It is
@@ -1568,12 +1570,12 @@ impl App {
                 // keystroke from ending a session by accident, and the two keys
                 // are a pair — Ctrl+U never quit anything. Quitting is Ctrl+Q,
                 // Ctrl+C twice, or `/exit`, all of which say so.
-                KeyCode::Char('u') if self.editor.mode_label() == "NORMAL" => {
+                KeyCode::Char('u') if self.editor.is_idle() && !self.editor.is_insert() => {
                     let half = (self.transcript_height / 2).max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_add(half);
                     return Action::None;
                 }
-                KeyCode::Char('d') if self.editor.mode_label() == "NORMAL" => {
+                KeyCode::Char('d') if self.editor.is_idle() && !self.editor.is_insert() => {
                     let half = (self.transcript_height / 2).max(1) as usize;
                     self.scroll_offset = self.scroll_offset.saturating_sub(half);
                     return Action::None;

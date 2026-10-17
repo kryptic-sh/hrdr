@@ -8700,6 +8700,24 @@ async fn vim_esc_and_enter_finish_the_editor_state_first() {
     assert_eq!(h.app.steering_len_for_test(), 1, "an idle Enter sends");
 }
 
+/// Ctrl+D after a pending `d` is the operator's motion, not a transcript
+/// scroll; once the operator is dropped, Ctrl+D scrolls again.
+#[tokio::test]
+async fn vim_ctrl_d_after_an_operator_does_not_scroll() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.editor = Box::new(hrdr_editor::VimEngine::new());
+    h.app.transcript_height = 20;
+    h.app.scroll_offset = 10;
+    let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+    h.app
+        .on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    h.app.on_key(ctrl_d);
+    assert_eq!(h.app.scroll_offset, 10, "Ctrl+D went to the operator");
+    h.press(KeyCode::Esc);
+    h.app.on_key(ctrl_d);
+    assert!(h.app.scroll_offset < 10, "an idle Ctrl+D scrolls");
+}
+
 /// A plain engine whose every key runs into a clipboard failure — a stand-in
 /// for a vim yank on a machine without a clipboard, which a test cannot cause.
 struct FailingClipboardEngine(hrdr_editor::PlainEngine);
