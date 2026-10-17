@@ -1884,6 +1884,28 @@ mod tests {
             "what is this\n\n--- Attached files ---\nImage 1: `pasted-1.png`\n"
         );
     }
+
+    /// On unix `d\e` is one directory name, not `d/e`: each mention attaches
+    /// its own directory's listing, never the other's. Unix by nature —
+    /// Windows has no backslash in a file name.
+    #[cfg(unix)]
+    #[test]
+    fn colliding_directory_mentions_list_their_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("d/e/nested-child")).unwrap();
+        std::fs::create_dir_all(root.join(r"d\e/literal-child")).unwrap();
+        for style in [false, true] {
+            for (mention, own, other) in [
+                ("@d/e/", "nested-child", "literal-child"),
+                (r"@d\e/", "literal-child", "nested-child"),
+            ] {
+                let out = expand_mentions(&format!("see {mention}"), root, style);
+                assert!(out.contains(own), "{mention} lists {own}:\n{out}");
+                assert!(!out.contains(other), "{mention} lists only its own:\n{out}");
+            }
+        }
+    }
 }
 
 /// The config-watcher debounce. `debounce_loop` is the whole of the coalescing
