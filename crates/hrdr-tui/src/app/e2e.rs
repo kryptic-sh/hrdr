@@ -8661,6 +8661,45 @@ async fn pruning_keeps_the_header_banner_not_a_leading_system_entry() {
     );
 }
 
+/// In vim, Esc and Enter go to a half-finished editor state before the app:
+/// during a turn Esc leaves Visual instead of arming the cancel, and Enter
+/// finishes a `/search` instead of sending the draft.
+#[tokio::test]
+async fn vim_esc_and_enter_finish_the_editor_state_first() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.editor = Box::new(hrdr_editor::VimEngine::new());
+    h.app.registry.begin_turn(hrdr_agent::MAIN_KEY);
+    let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+    for c in "ifoo bar".chars() {
+        h.app.on_key(key(c));
+    }
+    h.press(KeyCode::Esc);
+    assert!(
+        !h.app.cancel_armed,
+        "leaving Insert does not arm the cancel"
+    );
+
+    h.app.on_key(key('v'));
+    h.press(KeyCode::Esc);
+    assert!(!h.app.cancel_armed, "leaving Visual does not arm it either");
+    assert_eq!(h.app.editor.mode_label(), "NORMAL");
+
+    for c in "0/ba".chars() {
+        h.app.on_key(key(c));
+    }
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.steering_len_for_test(), 0, "Enter ended the search");
+    assert_eq!(h.app.editor.content().trim_end(), "foo bar");
+
+    h.press(KeyCode::Esc);
+    assert!(
+        h.app.cancel_armed,
+        "an idle Normal-mode Esc arms the cancel"
+    );
+    h.press(KeyCode::Enter);
+    assert_eq!(h.app.steering_len_for_test(), 1, "an idle Enter sends");
+}
+
 /// A plain engine whose every key runs into a clipboard failure — a stand-in
 /// for a vim yank on a machine without a clipboard, which a test cannot cause.
 struct FailingClipboardEngine(hrdr_editor::PlainEngine);

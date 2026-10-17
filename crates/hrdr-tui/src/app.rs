@@ -1584,11 +1584,12 @@ impl App {
 
         // Esc interrupts what is in flight — a turn or a user `!command` — but
         // only on a second consecutive press, so a stray Esc can't kill a long
-        // turn (vim: only in Normal, so Esc still exits Insert; plain: always,
+        // turn. Only while the editor is idle: in vim, Esc first leaves Insert
+        // or Visual, or drops a half-typed chord or search (plain: always idle,
         // since Esc is otherwise unused).
         if key.code == KeyCode::Esc
             && key.modifiers.is_empty()
-            && self.editor.mode_label() != "INSERT"
+            && self.editor.is_idle()
             && self.in_flight()
         {
             if std::mem::take(&mut self.cancel_armed) {

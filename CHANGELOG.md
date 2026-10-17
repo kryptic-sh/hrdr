@@ -21,6 +21,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **In vim mode, Enter and Esc finish a half-typed command first.** Enter in
+  Normal mode sent the draft even while a `/search`, an operator (`d`) or a
+  count was being typed, and during a turn Esc in Visual mode, in a search or on
+  a pending operator armed the turn cancel instead of leaving that state. Both
+  now wait until the editor is idle (`EditorEngine::is_idle`,
+  `crates/hrdr-editor`, `crates/hrdr-tui`).
 - **Vim mode no longer panics on the first key.** Since hjkl 0.33.6 an editor
   built with `Editor::new` carries no editing discipline, and `VimEngine` built
   it that way, so `--vim` / `vim = true` crashed hrdr the moment a key reached

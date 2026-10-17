@@ -120,17 +120,12 @@ is how hrdr hosts it. hjkl deps are current: every `hjkl-*` crate resolves to
 since `v0.42.2` (checked 2026-10-18). Evidence is marked: **[ran]** observed,
 **[read]** from the code, **[inferred]** not confirmed.
 
-1. **Let the engine say what Enter and Esc mean.** [ran + read] Mid-command —
-   typing a `/pattern`, after `d`, `r`, `f` or a count — `coarse_mode()` is
-   still Normal, so `VimEngine::wants_submit` sends the message on Enter instead
-   of finishing `/pat<CR>`. And `App::on_key` (`app.rs`) arms and fires the
-   double-Esc turn cancel whenever `mode_label() != "INSERT"`, so Esc in Visual
-   mode, in the search prompt or on a pending operator cancels the turn instead
-   of leaving that state. Add an engine method (e.g. `is_idle`) that is false
-   while `search_prompt_state()` or a pending command or count is live, and
-   replace the `mode_label()` string comparisons in `on_key` with engine
-   predicates. Verify: e2e tests that `/foo<CR>` does not submit, and that Esc
-   in Visual during a running turn leaves Visual without arming the cancel. M.
+1. **Ctrl+U/Ctrl+D still test the mode label.** [read] Enter and Esc now ask the
+   engine (`EditorEngine::is_idle`, 2026-10-18), but the Normal-mode transcript
+   scroll in `App::on_key` still compares `mode_label() == "NORMAL"`, so Ctrl+D
+   right after `d` scrolls rather than reaching the pending operator. Move it to
+   an engine predicate too. Verify: an e2e test that `d` then Ctrl+D does not
+   scroll. S.
 2. **Render the search prompt and its matches.** [ran + read] `/` opens a prompt
    (`search_prompt_state`) nothing draws, and `VimEngine::render` passes no
    `search_pattern`/`search_ranges` to `BufferView`; `HrdrHost::prompt_search`
@@ -278,11 +273,16 @@ push each verified slice to `main` before proceeding to the next slice.
    being set: nothing can make a pipe accept fail on demand. Same day, one
    parallel `local_ipc` run failed
    `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
-   stalling for 43s; four reruns passed in ~5s. Real-process coverage:
-   `tests/tui_pty.rs` (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`:
-   tools, peer wake, shutdown leaves discovery) and
-   `tests/headless_messaging.rs` (busy delivery, disabling), on the CI matrix;
-   verified locally on Windows only so far.
+   stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a full
+   Windows workspace run beside other sessions' builds: that test and
+   `native_cross_process_sequential_clients` failed on a `TimedOut` connect, and
+   in the same binary `lsp::tests::pre_warm_spawns_the_server_before_any_edit`
+   and `json_rpc_error_responses_are_forwarded_not_discarded` found "the python3
+   language server is not available"; all four passed alone and in the next full
+   run. Real-process coverage: `tests/tui_pty.rs`
+   (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
+   shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
+   disabling), on the CI matrix; verified locally on Windows only so far.
    `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
    covers `/new` rotation and the exit report across processes. Still
    unexercised across processes: access-control denial for a foreign OS user.

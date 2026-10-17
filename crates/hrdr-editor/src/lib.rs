@@ -76,6 +76,13 @@ pub trait EditorEngine {
     fn mode_label(&self) -> &'static str;
     /// Whether the engine is in a text-insertion mode (cursor-shape hint).
     fn is_insert(&self) -> bool;
+    /// Whether the engine holds nothing half-entered — no mode to leave, no
+    /// pending operator, count or search — so a key the frontend would take
+    /// for itself (Esc to cancel a turn) is not one the engine is waiting on.
+    /// An engine without such state is always idle.
+    fn is_idle(&self) -> bool {
+        true
+    }
     /// Whether `key`, in the engine's current state, should submit the buffer
     /// as a message rather than be fed to the editor. (e.g. vim: Enter in
     /// Normal mode; plain: Enter without Shift / trailing backslash.)
@@ -419,13 +426,27 @@ impl EditorEngine for VimEngine {
         matches!(self.editor.coarse_mode(), CoarseMode::Insert)
     }
 
+    /// Normal mode with no chord in flight. `coarse_mode` alone reads Normal
+    /// while a `/pattern`, an operator (`d`) or a count is still being typed —
+    /// which is exactly when Enter and Esc belong to vim. A register prefix
+    /// (`"a`) is not counted: hjkl keeps it across Esc until the next operator
+    /// consumes it, so counting it would leave Enter dead after a cancelled one.
+    fn is_idle(&self) -> bool {
+        let chord_in_flight = self
+            .editor
+            .discipline()
+            .as_any()
+            .downcast_ref::<hjkl_vim::vim::VimState>()
+            .is_some_and(|vim| vim.pending != Default::default() || vim.count != 0);
+        matches!(self.editor.coarse_mode(), CoarseMode::Normal)
+            && self.editor.search_prompt_state().is_none()
+            && !chord_in_flight
+    }
+
     fn wants_submit(&self, key: &EditorKey) -> bool {
-        // Vim convention: Enter in Normal mode sends; in Insert it's a newline.
-        key.key == EditorKeyCode::Enter
-            && !key.ctrl
-            && !key.alt
-            && !key.shift
-            && matches!(self.editor.coarse_mode(), CoarseMode::Normal)
+        // Vim convention: Enter in Normal mode sends; in Insert it's a newline,
+        // and mid-chord it finishes the chord (`/pattern<CR>`).
+        key.key == EditorKeyCode::Enter && !key.ctrl && !key.alt && !key.shift && self.is_idle()
     }
 
     fn paste(&mut self, text: &str) {
@@ -759,6 +780,35 @@ mod vim_tests {
         assert_eq!(e.content().trim_end_matches('\n'), "hi");
         type_keys(&mut e, "0x");
         assert_eq!(e.content().trim_end_matches('\n'), "i");
+    }
+
+    /// Enter and Esc belong to vim while a chord is half-typed: a search
+    /// prompt, a pending operator, a count. Only plain Normal is idle, and only
+    /// there does Enter submit.
+    #[test]
+    fn a_half_typed_chord_is_not_idle() {
+        let enter = key(EditorKeyCode::Enter);
+        let mut e = VimEngine::new();
+        type_keys(&mut e, "ifoo bar");
+        assert!(!e.is_idle(), "Insert is not idle");
+        e.feed_key(key(EditorKeyCode::Esc));
+        assert!(e.is_idle() && e.wants_submit(&enter));
+
+        type_keys(&mut e, "0/ba");
+        assert!(!e.is_idle() && !e.wants_submit(&enter), "a search prompt");
+        e.feed_key(enter);
+        assert!(e.is_idle(), "Enter finished the search");
+        assert_eq!(e.content().trim_end_matches('\n'), "foo bar");
+
+        for chord in ["d", "3"] {
+            type_keys(&mut e, chord);
+            assert!(!e.is_idle() && !e.wants_submit(&enter), "after {chord:?}");
+            e.feed_key(key(EditorKeyCode::Esc));
+            assert!(e.is_idle(), "Esc dropped {chord:?}");
+        }
+
+        type_keys(&mut e, "v");
+        assert!(!e.is_idle(), "Visual is not idle");
     }
 
     /// Text swapped in with `replace_content` is one undo step: `u` brings the
