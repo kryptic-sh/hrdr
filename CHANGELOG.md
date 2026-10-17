@@ -23,6 +23,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as vim's command line does, and its matches light up while it is open — not
   after, since hrdr has no `:noh` to clear a highlight that would otherwise sit
   on every later draft (`crates/hrdr-editor`).
+- **Vim mode wraps long lines.** A line wider than the input box scrolled
+  sideways out of view; it now wraps at word edges as the plain editor does, the
+  box grows to fit, and the cursor is placed by display width, so it lands on
+  the right cell after a wide glyph (`crates/hrdr-editor`).
 
 ### Fixed
 

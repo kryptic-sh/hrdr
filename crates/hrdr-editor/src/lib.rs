@@ -376,6 +376,20 @@ impl VimEngine {
     }
 }
 
+impl VimEngine {
+    /// Publish the box's width to the host viewport, whole and less the
+    /// line-number gutter, and return the gutter's width. Sizing and rendering
+    /// both need it: how many rows a wrapped line takes depends on it.
+    fn publish_width(&mut self, width: u16) -> u16 {
+        let digits = self.editor.row_count().max(1).to_string().len() as u16;
+        let gutter_width = digits + 1;
+        let v = self.editor.host_mut().viewport_mut();
+        v.width = width;
+        v.text_width = width.saturating_sub(gutter_width);
+        gutter_width
+    }
+}
+
 impl Default for VimEngine {
     fn default() -> Self {
         Self::new()
@@ -465,18 +479,25 @@ impl EditorEngine for VimEngine {
         "Esc=normal · Enter(normal)=send · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }
 
-    /// The buffer's rows — counted by the engine, since `content()` ends in a
-    /// newline that splitting would read as one more line — plus the row an
-    /// open search prompt draws below them, so `/` does not hide the text.
-    fn desired_rows(&mut self, _width: u16, max: u16) -> u16 {
-        let lines = self.editor.row_count().max(1)
-            + usize::from(self.editor.search_prompt_state().is_some());
+    /// The screen rows the buffer wraps to at `width` — counted by the engine,
+    /// since `content()` ends in a newline that splitting would read as one
+    /// more line — plus the row an open search prompt draws below them, so `/`
+    /// does not hide the text.
+    fn desired_rows(&mut self, width: u16, max: u16) -> u16 {
+        self.publish_width(width);
+        let last = self.editor.row_count().saturating_sub(1);
+        let rows = self
+            .editor
+            .buffer()
+            .screen_rows_between(self.editor.host().viewport(), 0, last);
+        let lines = rows.max(1) + usize::from(self.editor.search_prompt_state().is_some());
         lines.clamp(1, max as usize) as u16
     }
 }
 
 impl TuiRender for VimEngine {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let gutter_width = self.publish_width(area.width);
         let editor = &mut self.editor;
 
         // An open `/` or `?` prompt takes the bottom row, as vim's command line
@@ -500,23 +521,25 @@ impl TuiRender for VimEngine {
             None => (area, None),
         };
 
-        // Publish viewport dimensions into the host (renderer half of the
-        // host-owned-viewport contract).
+        // Publish the height too (renderer half of the host-owned-viewport
+        // contract; the width went in above).
         editor.set_viewport_height(area.height);
-        let line_count = editor.row_count().max(1);
-        let digits = line_count.to_string().len() as u16;
-        let gutter_width = digits + 1;
-        {
-            let v = editor.host_mut().viewport_mut();
-            v.width = area.width;
-            v.height = area.height;
-            v.text_width = area.width.saturating_sub(gutter_width);
-        }
+        editor.host_mut().viewport_mut().height = area.height;
 
-        // Copy out scroll + cursor before taking the immutable render borrows.
+        // The cursor's cell, worked out before the immutable render borrows:
+        // the screen row from the engine (wrap-aware), the column within the
+        // wrapped segment it sits on, in display cells.
         let (cur_row, cur_col) = editor.cursor();
-        let top_row = editor.host().viewport().top_row;
-        let top_col = editor.host().viewport().top_col;
+        let viewport = *editor.host().viewport();
+        let cursor_cell = editor.buffer().cursor_screen_row(&viewport).map(|dy| {
+            let line = editor.line(cur_row).unwrap_or_default();
+            let segments = hjkl_buffer::wrap_segments(&line, viewport.text_width, viewport.wrap);
+            let start = segments[hjkl_buffer::wrap::segment_for_col(&segments, cur_col)].0;
+            (
+                hjkl_buffer::visual_offset_for_char_col(&line, start, cur_col),
+                dy,
+            )
+        });
 
         // No syntax integration: spans are empty, so the resolver is never
         // exercised — return a default style.
@@ -568,7 +591,31 @@ impl TuiRender for VimEngine {
             blame_plan: None,
             diff_filler: None,
         };
-        frame.render_widget(view, area);
+        // hjkl scrolls by whole buffer lines, so a single line wrapped taller
+        // than the box can leave the cursor's row below it. Then draw the
+        // lines into a taller scratch buffer and show the window that ends on
+        // the cursor's row.
+        let skip = cursor_cell.map_or(0, |(_, dy)| {
+            dy.saturating_sub(usize::from(area.height).saturating_sub(1))
+        });
+        if skip == 0 {
+            frame.render_widget(view, area);
+        } else {
+            let tall = Rect {
+                x: 0,
+                y: 0,
+                width: area.width,
+                height: area.height + skip as u16,
+            };
+            let mut scratch = ratatui::buffer::Buffer::empty(tall);
+            ratatui::widgets::Widget::render(view, tall, &mut scratch);
+            let out = frame.buffer_mut();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    out[(area.x + x, area.y + y)] = scratch[(x, y + skip as u16)].clone();
+                }
+            }
+        }
 
         if let (Some((sigil, text, cursor)), Some(row)) = (prompt, prompt_row) {
             let before: usize = text.chars().take(cursor).map(char_width).sum();
@@ -584,10 +631,12 @@ impl TuiRender for VimEngine {
         }
 
         // Place the terminal cursor (viewport- and gutter-aware).
-        let sx = area.x + gutter_width + cur_col.saturating_sub(top_col) as u16;
-        let sy = area.y + cur_row.saturating_sub(top_row) as u16;
-        if sx < area.x + area.width && sy < area.y + area.height {
-            frame.set_cursor_position((sx, sy));
+        if let Some((dx, dy)) = cursor_cell {
+            let sx = area.x + gutter_width + dx as u16;
+            let sy = area.y + (dy - skip) as u16;
+            if sx < area.x + area.width && sy < area.y + area.height {
+                frame.set_cursor_position((sx, sy));
+            }
         }
     }
 }
@@ -893,6 +942,53 @@ mod vim_tests {
             Color::Yellow,
             "no highlight after the search"
         );
+    }
+
+    /// A line wider than the box wraps onto more rows instead of scrolling
+    /// sideways, the box asks for them, and the cursor lands on its cell in the
+    /// wrapped row — counted in display cells, so after a wide glyph too.
+    #[test]
+    fn a_long_line_wraps_and_the_cursor_follows() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut e = VimEngine::new();
+        // Gutter "1 " leaves 8 text cells at width 10.
+        type_keys(&mut e, "ione two three 国x");
+        e.feed_key(key(EditorKeyCode::Esc));
+        assert_eq!(e.desired_rows(10, 9), 3, "one line, three wrapped rows");
+
+        let mut terminal = Terminal::new(TestBackend::new(10, 3)).unwrap();
+        terminal.draw(|f| e.render(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row = |y: u16| -> String {
+            (0..10)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        };
+        assert!(row(0).contains("one two"), "{:?}", row(0));
+        assert!(row(1).contains("three"), "{:?}", row(1));
+        // Esc left the cursor on the `x`: past the two-cell gutter and the
+        // two-cell `国` that opens the third row.
+        // A wide glyph's second cell holds a blank symbol, hence the strip.
+        assert!(row(2).replace(' ', "").starts_with("国x"), "{:?}", row(2));
+        assert_eq!(terminal.get_cursor_position().unwrap(), (2 + 2, 2).into());
+    }
+
+    /// A draft that wraps to more rows than the box shows scrolls so the
+    /// cursor's wrapped row stays in view, and the cursor sits on its glyph.
+    #[test]
+    fn a_draft_taller_than_the_box_keeps_the_cursor_in_view() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut e = VimEngine::new();
+        type_keys(&mut e, "iaaaa bbbb cccc dddd eeee ffff x");
+        e.feed_key(key(EditorKeyCode::Esc));
+        assert!(e.desired_rows(10, 99) > 3, "taller than the box below");
+
+        let mut terminal = Terminal::new(TestBackend::new(10, 3)).unwrap();
+        terminal.draw(|f| e.render(f, f.area())).unwrap();
+        let at = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert!(at.y < 3, "{at:?}");
+        assert_eq!(buffer[(at.x, at.y)].symbol(), "x", "{at:?}");
     }
 
     /// Text swapped in with `replace_content` is one undo step: `u` brings the

@@ -31,9 +31,12 @@ impl HrdrHost {
             clipboard_notice: None,
             clipboard_failing: false,
             started: Instant::now(),
+            // Long lines wrap at word edges, as the plain engine's do, rather
+            // than scrolling the prompt sideways.
             viewport: Viewport {
                 width: 80,
                 height: 24,
+                wrap: hjkl_buffer::Wrap::Word,
                 ..Viewport::default()
             },
         }

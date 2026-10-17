@@ -123,12 +123,14 @@ is how hrdr hosts it. hjkl deps are current: every `hjkl-*` crate resolves to
 since `v0.42.2` (checked 2026-10-18). Evidence is marked: **[ran]** observed,
 **[read]** from the code, **[inferred]** not confirmed.
 
-1. **Soft wrap and a display-width cursor.** [read] `VimEngine::render` keeps
-   the viewport's default `Wrap::None` and `desired_rows` counts buffer rows, so
-   a long prompt scrolls sideways instead of wrapping as the plain engine does;
-   [inferred] the cursor x is a char column, so tabs and wide glyphs misplace
-   it. Verify: a long line at width 10 reports more than one row, and the cursor
-   after a CJK glyph lands on the right cell. M.
+1. **Tabs in a wrapped vim line are unchecked.** Soft wrap shipped 2026-10-18
+   (`Wrap::Word` in `HrdrHost::new`; the cursor from `cursor_screen_row` and
+   `wrap_segments`; a line taller than the box drawn through a scratch buffer,
+   since hjkl scrolls by whole lines), pinned by
+   `vim_tests::a_long_line_wraps_and_the_cursor_follows` and
+   `a_draft_taller_than_the_box_keeps_the_cursor_in_view`. `wrap_segments`
+   counts a tab as one cell; whether `BufferView` draws it as one under wrap, so
+   the cursor after a tab lands right, is not tested. S.
 2. **Document vim mode as it behaves.** [read] README (`--vim` "swaps in a real
    hjkl vim editor") says nothing of Enter-in-Normal sending, the keys the TUI
    takes first (Up/Down, Ctrl+U/D/C/S/G/L/Q/]), there being no `:` line, or the
