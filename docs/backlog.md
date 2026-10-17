@@ -123,15 +123,7 @@ is how hrdr hosts it. hjkl deps are current: every `hjkl-*` crate resolves to
 since `v0.42.2` (checked 2026-10-18). Evidence is marked: **[ran]** observed,
 **[read]** from the code, **[inferred]** not confirmed.
 
-1. **Tabs in a wrapped vim line are unchecked.** Soft wrap shipped 2026-10-18
-   (`Wrap::Word` in `HrdrHost::new`; the cursor from `cursor_screen_row` and
-   `wrap_segments`; a line taller than the box drawn through a scratch buffer,
-   since hjkl scrolls by whole lines), pinned by
-   `vim_tests::a_long_line_wraps_and_the_cursor_follows` and
-   `a_draft_taller_than_the_box_keeps_the_cursor_in_view`. `wrap_segments`
-   counts a tab as one cell; whether `BufferView` draws it as one under wrap, so
-   the cursor after a tab lands right, is not tested. S.
-2. **Vim e2e coverage.** [ran] `app::e2e::ctrl_d_scrolls_and_never_quits` never
+1. **Vim e2e coverage.** [ran] `app::e2e::ctrl_d_scrolls_and_never_quits` never
    feeds a key to the engine — which is how the crash went unnoticed. The
    `app::e2e::vim_*` tests now type through `App::on_key`; each item above lands
    with one. S per item.
@@ -141,25 +133,25 @@ since `v0.42.2` (checked 2026-10-18). Evidence is marked: **[ran]** observed,
 README's vim section (under Keybindings) describes the behaviour as it is,
 2026-10-18; each answer below changes it, so update it in the same change.
 
-3. **Mode indicator and showcmd.** [read] `mode_label()` is never drawn, the
+2. **Mode indicator and showcmd.** [read] `mode_label()` is never drawn, the
    labels say SELECT where vim says VISUAL, and nothing shows pending keys,
    "recording @a", or Replace mode (it reports as Insert). **Question:** draw it
    in the input pane's top row, or in the status bar? Verify: a render shows
    `-- INSERT --` after `i`. S–M.
-4. **Ctrl+C in Insert.** [read] Ctrl+C clears the whole input box in every mode;
+3. **Ctrl+C in Insert.** [read] Ctrl+C clears the whole input box in every mode;
    vim users press it to leave Insert, and lose the draft. **Question:** keep
    "clear box" everywhere, or make Ctrl+C act as Esc in vim Insert? S.
-5. **Start mode, and the mode after a submit.** [read + ran] The engine starts
+4. **Start mode, and the mode after a submit.** [read + ran] The engine starts
    in Normal and `set_content("")` after a submit leaves it there, so every
    message starts with `i`. **Question:** start (and return after submit) in
    Insert or Normal; and should Ctrl+Enter or Alt+Enter submit from Insert? S.
-6. **Which clipboard a yank or delete reaches.** [read] Every `x`/`d`/`c`/`y`
+5. **Which clipboard a yank or delete reaches.** [read] Every `x`/`d`/`c`/`y`
    goes to the OS clipboard (`record_yank_to_host` in hjkl-engine's
    `editor.rs`), as if `clipboard=unnamedplus` were always set, so deleting a
    word overwrites what the user copied elsewhere. **Question:** keep that, or
    vim's default (only `"+`/`"*` touch the OS clipboard — needs a host flag or
    an hjkl option)? S–M.
-7. **Arrows in a multiline draft.** [read] Up/Down always walk history, in every
+6. **Arrows in a multiline draft.** [read] Up/Down always walk history, in every
    mode — deliberate (cleared under Correctness 2026-08-05 half B).
    **Question:** keep that, or let the arrows move within a multiline draft in
    Insert and walk history only at its first/last line? S.

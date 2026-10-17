@@ -26,7 +26,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Vim mode wraps long lines.** A line wider than the input box scrolled
   sideways out of view; it now wraps at word edges as the plain editor does, the
   box grows to fit, and the cursor is placed by display width, so it lands on
-  the right cell after a wide glyph (`crates/hrdr-editor`).
+  the right cell after a wide glyph or a tab — which it missed even on a short
+  line, landing one cell past the tab (`crates/hrdr-editor`).
 
 ### Fixed
 

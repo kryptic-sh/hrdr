@@ -528,17 +528,17 @@ impl TuiRender for VimEngine {
 
         // The cursor's cell, worked out before the immutable render borrows:
         // the screen row from the engine (wrap-aware), the column within the
-        // wrapped segment it sits on, in display cells.
+        // wrapped segment it sits on, in display cells — through the same
+        // tab-stop and wide-glyph accounting `BufferView` paints with.
         let (cur_row, cur_col) = editor.cursor();
         let viewport = *editor.host().viewport();
         let cursor_cell = editor.buffer().cursor_screen_row(&viewport).map(|dy| {
             let line = editor.line(cur_row).unwrap_or_default();
             let segments = hjkl_buffer::wrap_segments(&line, viewport.text_width, viewport.wrap);
             let start = segments[hjkl_buffer::wrap::segment_for_col(&segments, cur_col)].0;
-            (
-                hjkl_buffer::visual_offset_for_char_col(&line, start, cur_col),
-                dy,
-            )
+            let tab_width = viewport.effective_tab_width();
+            let visual = |col| hjkl_buffer::char_col_to_visual_col(&line, col, tab_width);
+            (visual(cur_col) - visual(start), dy)
         });
 
         // No syntax integration: spans are empty, so the resolver is never
@@ -989,6 +989,26 @@ mod vim_tests {
         let buffer = terminal.backend().buffer().clone();
         assert!(at.y < 3, "{at:?}");
         assert_eq!(buffer[(at.x, at.y)].symbol(), "x", "{at:?}");
+    }
+
+    /// The cursor after a tab sits on the glyph the tab precedes: the cell
+    /// count the cursor math uses matches how the line is drawn. Typing Tab
+    /// inserts spaces (expandtab), so the tab arrives the way a real one does
+    /// — as text put in the box (a paste, a recall, `$EDITOR`).
+    #[test]
+    fn the_cursor_after_a_tab_lands_on_its_glyph() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut e = VimEngine::new();
+        e.set_content("\tx");
+        type_keys(&mut e, "$");
+        assert!(e.content().contains('\t'), "{:?}", e.content());
+        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        terminal.draw(|f| e.render(f, f.area())).unwrap();
+        let at = terminal.get_cursor_position().unwrap();
+        let symbol = terminal.backend().buffer()[(at.x, at.y)]
+            .symbol()
+            .to_string();
+        assert_eq!(symbol, "x", "{at:?}");
     }
 
     /// Text swapped in with `replace_content` is one undo step: `u` brings the
