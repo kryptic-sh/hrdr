@@ -18,8 +18,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   yank looked like it worked. It now raises a toast — once per run of failures,
   not on every `x` (`EditorEngine::take_notice`, `crates/hrdr-editor`,
   `crates/hrdr-tui`).
+- **The vim search prompt is drawn.** `/` and `?` opened a prompt nothing
+  showed, so a search was typed blind. It now takes the input box's bottom row,
+  as vim's command line does, and its matches light up while it is open — not
+  after, since hrdr has no `:noh` to clear a highlight that would otherwise sit
+  on every later draft (`crates/hrdr-editor`).
 
 ### Fixed
+
+- **The vim input box is no longer one row too tall.** It sized itself by
+  splitting the buffer's text on newlines, and hjkl's text always ends in one,
+  so every draft got an extra empty row. It now counts the engine's rows
+  (`crates/hrdr-editor`).
 
 - **In vim mode, Enter and Esc finish a half-typed command first.** Enter in
   Normal mode sent the draft even while a `/search`, an operator (`d`) or a

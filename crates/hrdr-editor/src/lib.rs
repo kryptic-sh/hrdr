@@ -464,11 +464,41 @@ impl EditorEngine for VimEngine {
     fn keybind_hint(&self) -> &'static str {
         "Esc=normal · Enter(normal)=send · Ctrl+G=$EDITOR · Ctrl+C×2=quit"
     }
+
+    /// The buffer's rows — counted by the engine, since `content()` ends in a
+    /// newline that splitting would read as one more line — plus the row an
+    /// open search prompt draws below them, so `/` does not hide the text.
+    fn desired_rows(&mut self, _width: u16, max: u16) -> u16 {
+        let lines = self.editor.row_count().max(1)
+            + usize::from(self.editor.search_prompt_state().is_some());
+        lines.clamp(1, max as usize) as u16
+    }
 }
 
 impl TuiRender for VimEngine {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         let editor = &mut self.editor;
+
+        // An open `/` or `?` prompt takes the bottom row, as vim's command line
+        // does — or the only row, when the box has one.
+        let prompt = editor
+            .search_prompt_state()
+            .map(|p| (if p.forward { '/' } else { '?' }, p.text.clone(), p.cursor));
+        let (area, prompt_row) = match prompt {
+            Some(_) if area.height > 1 => (
+                Rect {
+                    height: area.height - 1,
+                    ..area
+                },
+                Some(Rect {
+                    y: area.y + area.height - 1,
+                    height: 1,
+                    ..area
+                }),
+            ),
+            Some(_) => (Rect { height: 0, ..area }, Some(area)),
+            None => (area, None),
+        };
 
         // Publish viewport dimensions into the host (renderer half of the
         // host-owned-viewport contract).
@@ -488,9 +518,13 @@ impl TuiRender for VimEngine {
         let top_row = editor.host().viewport().top_row;
         let top_col = editor.host().viewport().top_col;
 
-        // No syntax/search integration in the MVP: spans are empty, so the
-        // resolver is never exercised — return a default style.
+        // No syntax integration: spans are empty, so the resolver is never
+        // exercised — return a default style.
         let resolver = |_id: u32| Style::default();
+        // Matches light up while the prompt is open (vim's incsearch), not
+        // after: with no `:noh` to clear it, a highlight that outlived the
+        // search would sit on every later draft.
+        let search_pattern = prompt_row.and(editor.search_state().pattern.as_ref());
         let selection = editor.buffer_selection();
         let gutter = Gutter {
             width: gutter_width,
@@ -511,12 +545,12 @@ impl TuiRender for VimEngine {
             selection_bg: Style::default().bg(Color::Blue),
             cursor_style: Style::default(),
             gutter: Some(gutter),
-            search_bg: Style::default(),
+            search_bg: Style::default().bg(Color::Yellow).fg(Color::Black),
             search_ranges: None,
             signs: &[],
             conceals: &[],
             spans: editor.buffer_spans(),
-            search_pattern: None,
+            search_pattern,
             background: Style::default(),
             non_text_style: Style::default(),
             show_eob: true,
@@ -535,6 +569,19 @@ impl TuiRender for VimEngine {
             diff_filler: None,
         };
         frame.render_widget(view, area);
+
+        if let (Some((sigil, text, cursor)), Some(row)) = (prompt, prompt_row) {
+            let before: usize = text.chars().take(cursor).map(char_width).sum();
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(format!("{sigil}{text}")),
+                row,
+            );
+            let x = row.x + 1 + before as u16;
+            if x < row.x + row.width {
+                frame.set_cursor_position((x, row.y));
+            }
+            return;
+        }
 
         // Place the terminal cursor (viewport- and gutter-aware).
         let sx = area.x + gutter_width + cur_col.saturating_sub(top_col) as u16;
@@ -809,6 +856,43 @@ mod vim_tests {
 
         type_keys(&mut e, "v");
         assert!(!e.is_idle(), "Visual is not idle");
+    }
+
+    /// An open search prompt draws on its own row below the text, with the
+    /// match highlighted and the cursor after the typed pattern; Enter closes
+    /// it and the text has the box to itself again.
+    #[test]
+    fn a_search_prompt_draws_below_the_text() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut e = VimEngine::new();
+        type_keys(&mut e, "ifoo bar");
+        e.feed_key(key(EditorKeyCode::Esc));
+        type_keys(&mut e, "0/ba");
+        assert_eq!(e.desired_rows(20, 5), 2, "a row for the prompt");
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        terminal.draw(|f| e.render(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row = |y: u16| -> String {
+            (0..20)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        };
+        assert!(row(0).contains("foo bar"), "{:?}", row(0));
+        assert_eq!(row(1).trim_end(), "/ba");
+        let b = row(0).find('b').unwrap() as u16;
+        assert_eq!(buffer[(b, 0)].bg, Color::Yellow, "the match is lit");
+        assert_eq!(terminal.get_cursor_position().unwrap(), (3, 1).into());
+
+        e.feed_key(key(EditorKeyCode::Enter));
+        assert_eq!(e.desired_rows(20, 5), 1);
+        terminal.draw(|f| e.render(f, f.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_ne!(
+            buffer[(b, 0)].bg,
+            Color::Yellow,
+            "no highlight after the search"
+        );
     }
 
     /// Text swapped in with `replace_content` is one undo step: `u` brings the
