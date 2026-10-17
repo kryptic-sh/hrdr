@@ -513,10 +513,14 @@ Config-mutation path tests cover storage and frontend failures; OAuth
 completion's captured preference is source-inspected, not exercised by a
 dedicated async regression test. Credential-save browser capture is likewise
 source-inspected rather than covered by a network/save integration test.
-Credential replacement-failure coverage uses a Windows readonly fixture; the
-corresponding Unix failure branch has not been exercised. Blob lock and OAuth
-refresh persistence errors remain ignored, with native labels in those discarded
-errors. The OAuth one is a question for the owner (see the index):
+Credential replacement-failure coverage uses a Windows readonly fixture
+(`credential_save_write_failure_labels_follow_style`). A unix twin was declined
+2026-10-18: a read-only file does not stop a unix rename, a read-only directory
+fails the lock before the write, and a directory at the path fails the read —
+nothing makes only `write_atomic` fail — and the label is one `with_context` in
+`save_entry_at` shared by every platform, which the Windows test pins. Blob lock
+and OAuth refresh persistence errors remain ignored, with native labels in those
+discarded errors. The OAuth one is a question for the owner (see the index):
 `coordinated_oauth_access` passes `coordinated_access_core` a persist callback
 that drops `save_oauth_entry_at`'s error, so a failed save of a rotated refresh
 token goes unnoticed until the next start cannot refresh. `hrdr-agent` has no
