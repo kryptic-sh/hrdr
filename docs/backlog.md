@@ -1433,13 +1433,13 @@ directory's files may then do:
   (`hrdr-tui/src/app/e2e.rs`) drives `/reload`, the `/commands` picker and a
   `:name` submit under a jailed harness, and
   `a_skipped_project_expands_neither_its_commands_nor_its_skills`
-  (`hrdr-app/src/util.rs`) covers the send-path seam directly. The other two
-  frontend rediscovery sites are **not** exercised by a jailed test and are
-  correct by inspection only: `TuiHost::cwd_changed` (`/cwd`, which reaches it
-  only for a directory the user _has_ trusted) and `App::apply_cwd`, reached
-  from `apply_session` when a resumed session names a different cwd — that path
-  asks the trust store nothing, so it is the one that moves a jailed session's
-  cwd without a trust answer, and the one worth a test if this is revisited.
+  (`hrdr-app/src/util.rs`) covers the send-path seam directly.
+  `a_jailed_session_moved_by_a_resume_reads_no_project_names` (2026-10-18)
+  covers `App::apply_cwd`, reached from `apply_session` when a resumed session
+  names a different cwd — the path that moves a jailed session without asking
+  the trust store. The one frontend rediscovery site still correct by inspection
+  only is `TuiHost::cwd_changed` (`/cwd`, which reaches it only for a directory
+  the user _has_ trusted); both go through `App::rediscover`.
 
 - **A jailed session cannot `/cwd` into another untrusted directory.** The hole
   is closed — `/cwd` refuses a directory nobody has answered for, so a trusted

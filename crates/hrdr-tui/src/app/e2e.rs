@@ -11316,6 +11316,36 @@ async fn a_jailed_session_neither_offers_nor_expands_the_projects_own_names() {
     );
 }
 
+/// A jailed session moved to another directory — as resuming a session saved
+/// elsewhere does, through `App::apply_cwd`, which asks the trust store nothing
+/// — still reads none of that directory's commands or skills.
+#[tokio::test]
+async fn a_jailed_session_moved_by_a_resume_reads_no_project_names() {
+    let mut h = Harness::jailed(vec![]).await;
+    let other = tempfile::tempdir().unwrap();
+    let commands_dir = other.path().join(".hrdr/commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    std::fs::write(commands_dir.join("ship.md"), "PROJECT-COMMAND-BODY").unwrap();
+    let bundle = other.path().join(".hrdr/skills/proj-skill");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        "---\nname: proj-skill\ndescription: the project's own skill\n---\nBODY",
+    )
+    .unwrap();
+
+    h.app.apply_cwd(other.path().to_path_buf());
+    assert_eq!(h.app.dir_cwd, other.path(), "the move happened");
+    assert!(
+        !h.app.commands.iter().any(|c| c.name == "ship"),
+        "an untrusted directory's command must not be discovered"
+    );
+    assert!(
+        !h.app.skills.skills.iter().any(|s| s.name == "proj-skill"),
+        "nor its skill"
+    );
+}
+
 /// `/effort` opens a picker of the model's own levels, "Default" on top,
 /// highest effort first; picking a level sets + persists it, and picking
 /// Default clears the override.
