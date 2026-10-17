@@ -8661,6 +8661,26 @@ async fn pruning_keeps_the_header_banner_not_a_leading_system_entry() {
     );
 }
 
+/// Vim undo reaches across a history recall: the recalled text replaced the
+/// draft as one undoable edit, so `u` brings the draft back instead of finding
+/// an emptied undo history.
+#[tokio::test]
+async fn vim_undo_brings_back_the_draft_a_recall_replaced() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.editor = Box::new(hrdr_editor::VimEngine::new());
+    h.app.record_history("sent earlier");
+    let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+    for c in "idraft".chars() {
+        h.app.on_key(key(c));
+    }
+    h.app
+        .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    h.app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(h.app.editor.content().trim_end(), "sent earlier");
+    h.app.on_key(key('u'));
+    assert_eq!(h.app.editor.content().trim_end(), "draft");
+}
+
 /// Ctrl+D scrolls and never quits, whatever the box holds.
 ///
 /// It used to end the session on an empty input, shell-style, from an arm that

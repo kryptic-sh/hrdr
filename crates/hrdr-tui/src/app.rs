@@ -1537,7 +1537,7 @@ impl App {
                 KeyCode::Char('s') => {
                     if self.composer_is_empty() {
                         if let Some(stashed) = self.stash.pop() {
-                            self.editor.set_content(&stashed.text);
+                            self.editor.replace_content(&stashed.text);
                             self.pending_attachments = stashed.attachments;
                         }
                     } else {
@@ -3468,7 +3468,7 @@ impl App {
         self.suppress_completions = true;
         let current = self.editor.content();
         if let Some(text) = self.history.recall_prev(&current) {
-            self.editor.set_content(&text);
+            self.editor.replace_content(&text);
         }
     }
 
@@ -3502,7 +3502,7 @@ impl App {
         // `display`, not `sent`: what the user typed, before `@file` mentions were
         // expanded into it. They get to edit their sentence, not a file dump — and
         // submitting expands it again.
-        self.editor.set_content(&steer.display);
+        self.editor.replace_content(&steer.display);
         // Drop the pending block right away rather than at the next frame's sync,
         // so the message is never on screen in two places at once.
         self.sync_panes();
@@ -3514,7 +3514,7 @@ impl App {
         self.suppress_completions = true;
         let current = self.editor.content();
         if let Some(text) = self.history.recall_next(&current) {
-            self.editor.set_content(&text);
+            self.editor.replace_content(&text);
         }
     }
 

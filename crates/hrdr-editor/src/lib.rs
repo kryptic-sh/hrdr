@@ -59,8 +59,14 @@ pub trait EditorEngine {
     fn feed_key(&mut self, key: EditorKey);
     /// Current buffer text.
     fn content(&self) -> String;
-    /// Replace the buffer text.
+    /// Replace the buffer text, starting a fresh undo history.
     fn set_content(&mut self, text: &str);
+    /// Replace the buffer text as one undoable edit, so undo brings back what
+    /// was there — for text the user swaps in (history recall, a stash pop).
+    /// An engine without undo just replaces it.
+    fn replace_content(&mut self, text: &str) {
+        self.set_content(text);
+    }
     /// FSM-agnostic uppercase mode label for status chrome (e.g. "NORMAL").
     fn mode_label(&self) -> &'static str;
     /// Whether the engine is in a text-insertion mode (cursor-shape hint).
@@ -390,6 +396,10 @@ impl EditorEngine for VimEngine {
 
     fn set_content(&mut self, text: &str) {
         self.editor.set_content(text);
+    }
+
+    fn replace_content(&mut self, text: &str) {
+        self.editor.set_content_undoable(text);
     }
 
     fn mode_label(&self) -> &'static str {
@@ -740,5 +750,21 @@ mod vim_tests {
         assert_eq!(e.content().trim_end_matches('\n'), "hi");
         type_keys(&mut e, "0x");
         assert_eq!(e.content().trim_end_matches('\n'), "i");
+    }
+
+    /// Text swapped in with `replace_content` is one undo step: `u` brings the
+    /// draft back. `set_content` starts afresh, so there is nothing to undo.
+    #[test]
+    fn replaced_content_undoes_to_the_previous_draft() {
+        let mut e = VimEngine::new();
+        type_keys(&mut e, "idraft");
+        e.feed_key(key(EditorKeyCode::Esc));
+        e.replace_content("recalled");
+        type_keys(&mut e, "u");
+        assert_eq!(e.content().trim_end_matches('\n'), "draft");
+
+        e.set_content("fresh");
+        type_keys(&mut e, "u");
+        assert_eq!(e.content().trim_end_matches('\n'), "fresh");
     }
 }

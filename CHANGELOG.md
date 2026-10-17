@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Vim undo reaches across a history recall.** Up/Down recall, taking a queued
+  message back, and popping a Ctrl+S stash replaced the input as a fresh buffer,
+  wiping vim's undo history, so `u` could not bring back the draft they
+  replaced. They now replace it as one undoable edit
+  (`EditorEngine::replace_content`, `crates/hrdr-editor`, `crates/hrdr-tui`).
+
 ### Fixed
 
 - **Vim mode no longer panics on the first key.** Since hjkl 0.33.6 an editor
