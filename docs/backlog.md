@@ -97,6 +97,91 @@ only the list. Delete a line when its question is answered.
 - **`CommandHost` text-fallback defaults; `gate_rank`/`kind_rank` merge;
   verbose-gating the session banner; `jail` write floor and read-only git.**
   Smaller calls recorded where each lives.
+- **Vim mode behaviour calls** — Ctrl+C in Insert, the start mode and the mode
+  after a submit, which clipboard a yank or delete reaches, arrows in a
+  multiline draft, and where the mode indicator goes. _Vim mode — proper
+  support._
+
+---
+
+## Vim mode — proper support, requested 2026-10-18
+
+The owner asked for vim mode to work "properly/nicely". A read-only
+investigation (2026-10-18) drove `hrdr_editor::VimEngine` and a scratch
+`hjkl_vim::vim_editor` probe against the resolved hjkl 0.42.2, read the TUI's
+key routing, and found vim mode **crashing on the first key**: `VimEngine::new`
+built through `Editor::new`, which since hjkl 0.33.6 installs no discipline.
+Fixed 2026-10-18 (`vim_editor`, pinned by `vim_tests::keys_drive_the_vim_fsm`).
+The hjkl engine itself is capable — `dw`, counts, `ciw`/`ci"`, `.`, undo/redo,
+visual delete, named registers, `/` search, macros, marks and `R` all worked in
+the probe; `:` is a no-op by design (ex commands are the host's). What remains
+is how hrdr hosts it. hjkl deps are current: every `hjkl-*` crate resolves to
+0.42.2, the newest on crates.io, and the hjkl repo holds only dependency bumps
+since `v0.42.2` (checked 2026-10-18). Evidence is marked: **[ran]** observed,
+**[read]** from the code, **[inferred]** not confirmed.
+
+1. **Let the engine say what Enter and Esc mean.** [ran + read] Mid-command —
+   typing a `/pattern`, after `d`, `r`, `f` or a count — `coarse_mode()` is
+   still Normal, so `VimEngine::wants_submit` sends the message on Enter instead
+   of finishing `/pat<CR>`. And `App::on_key` (`app.rs`) arms and fires the
+   double-Esc turn cancel whenever `mode_label() != "INSERT"`, so Esc in Visual
+   mode, in the search prompt or on a pending operator cancels the turn instead
+   of leaving that state. Add an engine method (e.g. `is_idle`) that is false
+   while `search_prompt_state()` or a pending command or count is live, and
+   replace the `mode_label()` string comparisons in `on_key` with engine
+   predicates. Verify: e2e tests that `/foo<CR>` does not submit, and that Esc
+   in Visual during a running turn leaves Visual without arming the cancel. M.
+2. **Render the search prompt and its matches.** [ran + read] `/` opens a prompt
+   (`search_prompt_state`) nothing draws, and `VimEngine::render` passes no
+   `search_pattern`/`search_ranges` to `BufferView`; `HrdrHost::prompt_search`
+   returns `None`. Verify: a `TestBackend` render after `/ba` shows `/ba` and
+   highlighted matches. M.
+3. **Soft wrap and a display-width cursor.** [read] `VimEngine::render` keeps
+   the viewport's default `Wrap::None` and `desired_rows` counts logical lines,
+   so a long prompt scrolls sideways instead of wrapping as the plain engine
+   does; [inferred] the cursor x is a char column, so tabs and wide glyphs
+   misplace it. Verify: a long line at width 10 reports more than one row, and
+   the cursor after a CJK glyph lands on the right cell. M.
+4. **Keep undo across history recall and stash pop.** [read] Both go through
+   `set_content`, which clears hjkl's undo, so `u` after recalling a history
+   entry cannot bring the draft back. Use hjkl's undoable content setter.
+   Verify: recall, then `u`, restores the prior draft. S.
+5. **Report clipboard write failures.** [read] `HrdrHost::flush_clipboard` drops
+   `set` errors (`let _ =`), so a failed yank to the OS clipboard is silent.
+   Surface it (toast). S.
+6. **Document vim mode as it behaves.** [read] README (`--vim` "swaps in a real
+   hjkl vim editor") says nothing of Enter-in-Normal sending, the keys the TUI
+   takes first (Up/Down, Ctrl+U/D/C/S/G/L/Q/]), there being no `:` line, or the
+   clipboard behaviour. Do after the decisions below. S.
+7. **Vim e2e coverage.** [ran] The only vim e2e test,
+   `app::e2e::ctrl_d_scrolls_and_never_quits`, never feeds a key to the engine —
+   which is how the crash went unnoticed. Each item above lands with an e2e test
+   that types through `App::on_key` in vim mode. S per item.
+
+**[Deferred — questions for the owner; see the index at the top]**
+
+8. **Mode indicator and showcmd.** [read] `mode_label()` is never drawn, the
+   labels say SELECT where vim says VISUAL, and nothing shows pending keys,
+   "recording @a", or Replace mode (it reports as Insert). **Question:** draw it
+   in the input pane's top row, or in the status bar? Verify: a render shows
+   `-- INSERT --` after `i`. S–M.
+9. **Ctrl+C in Insert.** [read] Ctrl+C clears the whole input box in every mode;
+   vim users press it to leave Insert, and lose the draft. **Question:** keep
+   "clear box" everywhere, or make Ctrl+C act as Esc in vim Insert? S.
+10. **Start mode, and the mode after a submit.** [read + ran] The engine starts
+    in Normal and `set_content("")` after a submit leaves it there, so every
+    message starts with `i`. **Question:** start (and return after submit) in
+    Insert or Normal; and should Ctrl+Enter or Alt+Enter submit from Insert? S.
+11. **Which clipboard a yank or delete reaches.** [read] Every `x`/`d`/`c`/`y`
+    goes to the OS clipboard (`record_yank_to_host` in hjkl-engine's
+    `editor.rs`), as if `clipboard=unnamedplus` were always set, so deleting a
+    word overwrites what the user copied elsewhere. **Question:** keep that, or
+    vim's default (only `"+`/`"*` touch the OS clipboard — needs a host flag or
+    an hjkl option)? S–M.
+12. **Arrows in a multiline draft.** [read] Up/Down always walk history, in
+    every mode — deliberate (cleared under Correctness 2026-08-05 half B).
+    **Question:** keep that, or let the arrows move within a multiline draft in
+    Insert and walk history only at its first/last line? S.
 
 ---
 
@@ -490,10 +575,11 @@ command had not finished was dropped with the read loop, which the new
 unfinished-line case shows deterministically (it fails without the drain). The
 1s deadline could also expire before Git Bash started under load; both tests now
 use `test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS`. Which cause produced the CI
-failures is unknown — neither was reproduced on demand. The PowerShell branch of
-the unfinished-line case has not run locally (`test_env::shell` picks Git Bash
-here). The same day, one full `hrdr-tools` run in WSL under load (a release
-build running beside it) failed
+failures is unknown — neither was reproduced on demand. Since 2026-10-18 the
+test runs every shell in `Shell::available()`, so on Windows the PowerShell
+branches (the unfinished line included) run beside Git Bash; they pass locally.
+The same day, one full `hrdr-tools` run in WSL under load (a release build
+running beside it) failed
 `proc::tests::git_runner_deadline_covers_readers_after_the_leader_exits` on its
 `TimedOut` kind assertion; five isolated reruns passed. A full Windows
 `hrdr-tools` run on 2026-10-14 likewise failed
@@ -2718,11 +2804,14 @@ and **not** fixed.
   preference from valid TOML or default to `true`; failed reloads retain the
   active style. The reload regression exercises manual dispatch and the mtime
   handler, not the watcher/event loop; a successful reload's notice is asserted
-  (`a_successful_config_reload_applies_it_and_says_so`), but the failure test
-  derives its expected parser reason from `reload_checked` itself, so the exact
-  wording is not independently checked. Preserve filesystem identities, Unix
-  literal backslashes, parser excerpts, protocol URIs, and captured shell
-  output.
+  (`a_successful_config_reload_applies_it_and_says_so`). The failure test takes
+  its whole expected toast from `reload_checked`, but also requires the literal
+  diagnostic in it (`could not parse config file:` after the styled path, or the
+  `sandbox_writable_roots` message), and `reload_message_tests` pins the prefix
+  — rewording the diagnostic fails it (mutation-checked 2026-10-18). Only the
+  TOML parser's own excerpt is unpinned, deliberately: that text is the `toml`
+  crate's. Preserve filesystem identities, Unix literal backslashes, parser
+  excerpts, protocol URIs, and captured shell output.
 - **Completion identity verification gaps:** Unix collision tests in
   `hrdr-app/src/util.rs` and `hrdr-tui/src/app/e2e.rs` passed Linux/macOS CI in
   `37912493951`; local verification was Windows-only, including a failing
