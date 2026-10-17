@@ -1931,73 +1931,85 @@ mod tests {
     /// otherwise, and the flag is what gets skimmed.
     #[tokio::test]
     async fn a_timeout_fails_the_call_but_a_non_zero_exit_does_not() {
-        let Some(shell) = test_env::shell() else {
+        if test_env::shell().is_none() {
             return;
-        };
+        }
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = ToolContext::new(dir.path().to_path_buf());
         ctx.enforce_timeout_floor = false;
 
-        // Killed by the deadline: Err, and the partial output survives on it —
-        // dropping that would force a re-run of the command that just cost the
-        // deadline.
-        let timeout_cmd = match shell {
-            Shell::Bash | Shell::Posix => "echo starting; sleep 30",
-            Shell::PowerShell => "Write-Output starting; Start-Sleep -Seconds 30",
-        };
-        let deadline = test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS;
-        let err = ShellTool::new(shell)
-            .execute(
-                json!({"command": timeout_cmd, "timeout_secs": deadline}),
-                &ctx,
-            )
-            .await
-            .expect_err("a killed command is not a successful one");
-        let msg = err.to_string();
-        assert!(
-            msg.contains(&format!("timed out after {deadline}s")),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("starting"),
-            "partial output must survive: {msg}"
-        );
+        // Every shell this machine runs, not only the default: each kills and
+        // drains through its own branch below, and on Windows the default is
+        // Git Bash, which would leave PowerShell's never run.
+        for &shell in Shell::available() {
+            // Killed by the deadline: Err, and the partial output survives on it —
+            // dropping that would force a re-run of the command that just cost the
+            // deadline.
+            let timeout_cmd = match shell {
+                Shell::Bash | Shell::Posix => "echo starting; sleep 30",
+                Shell::PowerShell => "Write-Output starting; Start-Sleep -Seconds 30",
+            };
+            let deadline = test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS;
+            let err = ShellTool::new(shell)
+                .execute(
+                    json!({"command": timeout_cmd, "timeout_secs": deadline}),
+                    &ctx,
+                )
+                .await
+                .expect_err("a killed command is not a successful one");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("timed out after {deadline}s")),
+                "{}: {msg}",
+                shell.name()
+            );
+            assert!(
+                msg.contains("starting"),
+                "{}: partial output must survive: {msg}",
+                shell.name()
+            );
 
-        // A line the command had not finished is partial output too: it was read
-        // into the line buffer but not yet ingested when the deadline fired. The
-        // marker is assembled at run time, so only the command's own write can
-        // put it in the result.
-        let unfinished_cmd = match shell {
-            Shell::Bash | Shell::Posix => "printf 'unfinished-%s' line; sleep 30",
-            Shell::PowerShell => {
-                "[Console]::Out.Write('unfinished-' + 'line'); [Console]::Out.Flush(); \
-                 Start-Sleep -Seconds 30"
-            }
-        };
-        let err = ShellTool::new(shell)
-            .execute(
-                json!({"command": unfinished_cmd, "timeout_secs": deadline}),
-                &ctx,
-            )
-            .await
-            .expect_err("a killed command is not a successful one");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unfinished-line"),
-            "an unfinished line must survive the kill: {msg}"
-        );
+            // A line the command had not finished is partial output too: it was read
+            // into the line buffer but not yet ingested when the deadline fired. The
+            // marker is assembled at run time, so only the command's own write can
+            // put it in the result.
+            let unfinished_cmd = match shell {
+                Shell::Bash | Shell::Posix => "printf 'unfinished-%s' line; sleep 30",
+                Shell::PowerShell => {
+                    "[Console]::Out.Write('unfinished-' + 'line'); [Console]::Out.Flush(); \
+                     Start-Sleep -Seconds 30"
+                }
+            };
+            let err = ShellTool::new(shell)
+                .execute(
+                    json!({"command": unfinished_cmd, "timeout_secs": deadline}),
+                    &ctx,
+                )
+                .await
+                .expect_err("a killed command is not a successful one");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unfinished-line"),
+                "{}: an unfinished line must survive the kill: {msg}",
+                shell.name()
+            );
 
-        // Ran to completion and said no: still Ok. The command answered, and the
-        // answer is the output — only the deadline case is unknowable.
-        let nonzero_cmd = match shell {
-            Shell::Bash | Shell::Posix => "echo nope; exit 3",
-            Shell::PowerShell => "Write-Output nope; exit 3",
-        };
-        let out = ShellTool::new(shell)
-            .execute(json!({"command": nonzero_cmd}), &ctx)
-            .await
-            .expect("a non-zero exit is a result, not a tool failure");
-        assert!(out.contains("nope") && out.contains("exit status"), "{out}");
+            // Ran to completion and said no: still Ok. The command answered, and the
+            // answer is the output — only the deadline case is unknowable.
+            let nonzero_cmd = match shell {
+                Shell::Bash | Shell::Posix => "echo nope; exit 3",
+                Shell::PowerShell => "Write-Output nope; exit 3",
+            };
+            let out = ShellTool::new(shell)
+                .execute(json!({"command": nonzero_cmd}), &ctx)
+                .await
+                .expect("a non-zero exit is a result, not a tool failure");
+            assert!(
+                out.contains("nope") && out.contains("exit status"),
+                "{}: {out}",
+                shell.name()
+            );
+        }
     }
 
     #[tokio::test]
