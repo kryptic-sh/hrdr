@@ -2,9 +2,10 @@
 //!
 //! Mirrors the well-trodden sqeel adapter: the host **owns the viewport** (the
 //! renderer publishes dimensions, the engine writes scroll offsets). Clipboard
-//! writes queue to an outbox flushed on a tick (non-blocking); reads pull the OS
-//! clipboard directly (the same synchronous `hjkl_clipboard::get` the TUI's
-//! `/paste` uses — a paste is user-initiated and rare, so it needn't be cached).
+//! writes queue to an outbox that `VimEngine::feed_key` flushes after each key;
+//! reads pull the OS clipboard directly (the same `hjkl_clipboard::get` the
+//! TUI's `/paste` uses — a paste is user-initiated and rare, so it needn't be
+//! cached). Both are synchronous OS calls on the caller's thread.
 
 use std::time::{Duration, Instant};
 
@@ -72,6 +73,16 @@ impl HrdrHost {
     }
 }
 
+/// Clipboard bytes as buffer text: UTF-8, with every `\r` dropped. Windows
+/// clipboard text uses CRLF, and hjkl keeps a `\r` in the buffer, so `"+p`
+/// would put stray carriage returns in the message — the same reason the
+/// editor's `paste` strips them.
+fn clipboard_text(bytes: Vec<u8>) -> Option<String> {
+    String::from_utf8(bytes)
+        .ok()
+        .map(|text| text.replace('\r', ""))
+}
+
 impl Default for HrdrHost {
     fn default() -> Self {
         Self::new()
@@ -91,7 +102,7 @@ impl Host for HrdrHost {
             .as_ref()?
             .get(Selection::Clipboard, MimeType::Text)
             .ok()?;
-        String::from_utf8(bytes).ok()
+        clipboard_text(bytes)
     }
 
     fn now(&self) -> Duration {
@@ -122,6 +133,17 @@ impl Host for HrdrHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRLF clipboard text reaches the buffer as LF; bytes that are not UTF-8
+    /// read as nothing.
+    #[test]
+    fn clipboard_text_drops_carriage_returns() {
+        assert_eq!(
+            clipboard_text(b"one\r\ntwo\r\n".to_vec()).as_deref(),
+            Some("one\ntwo\n")
+        );
+        assert_eq!(clipboard_text(vec![0xff]), None);
+    }
 
     /// Without a clipboard, a yank reports once — not once per write, and not
     /// again until a write has succeeded.

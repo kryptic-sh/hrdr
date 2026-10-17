@@ -31,6 +31,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Vim `"+p` no longer pastes stray carriage returns on Windows.** Clipboard
+  text there uses CRLF, and the `+`/`*` registers took it as-is, so each line of
+  a pasted block carried a `\r` into the message. They now drop it, as the
+  editor's own paste already did (`crates/hrdr-editor`).
 - **The vim input box is no longer one row too tall.** It sized itself by
   splitting the buffer's text on newlines, and hjkl's text always ends in one,
   so every draft got an extra empty row. It now counts the engine's rows

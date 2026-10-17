@@ -2918,7 +2918,40 @@ and **not** fixed.
   run removes. The `.tmp*` dirs leaked into the system temp dir before the fix —
   17,297 on the owner's machine, all `tempfile`-shaped and none touched in the
   last hour — were deleted on the owner's word 2026-10-16.
-- **Not reviewed:** the `hjkl-clipboard` Windows backend.
+- **`hjkl-clipboard` Windows backend — reviewed 2026-10-18 (0.42.2).** Read in
+  full, plus one live read-only probe (another process holding the clipboard
+  open); no write was run, since it would wipe the owner's clipboard. Sound:
+  `CloseClipboard` on every path, `GlobalFree` only when `SetClipboardData`
+  fails, FFI types and constants right for x86_64 and aarch64 (by reading).
+  Fixed in hrdr the same day: vim `"+p` kept Windows `\r` (`clipboard_text` in
+  `hrdr-editor/src/host.rs`). Open, **upstream** (kryptic-sh/hjkl,
+  `backend/windows.rs`):
+  - `ClipboardOpen::new` calls `OpenClipboard` once — no retry — and drops
+    `GetLastError`, so a clipboard-history or RDP-sync app holding the clipboard
+    for a moment fails a copy or paste outright [ran: every read failed in
+    microseconds while another process held it].
+  - `get_text` uses strict `String::from_utf16`: one lone surrogate fails the
+    whole read; `set_text` truncates at an interior NUL; neither converts line
+    endings.
+  - `dib_png::dib_to_png` ignores `biCompression` and the colour masks and takes
+    the fourth byte as alpha, so a classic PrintScreen bitmap (alpha 0) likely
+    pastes as a transparent PNG; 16-bit and palette DIBs error. It negates
+    `height_raw` plainly (overflow on `i32::MIN`).
+  - `get_png`/`get_bytes` copy `GlobalSize` bytes, which may exceed what was
+    written; `cf_hdrop::parse` errors on an odd length instead of trimming.
+  - `set_*` call `EmptyClipboard` before allocating, so a failed write erases
+    the user's clipboard; `set_png` can leave only the PNG format.
+  - No size cap on a read.
+
+  Open, **in hrdr** [read]: every clipboard call is a synchronous OS call on the
+  UI thread — `App::paste_clipboard`, `/paste`, `HrdrHost::read_clipboard`, and
+  `flush_clipboard` after every vim key — and `GetClipboardData` waits on a
+  delayed-render source (Excel, Office), so a slow or hung source app stalls the
+  TUI; moving them off-thread is the fix. And `clipboard_paste` prefers `Png`,
+  which `WindowsBackend::available` reports whenever `CF_DIBV5` is listed —
+  Office puts a bitmap beside its text, so Ctrl+] on copied cells likely
+  attaches a picture of them (unverified: no Office here). Not verified:
+  delayed-render stall lengths, real PrintScreen/Snipping Tool output, aarch64.
 
 ## Correctness review 2026-08-14
 
