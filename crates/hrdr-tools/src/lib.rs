@@ -793,7 +793,9 @@ pub fn resolve_under(base: &std::path::Path, path: &str) -> PathBuf {
 /// returned path never contains unprocessed `ParentDir` components. This
 /// prevents a confinement bypass where a path like
 /// `cwd/nonexistent/../../etc/passwd` would pass a `starts_with(cwd)` check
-/// despite escaping the working directory.
+/// despite escaping the working directory. A `..` steps up from where the OS
+/// would: on unix from the resolved path before it, so `cwd/link/x/../..`
+/// under a symlinked `link` names the link target's parent, not `cwd`.
 ///
 /// A dangling symlink anywhere along the path is resolved to its target, not
 /// only in the final position: `cwd/link/file` under a dangling `link` names a
@@ -808,6 +810,29 @@ pub fn canonicalize_nearest(path: &std::path::Path) -> PathBuf {
 const MAX_CANON_SYMLINKS: usize = 40;
 
 fn canonicalize_nearest_bounded(path: &std::path::Path, budget: usize) -> PathBuf {
+    // `..` steps up from what the path before it names, and the platforms
+    // disagree on what that is. Windows resolves it from the text before
+    // following any link — as every lookup below does there, and as the walk's
+    // lexical fallback does — so it needs nothing more. Unix resolves it from
+    // the head as the kernel walks it, through any symlink: `link/x/../..`
+    // under `link -> /a/b` is `/a` once a write has created `x`, not the
+    // link's own parent. The walk cannot step past a trailing `..` (it has no
+    // file name) and would fall back to the text, so settle each one first.
+    #[cfg(not(windows))]
+    if let Some(at) = path
+        .components()
+        .position(|c| c == std::path::Component::ParentDir)
+        && at > 0
+    {
+        let head: PathBuf = path.components().take(at).collect();
+        let resolved = canonicalize_nearest_bounded(&head, budget);
+        let mut next = resolved
+            .parent()
+            .unwrap_or(resolved.as_path())
+            .to_path_buf();
+        next.extend(path.components().skip(at + 1));
+        return canonicalize_nearest_bounded(&next, budget);
+    }
     let mut existing = path;
     let mut rest = Vec::new();
     loop {
@@ -4035,29 +4060,33 @@ b:2:y"
         assert_eq!(canon, cwd.join("other/file"));
     }
 
+    /// `..` below a symlinked directory resolves where the OS would put a write.
+    /// With `project/link -> outside/deep`, `project/link/x/../../escaped` reads
+    /// as `project/escaped`. Unix steps up from the resolved head, so once a
+    /// write creates `x` it lands in `outside/escaped`: the guard has to see
+    /// that, or the write leaves the project unnoticed. Windows steps up in the
+    /// text, before following the link, so there it is `project/escaped`.
+    /// Skips on a Windows machine that may not create symlinks (never on CI).
     #[test]
     fn normalize_path_handles_existing_and_nonexistent_symlink_targets() {
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("project");
+        // Canonical root so the expected path matches `canonicalize_nearest`'s
+        // resolved ancestor on macOS (`/private`) and Windows (`\\?\`).
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let cwd = root.join("project");
         std::fs::create_dir_all(&cwd).unwrap();
-        // Create a symlink inside the project pointing outside.
-        let outside = dir.path().join("outside_file");
-        std::fs::write(&outside, "content").unwrap();
-        if !hrdr_test_support::symlink_or_skip(&outside, &cwd.join("link")) {
+        let deep = root.join("outside/deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        if !hrdr_test_support::symlink_or_skip(&deep, &cwd.join("link")) {
             return;
         }
 
-        // Path using the symlink component + `..` escape in unresolved suffix.
-        // project/link/../../outside/other — `link` follows to `outside_file`,
-        // but the `..` in the unresolved part should be normalized.
-        let path = cwd.join("link/../../other/file");
-        let canon = canonicalize_nearest(&path);
-        // The `..` from inside the symlink-target dir resolves above it;
-        // the result must not start with cwd (the path escapes).
-        assert!(
-            !canon.starts_with(&cwd),
-            "symlink-escaped path {canon:?} must not start with cwd {cwd:?}"
-        );
+        let canon = canonicalize_nearest(&cwd.join("link/absent/../../escaped/file"));
+        #[cfg(unix)]
+        let lands = root.join("outside");
+        #[cfg(windows)]
+        let lands = cwd.clone();
+        assert_eq!(canon, lands.join("escaped").join("file"));
     }
 
     /// A dangling symlink must resolve to its target: a write through it lands

@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The path guard now resolves `..` below a symlink where unix would.**
+  `canonicalize_nearest` read a path whose remainder ended in `..` from its
+  text, so `cwd/link/x/../../y` under `link` pointing outside the working
+  directory was reported as `cwd/y` and passed the confinement check, while a
+  write that creates `x` lands beside the link's target. On unix each `..` now
+  steps up from the resolved path before it; Windows already resolves `..` from
+  the text, as the OS does (`crates/hrdr-tools`).
+
 ## [0.17.0] - 2026-10-17
 
 ### Breaking
