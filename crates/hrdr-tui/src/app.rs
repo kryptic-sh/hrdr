@@ -1659,6 +1659,9 @@ impl App {
 
         self.suppress_completions = false;
         self.editor.feed_key(ekey);
+        if let Some(why) = self.editor.take_notice() {
+            self.toasts.warn(why);
+        }
         Action::None
     }
 

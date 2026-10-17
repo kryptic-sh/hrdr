@@ -8661,6 +8661,53 @@ async fn pruning_keeps_the_header_banner_not_a_leading_system_entry() {
     );
 }
 
+/// A plain engine whose every key runs into a clipboard failure — a stand-in
+/// for a vim yank on a machine without a clipboard, which a test cannot cause.
+struct FailingClipboardEngine(hrdr_editor::PlainEngine);
+
+impl hrdr_editor::EditorEngine for FailingClipboardEngine {
+    fn feed_key(&mut self, key: hrdr_editor::EditorKey) {
+        self.0.feed_key(key);
+    }
+    fn content(&self) -> String {
+        self.0.content()
+    }
+    fn set_content(&mut self, text: &str) {
+        self.0.set_content(text);
+    }
+    fn mode_label(&self) -> &'static str {
+        self.0.mode_label()
+    }
+    fn is_insert(&self) -> bool {
+        self.0.is_insert()
+    }
+    fn wants_submit(&self, key: &hrdr_editor::EditorKey) -> bool {
+        self.0.wants_submit(key)
+    }
+    fn keybind_hint(&self) -> &'static str {
+        self.0.keybind_hint()
+    }
+    fn take_notice(&mut self) -> Option<&'static str> {
+        Some("clipboard unavailable")
+    }
+}
+
+impl hrdr_editor::TuiRender for FailingClipboardEngine {
+    fn render(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        self.0.render(frame, area);
+    }
+}
+
+/// What a key ran into in the editor reaches the user as a toast.
+#[tokio::test]
+async fn an_editor_notice_after_a_key_becomes_a_toast() {
+    let mut h = Harness::new(vec![]).await;
+    h.app.editor = Box::new(FailingClipboardEngine(hrdr_editor::PlainEngine::new()));
+    h.app
+        .on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(h.app.toasts.last_body(), Some("clipboard unavailable"));
+}
+
 /// Vim undo reaches across a history recall: the recalled text replaced the
 /// draft as one undoable edit, so `u` brings the draft back instead of finding
 /// an emptied undo history.

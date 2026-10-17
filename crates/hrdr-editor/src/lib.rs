@@ -67,6 +67,11 @@ pub trait EditorEngine {
     fn replace_content(&mut self, text: &str) {
         self.set_content(text);
     }
+    /// Something the last key ran into that the user should hear about — a
+    /// failed clipboard write. Taken once: a second call returns `None`.
+    fn take_notice(&mut self) -> Option<&'static str> {
+        None
+    }
     /// FSM-agnostic uppercase mode label for status chrome (e.g. "NORMAL").
     fn mode_label(&self) -> &'static str;
     /// Whether the engine is in a text-insertion mode (cursor-shape hint).
@@ -400,6 +405,10 @@ impl EditorEngine for VimEngine {
 
     fn replace_content(&mut self, text: &str) {
         self.editor.set_content_undoable(text);
+    }
+
+    fn take_notice(&mut self) -> Option<&'static str> {
+        self.editor.host_mut().take_clipboard_notice()
     }
 
     fn mode_label(&self) -> &'static str {

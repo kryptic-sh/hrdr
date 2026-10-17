@@ -13,6 +13,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wiping vim's undo history, so `u` could not bring back the draft they
   replaced. They now replace it as one undoable edit
   (`EditorEngine::replace_content`, `crates/hrdr-editor`, `crates/hrdr-tui`).
+- **A vim yank that cannot reach the OS clipboard now says so.** A failed
+  clipboard write, or a machine with no clipboard, was silently dropped, so a
+  yank looked like it worked. It now raises a toast — once per run of failures,
+  not on every `x` (`EditorEngine::take_notice`, `crates/hrdr-editor`,
+  `crates/hrdr-tui`).
 
 ### Fixed
 
