@@ -2947,11 +2947,17 @@ and **not** fixed.
   UI thread — `App::paste_clipboard`, `/paste`, `HrdrHost::read_clipboard`, and
   `flush_clipboard` after every vim key — and `GetClipboardData` waits on a
   delayed-render source (Excel, Office), so a slow or hung source app stalls the
-  TUI; moving them off-thread is the fix. And `clipboard_paste` prefers `Png`,
-  which `WindowsBackend::available` reports whenever `CF_DIBV5` is listed —
-  Office puts a bitmap beside its text, so Ctrl+] on copied cells likely
-  attaches a picture of them (unverified: no Office here). Not verified:
-  delayed-render stall lengths, real PrintScreen/Snipping Tool output, aarch64.
+  TUI; moving them off-thread is the fix. Not done 2026-10-18, for two reasons:
+  hjkl's `Host::read_clipboard` is synchronous, so the `"+p` read cannot move at
+  all; and a write worker alone opens an ordering trap — `"+y` then `"+p` would
+  read the OS clipboard before the worker wrote it and paste the old contents,
+  unless the read first waits for the worker to drain. (`Clipboard` is
+  `Send + Sync`, and hjkl-clipboard's `MockBackend` records writes.) And
+  `clipboard_paste` prefers `Png`, which `WindowsBackend::available` reports
+  whenever `CF_DIBV5` is listed — Office puts a bitmap beside its text, so
+  Ctrl+] on copied cells likely attaches a picture of them (unverified: no
+  Office here). Not verified: delayed-render stall lengths, real
+  PrintScreen/Snipping Tool output, aarch64.
 
 ## Correctness review 2026-08-14
 
