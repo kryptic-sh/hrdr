@@ -580,21 +580,22 @@ round journal; items 2-4 dropped — not fixable as proposed, or disproved at
 review time.** Each item carries its own tag below.
 
 2. **~3-4 heap allocations per streamed token.** **[dropped — infeasible: the
-   event must survive to the frontend's `on_event` (`registry.rs:880-883`), so
-   `record` cannot give ownership to `from_event`; a borrowed-`Record` variant
-   is a larger refactor for one small clone per chunk]** Per chunk:
-   `Accumulator::push` clones the delta (`hrdr-llm/src/types.rs:820`), the
-   reasoning path clones (`turn_loop.rs:223`), `record` clones the whole event
-   into the log (`registry.rs:427`), `Record::from_event` clones every string
-   field again (`transcript_log.rs:111-143`), and the pane drain clones once
-   more (`registry.rs:103`). Fix: `Record::from_event` takes the event by value
-   (the closure at `registry.rs:880-883` owns it and drops it immediately),
-   moving the strings — cuts ~2 allocations per token.
+   event must survive to the frontend's `on_event`
+   (`AgentRegistry::start_turn`), so `record` cannot give ownership to
+   `from_event`; a borrowed-`Record` variant is a larger refactor for one small
+   clone per chunk]** Per chunk: `Accumulator::push` clones the delta
+   (`hrdr-llm/src/types.rs:820`), the reasoning path clones
+   (`turn_loop.rs:223`), `record` clones the whole event into the log
+   (`registry.rs:427`), `Record::from_event` clones every string field again
+   (`transcript_log.rs:111-143`), and the pane drain clones once more
+   (`registry.rs:103`). Fix: `Record::from_event` takes the event by value (the
+   `on_event` closure in `AgentRegistry::start_turn` owns it and drops it
+   immediately), moving the strings — cuts ~2 allocations per token.
 3. **No-usage fallback re-estimates the whole history every round.** **[dropped
    — risk > value: a running token counter must track ~11 message-mutation sites
    including in-place edits (`turn_loop.rs:408`, `compaction.rs:531`); a missed
    one silently corrupts the budget cap for a ~µs-per-round win]**
-   `budget.rs:122-127`: when the endpoint reports no usage,
+   `Agent::account_usage` (`budget.rs`): when the endpoint reports no usage,
    `estimate_tokens_in_messages(&self.messages)` is O(N) per round. Fix: keep a
    running prompt-token estimate, add only messages appended since the last
    call. Same as the archived review's #5, still open.
@@ -609,8 +610,8 @@ review time.** Each item carries its own tag below.
    here.
 
 **Not settled without profiling:** the per-frame transcript layout loop
-(`ui.rs:880-916`) at very long transcripts, and item 2's real lock-contention
-timing.
+(`draw_transcript`, `ui.rs`) at very long transcripts, and item 2's real
+lock-contention timing.
 
 ## Tidy review 2026-08-04
 
@@ -674,11 +675,11 @@ hrdr-test-support + apps/hrdr). The one item left open by decision is below,
 re-traced at its cited lines.
 
 **Context — `budget`'s O(H) token estimate per round when the server reports no
-usage.** `crates/hrdr-agent/src/budget.rs:122-127`
-(`estimate_tokens_in_messages(&self.messages)` per round in `account_usage` when
-`acc.usage` is None). Cheap per pass; hoistable into a running total, but needs
-care across compaction/resume. Not worth it unless the no-usage case
-(self-hosted servers) is common.
+usage.** `Agent::account_usage` in `crates/hrdr-agent/src/budget.rs`
+(`estimate_tokens_in_messages(&self.messages, …)` per round when `acc.usage` is
+None). Cheap per pass; hoistable into a running total, but needs care across
+compaction/resume. Not worth it unless the no-usage case (self-hosted servers)
+is common.
 
 **Recorded items confirmed still present (not re-recorded):** the per-frame
 full-transcript layout walk (`ui.rs:2664` `transcript_chunks` + `:912-918`
@@ -2773,15 +2774,19 @@ and **not** fixed.
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
   intentionally does not affect animation eligibility; only transcript viewport
-  visibility does. **Coverage gaps (stated as gaps):**
+  visibility does.
 
-- **33 tests still run only on Linux** (CI at `5a8d8a5`). Unix by nature: the
-  mode-bit tests (`*_owner_only`, `*_0600*`,
-  `ensure_private_dir_sets_0700_on_unix`,
-  `atomic_write_preserves_mode_and_replaces_content`), `O_NOFOLLOW`
-  (`open_wire_log_*`, `owner_only_options_no_follow_refuses_a_symlink` — no
-  Windows equivalent exists, see Hardening notes) and the Landlock backend.
-  **Not unix by nature, still gated:** none. The last,
+**Coverage gaps (stated as gaps):**
+
+- **Some tests still run only on unix.** Unix by nature: the mode-bit tests
+  (`*_owner_only`, `*_0600*`, `ensure_private_dir_sets_0700_on_unix`,
+  `atomic_write_preserves_mode_and_replaces_content`), the `O_NOFOLLOW` refusals
+  (`open_wire_log_rejects_pre_existing_symlink`,
+  `open_wire_log_refuses_final_component_symlink_with_o_nofollow`,
+  `owner_only_options_no_follow_refuses_a_symlink`; Windows'
+  `FILE_FLAG_OPEN_REPARSE_POINT` half is covered on every platform by
+  `owner_only_options_no_follow_never_reaches_a_link_target`) and the Landlock
+  backend. **Not unix by nature, still gated:** none. The last,
   `a_jailed_delegation_requires_a_contained_cwd`'s symlink escape, now links to
   the caller's own parent instead of `/` and fails on Windows when containment
   is checked lexically. What remains is unix by nature: the `hrdr-llm`
@@ -3663,8 +3668,6 @@ code changed by the audit itself.
 - **Paste cap and gate/sandbox/whitespace dedup.** `take(MAX_PASTE_CHARS)` (also
   bounds memory from a poisoned clipboard); `join_paths`/`is_whole`/
   `collapse_whitespace` verified byte-equivalent to the originals.
-
-**Hardening (correct today, fragile — explicitly not vulnerabilities):**
 
 **Coverage:** walked in full this pass — `hrdr-tools` cron.rs, goal.rs,
 ToolContext + registration + `JAIL_TOOLS`, lib.rs secret/identity/resolve
