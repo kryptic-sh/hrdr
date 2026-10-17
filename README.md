@@ -318,8 +318,24 @@ Run `scripts/notes.sh` for the changelog draft.
 | `Esc` twice               | Interrupt the running turn or `!command`                                                                                                   |
 | `Ctrl+C` twice            | Quit when idle with an empty input; `Ctrl+Q` quits at once                                                                                 |
 
-Pass `--vim` for a full [hjkl](https://github.com/kryptic-sh/hjkl) vim editor in
-the input pane instead of the default plain input.
+Pass `--vim` (or set `vim = true` in the config file) for an
+[hjkl](https://github.com/kryptic-sh/hjkl) vim editor in the input pane instead
+of the default plain input. It starts in Normal mode, and:
+
+- `Enter` in Normal mode sends; in Insert mode it is a newline. While a command
+  is half-typed — a `/` or `?` search, an operator such as `d`, a count —
+  `Enter` and `Esc` go to vim, and `Esc` interrupts a running turn only from
+  idle Normal mode.
+- `/` and `?` search the draft, with the prompt on the box's bottom row and its
+  matches lit while it is open.
+- Long lines wrap; the box grows to fit.
+- `u` undoes a history recall or a stash pop, bringing the draft back.
+- Every yank and delete goes to the OS clipboard; a failed write raises a toast.
+- hrdr keeps some keys in every mode: `Up`/`Down` (history), `Ctrl+C`, `Ctrl+S`,
+  `Ctrl+G`, `Ctrl+L`, `Ctrl+Q` and `Ctrl+]` as in the table above.
+  `Ctrl+U`/`Ctrl+D` scroll the transcript from idle Normal mode.
+- There is no `:` command line. hrdr's `/name` and `:name` commands are typed as
+  text, in Insert mode.
 
 ### Slash commands
 
