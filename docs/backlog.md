@@ -3260,12 +3260,17 @@ single-flight coordinator (cancel-safe `RefresherGuard`).
 **Hardening (correct today, fragile — not vulnerabilities):**
 
 - **`open_system_handler` Windows `cmd /C start` escaping is partial**
-  (`hrdr-app/src/commands/dispatch.rs:574-610`): only `&` is caret-escaped, so
-  other cmd metacharacters (`|`, `<`, `>`, `%`, `^`) in a path would still be
-  interpreted. Inert today: `open_browser` passes a fixed OAuth URL and
-  `open_editor` has no in-tree caller (the TUI overrides the trait default);
-  platform-gated, so not compiled locally. Worth fixing only if a real user-path
-  caller appears.
+  (`windows_escape_for_cmd_start`, `hrdr-app/src/commands/dispatch.rs`): only
+  `&` is caret-escaped, so other cmd metacharacters (`|`, `<`, `>`, `%`, `^`) in
+  a path would still be interpreted. Inert today: `open_browser` passes a fixed
+  OAuth URL and `open_editor` has no in-tree caller (the TUI overrides the trait
+  default). Worth fixing only if a real user-path caller appears — and then it
+  is not "caret-escape more characters" (looked at 2026-10-18):
+  `std::process::Command` quotes an argument holding a space, inside quotes a
+  caret is literal, and no escape stops `%NAME%` expanding in a quoted `cmd /C`
+  argument. A real fix builds the command line itself (`raw_arg`) and must keep
+  the one live caller working: the percent-encoded OAuth authorize URL, which
+  today's `&`-only escaping handles.
 
 The pre-existing `session.rs` reservation-lock lost-update (since fixed,
 `40bdb6f8`: `Reservation::drop` is the only release),
