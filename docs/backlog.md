@@ -1076,18 +1076,6 @@ The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
   switching to them would keep the trust gate honoured either way. Not changed;
   needs a call on which behaviour is wanted.
 
-Coverage gaps, stated plainly:
-
-- **Not tested: discovery from the user-scope roots.** Every discovery test uses
-  project scopes under a `tempfile::tempdir`, because `$HOME` is one sandboxed
-  directory shared by all tests in a process and a real bundle planted there
-  would leak into other tests' discovery. The jail-read test
-  (`a_jailed_agent_may_read_the_user_skill_roots`) creates only an empty
-  `~/.claude/skills` directory for that reason, and
-  `codex_home_overrides_the_default_codex_root` tests `skill_dirs` (the pure
-  path function) rather than a planted bundle. What is therefore unexercised is
-  the walk of a user root, not the roots' composition.
-
 ## Deferred 2026-08-11 — media attachments
 
 Images and PDFs ship end to end: `hrdr_llm::media` renders them for all three

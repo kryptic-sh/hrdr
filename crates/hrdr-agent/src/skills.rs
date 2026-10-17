@@ -1180,4 +1180,42 @@ mod tests {
         let found = discover_skills(dir.path(), crate::prompt::ProjectInstructions::Load);
         assert!(found.skills.iter().any(|s| s.name == "ship"));
     }
+
+    /// A bundle under a user-scope root is discovered — the walk of a user
+    /// root, not only the list of roots — even with project instructions
+    /// skipped. In a child process: a bundle planted under the shared test home,
+    /// or `$CODEX_HOME` pointed at one, would show up in every other test's
+    /// discovery in this process.
+    #[test]
+    fn a_user_root_bundle_is_discovered() {
+        const CHILD: &str = "HRDR_USER_SKILL_ROOT_TEST_CHILD";
+        const NAME: &str = "skills::tests::a_user_root_bundle_is_discovered";
+        if std::env::var_os(CHILD).is_none() {
+            let codex_home = tempfile::tempdir().unwrap();
+            bundle(
+                &codex_home.path().join("skills"),
+                "user-skill",
+                &skill_md("user-skill", "from the user root", "Body."),
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, "1")
+                .env(CODEX_HOME, codex_home.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let found = discover_skills(
+            Path::new("/nonexistent-cwd"),
+            crate::prompt::ProjectInstructions::Skip,
+        );
+        let names: Vec<_> = found.skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"user-skill"), "{names:?}");
+    }
 }
