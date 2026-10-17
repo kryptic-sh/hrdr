@@ -344,7 +344,9 @@ pub struct VimEngine {
 
 impl VimEngine {
     pub fn new() -> Self {
-        let editor = Editor::new(
+        // `vim_editor`, not `Editor::new`: the latter installs no discipline,
+        // and the first key dispatched to it panics.
+        let editor = hjkl_vim::vim_editor(
             hjkl_buffer::View::new(),
             HrdrHost::new(),
             Options {
@@ -704,5 +706,39 @@ mod wrap_tests {
         for c in sanitize_for_terminal("\x1b\x07\x00").chars() {
             assert_eq!(char_width(c), 1, "{c:?} must render as one cell");
         }
+    }
+}
+
+#[cfg(test)]
+mod vim_tests {
+    use super::*;
+
+    fn key(code: EditorKeyCode) -> EditorKey {
+        EditorKey {
+            key: code,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
+    }
+    fn type_keys(e: &mut VimEngine, keys: &str) {
+        for c in keys.chars() {
+            e.feed_key(key(EditorKeyCode::Char(c)));
+        }
+    }
+
+    /// Keys reach hjkl's vim FSM: insert, leave insert, then an operator. An
+    /// engine built without the vim discipline panics on the first key, while
+    /// still reporting NORMAL — which is all a mode-label check can see.
+    #[test]
+    fn keys_drive_the_vim_fsm() {
+        let mut e = VimEngine::new();
+        type_keys(&mut e, "ihi");
+        assert!(e.is_insert());
+        e.feed_key(key(EditorKeyCode::Esc));
+        assert_eq!(e.mode_label(), "NORMAL");
+        assert_eq!(e.content().trim_end_matches('\n'), "hi");
+        type_keys(&mut e, "0x");
+        assert_eq!(e.content().trim_end_matches('\n'), "i");
     }
 }

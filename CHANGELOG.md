@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Vim mode no longer panics on the first key.** Since hjkl 0.33.6 an editor
+  built with `Editor::new` carries no editing discipline, and `VimEngine` built
+  it that way, so `--vim` / `vim = true` crashed hrdr the moment a key reached
+  the input box (`vim discipline not installed on this Editor`) while the mode
+  label still read NORMAL. It now builds through `hjkl_vim::vim_editor`
+  (`crates/hrdr-editor`).
 - **The path guard now resolves `..` below a symlink where unix would.**
   `canonicalize_nearest` read a path whose remainder ended in `..` from its
   text, so `cwd/link/x/../../y` under `link` pointing outside the working
