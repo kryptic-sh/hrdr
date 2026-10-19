@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`message_session` says why a registered session could not be messaged.** A
+  send to a session that discovery found registered but not answering was
+  refused as "no running session", the same words as one that had exited, so the
+  model was sent back to `sessions` for a session already listed there. It now
+  names the session as registered but not answering, with the answer its probe
+  got, and says nothing was sent (`crates/hrdr-tui`).
+
 ## [0.17.1] - 2026-10-19
 
 ### Changed

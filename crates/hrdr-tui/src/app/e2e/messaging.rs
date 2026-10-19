@@ -273,6 +273,58 @@ async fn the_model_lists_other_sessions_and_messages_one_as_this_session() {
     recipient.close().await;
 }
 
+/// A send names a session that discovery found registered but not answering
+/// by what it answered, rather than calling it not running — the two read
+/// alike to the model, and only one of them is worth asking `sessions` about.
+#[tokio::test]
+async fn a_send_to_a_session_that_did_not_answer_says_why() {
+    let _data_home = isolated_data_home();
+    let own = peer("resolve-own").await;
+    let other = peer("resolve-other").await;
+    let target = other.descriptor();
+    let (id, cwd) = (target.session_id.clone(), target.working_directory.clone());
+    let resolve = |found| {
+        super::super::messaging_tools::resolve_target(found, &own.descriptor().endpoint, &id, &cwd)
+    };
+
+    let live = hrdr_agent::messaging::Discovery {
+        live: vec![own.descriptor(), target.clone()],
+        unreachable: Vec::new(),
+    };
+    assert_eq!(resolve(live).unwrap(), target);
+
+    let silent = hrdr_agent::messaging::Discovery {
+        live: vec![own.descriptor()],
+        unreachable: vec![(target.clone(), "answered Unavailable".into())],
+    };
+    let error = resolve(silent).unwrap_err().to_string();
+    assert!(
+        error.contains("registered but did not answer (answered Unavailable)"),
+        "{error}"
+    );
+
+    let gone = hrdr_agent::messaging::Discovery {
+        live: vec![own.descriptor()],
+        unreachable: Vec::new(),
+    };
+    let error = resolve(gone).unwrap_err().to_string();
+    assert!(error.contains("no running session"), "{error}");
+
+    // This session is never its own target, even under the name it was asked for.
+    let mut mirror = own.descriptor();
+    mirror.session_id = id.clone();
+    mirror.working_directory = cwd.clone();
+    let error = resolve(hrdr_agent::messaging::Discovery {
+        live: vec![mirror],
+        unreachable: Vec::new(),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("no running session"), "{error}");
+    own.close().await;
+    other.close().await;
+}
+
 #[tokio::test]
 async fn two_sessions_with_one_id_and_cwd_are_not_guessed_between() {
     let _data_home = isolated_data_home();

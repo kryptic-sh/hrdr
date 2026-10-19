@@ -251,11 +251,18 @@ push each verified slice to `main` before proceeding to the next slice.
    re-runs discovery (`peers` in `messaging_tools.rs`) rather than reusing the
    `sessions` listing, so this is the discovery flake again, not delivery: the
    live peer dropped out of a second listing moments after the first one found
-   it. The same commit's tag run passed every job, this one included. Not
-   reproduced locally (12 runs of the two messaging tests together, 6 of the
-   full `tui_pty` suite, Windows, pinned host). No test covers `stopped_by`
-   being set: nothing can make a pipe accept fail on demand. Same day, one
-   parallel `local_ipc` run failed
+   it. The same commit's tag run passed every job, this one included. Again on
+   `ec0bef24` (run 39225324122, Windows release smoke, 2026-10-19, 237 ms,
+   `peer open: true, stopped by: None`), while its tag run passed. Since then
+   `message_session` resolves through `discover_detailed`
+   (`messaging_tools::resolve_target`): a peer the second listing found
+   registered but not answering is refused with its probe's answer ("registered
+   but did not answer (…)"), and only a peer missing from the registry
+   altogether still reads "no running session" — so the next recurrence says
+   which of the two dropped it. Not reproduced locally (12 runs of the two
+   messaging tests together, 6 of the full `tui_pty` suite, Windows, pinned
+   host). No test covers `stopped_by` being set: nothing can make a pipe accept
+   fail on demand. Same day, one parallel `local_ipc` run failed
    `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
    stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a full
    Windows workspace run beside other sessions' builds: that test and

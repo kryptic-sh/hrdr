@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use hrdr_agent::messaging::{MAX_MESSAGE_BYTES, Messaging, SendStatus};
-use hrdr_tools::local_ipc::SessionDescriptor;
+use hrdr_agent::messaging::{Discovery, MAX_MESSAGE_BYTES, Messaging, SendStatus};
+use hrdr_tools::local_ipc::{EndpointId, SessionDescriptor};
 use hrdr_tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 
@@ -37,15 +37,38 @@ async fn running(view: &MessagingView) -> Result<Arc<Messaging>> {
     }
 }
 
-/// Every live session but this one.
-async fn peers(runtime: &Messaging) -> Result<Vec<SessionDescriptor>> {
-    let own = runtime.descriptor();
-    Ok(runtime
-        .discover()
-        .await?
-        .into_iter()
-        .filter(|session| session.endpoint != own.endpoint)
-        .collect())
+/// The one live session other than `own` that `session_id` and `cwd` name in
+/// `found`. A registered session that did not answer is refused with the reason
+/// discovery recorded, so "not running" is only said of one that is not there.
+pub(crate) fn resolve_target(
+    found: Discovery,
+    own: &EndpointId,
+    session_id: &str,
+    cwd: &str,
+) -> Result<SessionDescriptor> {
+    let named = |session: &SessionDescriptor| {
+        session.endpoint != *own
+            && session.session_id == session_id
+            && session.working_directory == cwd
+    };
+    let mut matches = found.live.into_iter().filter(named);
+    match (matches.next(), matches.next()) {
+        (Some(target), None) => Ok(target),
+        (Some(_), Some(_)) => bail!(
+            "more than one running session has session_id {session_id:?} in {cwd:?}; \
+             it cannot be told apart"
+        ),
+        (None, _) => match found.unreachable.into_iter().find(|(s, _)| named(s)) {
+            Some((_, reason)) => bail!(
+                "the session with session_id {session_id:?} in {cwd:?} is registered but \
+                 did not answer ({reason}); nothing was sent"
+            ),
+            None => bail!(
+                "no running session has session_id {session_id:?} in {cwd:?}; call `sessions` \
+                 for the current list"
+            ),
+        },
+    }
 }
 
 pub(crate) struct SessionsTool {
@@ -162,21 +185,12 @@ impl Tool for MessageSessionTool {
             bail!("the message is over the {MAX_MESSAGE_BYTES}-byte limit");
         }
         let runtime = running(&self.view).await?;
-        let mut matches = peers(&runtime)
-            .await?
-            .into_iter()
-            .filter(|session| session.session_id == session_id && session.working_directory == cwd);
-        let target = match (matches.next(), matches.next()) {
-            (Some(target), None) => target,
-            (None, _) => bail!(
-                "no running session has session_id {session_id:?} in {cwd:?}; call `sessions` \
-                 for the current list"
-            ),
-            (Some(_), Some(_)) => bail!(
-                "more than one running session has session_id {session_id:?} in {cwd:?}; \
-                 it cannot be told apart"
-            ),
-        };
+        let target = resolve_target(
+            runtime.discover_detailed().await?,
+            &runtime.descriptor().endpoint,
+            &session_id,
+            &cwd,
+        )?;
         let status = runtime.send(&target, message).await.map_err(|error| {
             anyhow!(
                 "delivery outcome unknown ({error}); the message may have arrived, so do not \
