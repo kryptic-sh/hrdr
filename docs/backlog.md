@@ -2925,7 +2925,11 @@ and **not** fixed.
 - **The Windows leak guard sees less than the others.** `dirs::home_dir()`
   ignores `HOME`/`USERPROFILE` there, so a test that writes through a `dirs`
   fallback lands in the runner's real profile, not the sentinel. Its temp-dir
-  check does work.
+  check does work. Inert today: no workspace crate depends on `dirs` directly
+  (only transitively — checked 2026-10-20), and both of hrdr's own `home_dir`
+  helpers (`agents_dir`, `sandbox`) read `HOME`/`USERPROFILE`. A `clippy.toml`
+  ban was considered and declined: it would name a crate nothing here links,
+  and adding `dirs` is already a dependency decision that would surface it.
 - **Windows test runs with a failure leaked their temp dirs — fixed
   2026-10-15.** libtest ends a binary with a failed test through
   `std::process::exit`, which on Windows is `ExitProcess`: no `atexit` handler
