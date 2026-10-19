@@ -101,6 +101,21 @@ only the list. Delete a line when its question is answered.
   after a submit, which clipboard a yank or delete reaches, arrows in a
   multiline draft, and where the mode indicator goes. _Vim mode — proper
   support._
+- **Added 2026-10-20 — open items that need a call, each tagged where it
+  lives:** MCP tool-description wrapping (_Hardening notes, 2026-08-05 security
+  audit_); `open_system_handler` `raw_arg` rewrite (_Security audit
+  2026-08-28_); write mode's whole temp dir (_Peer-comparison findings →
+  Permissions, isolation, and state_); a shell pre-flight (_Sandbox
+  follow-ups_); handle-relative no-follow opens (_Consistency / robustness_); a
+  profile with no search tool (_Known behaviour to revisit_); an image dimension
+  check, and a real-time lock-staleness test (_Deferred 2026-08-11 — media_);
+  the hrdr clipboard worker, text-over-PNG, and the upstream hjkl-clipboard
+  fixes (_Windows support review_); `compaction_tail_start` and the trailing
+  backslash (_Correctness review 2026-08-14_); `verify` dry run and resumed
+  `read_only` (_Security audit 2026-08-30_); the cron late fire (_Correctness
+  review 2026-09-04_); the unix completion-identity red/green (_Windows support
+  review_); per-surface shell choice (queue item 6) and broadening the
+  self-update handoff (queue item 8).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -331,7 +346,9 @@ push each verified slice to `main` before proceeding to the next slice.
    offered through the `shell` tool's `shell` argument, and dialect sections for
    each offered shell. Verified locally on Windows only; macOS/Linux rely on CI.
    Hooks, `verify`, `watch` and the TUI's `!command` still run the default shell
-   only — no per-call choice there.
+   only — no per-call choice there. **[Deferred — question for the owner; see
+   the index at the top]** **Question:** give those a shell choice too (a config
+   key per surface, or one shared default), or keep them on the default shell?
 7. **TODO-to-TODO dependencies — question for the owner.** Watch-aware TODO
    nudges shipped: an item's `waits_on` names a running watch (see the
    changelog). The request's repeated "TODO item" wording could also mean one
@@ -418,7 +435,10 @@ push each verified slice to `main` before proceeding to the next slice.
    handoff waits for quiescence, and a queued steer relaunches a turn at `Done`,
    so queued messages are delivered before the handoff rather than lost. It
    becomes necessary once the contract is broadened to hand off with work
-   outstanding.
+   outstanding. **[Deferred — question for the owner; see the index at the
+   top]** **Question:** broaden the handoff to carry queued messages, child
+   tasks and watches (needs queue persistence and a recovery test per kind), or
+   keep the quiescent-only contract?
 9. **Windows multiline paste — shipped 2026-10-15 (`58b2c631`); gaps left.** Not
    verified by hand: pasting and typing in a real Windows Terminal and in a
    classic console window (the pty tests run under ConPTY only). CI's Windows
@@ -1106,11 +1126,14 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   inlines text files, and `@` is ordinary punctuation in prose a model writes.
   Both feed one builder, so the difference is input rather than a second
   implementation — pinned by `the_two_paths_build_the_same_message`.
-- **No lock test waits out a staleness window in real time.** The cross-process
+- **No lock test waits out a staleness window in real time.** **[Deferred —
+  question for the owner; see the index at the top]** The cross-process
   `store_lock` tests (`LockHolder`, driving the `#[ignore]`d
   `child_process_holds_the_lock`) run on every platform, liveness probe
   included, but every staleness test backdates the timestamp: the clock
-  arithmetic is exercised, a minute of real waiting is not.
+  arithmetic is exercised, a minute of real waiting is not. **Question:** add an
+  `#[ignore]`d test that waits out a real window (a minute per run, run by
+  hand), or accept the backdated coverage?
 - **An image is now priced for the endpoint it is bound for** (`TokenTarget` in
   `media.rs`, threaded through `estimate_tokens_in_messages`), which closes the
   "charged at Anthropic's tier for every dialect" entry that stood here. What is
@@ -1166,13 +1189,15 @@ raised to Anthropic's documented 10 MB (it had been 5 MB, which is the
 Bedrock/Google-Cloud number, and hrdr never speaks the Messages API to either).
 What that audit did not close:
 
-- **No dimension check anywhere.** The vision docs cap an image at 8000x8000 px,
-  and apply a stricter per-image dimension limit once a request carries more
-  than 20 images ("resize each image so that neither dimension exceeds 2000
-  px"). `image_dimensions` already reads width and height for the token
-  estimate, so the check is cheap to add — it was left out because a refusal
-  hrdr invents is worse than a provider error hrdr reports, and nobody has hit
-  it.
+- **No dimension check anywhere.** **[Deferred — question for the owner; see the
+  index at the top]** The vision docs cap an image at 8000x8000 px, and apply a
+  stricter per-image dimension limit once a request carries more than 20 images
+  ("resize each image so that neither dimension exceeds 2000 px").
+  `image_dimensions` already reads width and height for the token estimate, so
+  the check is cheap to add — it was left out because a refusal hrdr invents is
+  worse than a provider error hrdr reports, and nobody has hit it. **Question:**
+  add a client-side refusal (or a downscale) before sending, or keep reporting
+  the provider's error?
 - **The image-count cap is the conservative branch.** 100 is the documented
   limit for 200k-context models; other models take 600. The gate is handed a
   model name, not a window, so it applies the smaller one.
@@ -1461,8 +1486,12 @@ directory's files may then do:
 
 **Two smaller confinement gaps, verified and unchanged:**
 
-- **`std::env::temp_dir()` is granted whole** in `write` mode, not just
+- **`std::env::temp_dir()` is granted whole** **[Deferred — question for the
+  owner; see the index at the top]** in `write` mode, not just
   `session_scratch_dir()`. Broader than the stated need, and pre-existing.
+  **Question:** narrow it to the session scratch dir (compilers and tools that
+  write `TMPDIR` would then fail under the sandbox unless pointed there), or
+  keep the whole temp dir writable?
 - **`shell` runs unconfined where no OS backend exists** — Windows always, Linux
   without Landlock. The file tools stay guarded and `NO_OS_SANDBOX_NOTICE`
   fires, so it is admitted rather than silent.
@@ -1591,10 +1620,12 @@ remains open:
   touching one (`DiffRedactor`), so the _accidental_ leak — a broad `rg`, a
   `git diff` of `.env` — no longer reaches the transcript. Deliberate
   exfiltration is untouched and admits it.
-- **No shell-command pre-flight** — still open, and cheaper than it was: the
-  EROFS note now names the remedy (`sandbox_writable_roots`,
-  `--sandbox-writable-root`, `!command`), which was most of what a pre-flight
-  would have said.
+- **No shell-command pre-flight** **[Deferred — question for the owner; see the
+  index at the top]** — still open, and cheaper than it was: the EROFS note now
+  names the remedy (`sandbox_writable_roots`, `--sandbox-writable-root`,
+  `!command`), which was most of what a pre-flight would have said.
+  **Question:** is a pre-flight still wanted, and if so what should it check
+  before a command runs?
 - **Windows `write` mode has no OS confinement** **[Deferred — question for the
   owner; see the index at the top]** (`read` mode is confined by Mandatory
   Integrity Control since 2026-08-02; `write` still takes
@@ -1709,12 +1740,15 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   labels), added to `hrdr-llm`; the cost is the code to build the DACL and its
   tests. Leaving it means a credential file is protected only by the profile
   directory's inherited ACL, which on a standard install is already per-user.
-- **The no-follow open covers only the final path component.** A symlinked
-  _parent_ directory is still traversed on the wire-log open, on unix
-  (`O_NOFOLLOW`) and Windows (`FILE_FLAG_OPEN_REPARSE_POINT`, since 2026-10-16)
-  alike. Recorded on `owner_only_options_no_follow`; closing it properly means
-  resolving the whole path under a directory handle (`openat` on unix,
-  `NtCreateFile` relative to a directory handle on Windows).
+- **The no-follow open covers only the final path component.** **[Deferred —
+  question for the owner; see the index at the top]** A symlinked _parent_
+  directory is still traversed on the wire-log open, on unix (`O_NOFOLLOW`) and
+  Windows (`FILE_FLAG_OPEN_REPARSE_POINT`, since 2026-10-16) alike. Recorded on
+  `owner_only_options_no_follow`; closing it properly means resolving the whole
+  path under a directory handle (`openat` on unix, `NtCreateFile` relative to a
+  directory handle on Windows). **Question:** build that (L: platform code on
+  both sides, for the wire log and now the trust store), or accept
+  final-component protection for same-user files?
 - **`CommandHost`'s text-fallback defaults are now test-only.** **[Deferred —
   question for the owner; see the index at the top]** Found in the 2026-08-02
   web-removal sweep, not fixed — the parent's call, and the Standing-constraints
@@ -1941,13 +1975,14 @@ Not bugs; things whose surprise is worth having written down.
   the old immediacy; deferred as a rework of the riskiest slice for an edge
   case.
 
-- **A profile can allow-list itself into having no search tool.** `read_only`
-  keeps a shell on purpose, and `jail` keeps `grep`/`find`/`ls`/`tree`; but an
-  `allowed_tools` list naming neither leaves an agent that can only `read` by
-  exact path. Nothing validates that at load, and no prompt section can name a
-  search tool it does not hold — `base.md` says "whichever search tool you hold"
-  precisely because there may be none. Worth deciding whether such a profile
-  should be refused at load rather than shipped blind.
+- **A profile can allow-list itself into having no search tool.** **[Deferred —
+  question for the owner; see the index at the top]** `read_only` keeps a shell
+  on purpose, and `jail` keeps `grep`/`find`/`ls`/`tree`; but an `allowed_tools`
+  list naming neither leaves an agent that can only `read` by exact path.
+  Nothing validates that at load, and no prompt section can name a search tool
+  it does not hold — `base.md` says "whichever search tool you hold" precisely
+  because there may be none. **Question:** refuse such a profile at load, warn
+  about it, or allow it?
 - **`write.md` is the largest always-on prompt** after the git/release split,
   and most of its rules carry a shouted ALL-CAPS header. Emphasis that dense
   stops selecting. Neither is a defect; both are what is left of "the always-on
@@ -2029,12 +2064,16 @@ refactor from being the only guard (`web.rs`).
 
 **From the 2026-08-05 security audit:** `atomic_write` write-path TOCTOU
 (`tools/mutation.rs` — admitted in the comment; requires a hostile process
-racing the agent's own edits); MCP tool descriptions ride into the tools cache
-block unwrapped (`handshake_and_list` in `mcp/client.rs`, `Box::leak`) — a
-compromised operator-installed server can steer the model through its
-descriptions, where results are wrapped as untrusted; `/export` writes to any
-absolute path the user names (`export_conversation` — equivalent to the user's
-own shell redirection, but the transcript contains model output).
+racing the agent's own edits); **[Deferred — question for the owner; see the
+index at the top]** MCP tool descriptions ride into the tools cache block
+unwrapped (`handshake_and_list` in `mcp/client.rs`, `Box::leak`) — a compromised
+operator-installed server can steer the model through its descriptions, where
+results are wrapped as untrusted; `/export` writes to any absolute path the user
+names (`export_conversation` — equivalent to the user's own shell redirection,
+but the transcript contains model output). **Question (MCP):** wrap MCP tool
+descriptions in the untrusted-content envelope — they are written by the server,
+which you installed but may not control — at the cost of a longer, noisier tool
+block, or keep treating them as operator-trusted config?
 
 **From the 2026-08-06 correctness pass:**
 
@@ -2042,10 +2081,6 @@ own shell redirection, but the transcript contains model output).
   per-turn cap: every delivered steer resets the round budget, so sustained
   steering (or a held key) keeps the turn alive indefinitely; the cap only binds
   once steers stop. Deliberate and test-pinned, but the meaning changed.
-- The checkpoint note (`checkpoint_warning_round`, `turn_loop.rs`) — its "the
-  turn ends at Y" is computed from the current budget, so after a reset the
-  model can be told the turn ends at `max_steps` when further steers will extend
-  it (advisory text only).
 - `context_after` (`compaction.rs`) is a ~4-bytes/token local estimate, not a
   provider reading; the post-compaction gauge drifts from the provider's real
   `prompt_tokens` (the estimator deliberately under-counts).
@@ -2820,6 +2855,10 @@ and **not** fixed.
   `hrdr-app/src/util.rs` and `hrdr-tui/src/app/e2e.rs` passed Linux/macOS CI in
   `37912493951`; local verification was Windows-only, including a failing
   separator-normalization mutation. Unix old-code red/green remains unrun.
+  **[Deferred — question for the owner; see the index at the top]** Local runs
+  are Windows-only by your call; showing it needs a CI run of the old code (a
+  throwaway branch reverting the fix). **Question:** worth one CI run, or accept
+  the Windows mutation as the evidence?
   `indexed_completion_accepts_platform_path_identity` asserts indexing and
   acceptance; that `@d/e/` and `@d\e/` each attach their own directory's listing
   is `util::tests::colliding_directory_mentions_list_their_own_directory`
@@ -2976,8 +3015,9 @@ and **not** fixed.
     the user's clipboard; `set_png` can leave only the PNG format.
   - No size cap on a read.
 
-  Open, **in hrdr** [read]: every clipboard call is a synchronous OS call on the
-  UI thread — `App::paste_clipboard`, `/paste`, `HrdrHost::read_clipboard`, and
+  Open, **in hrdr** [read] **[Deferred — question for the owner; see the index
+  at the top]** every clipboard call is a synchronous OS call on the UI thread —
+  `App::paste_clipboard`, `/paste`, `HrdrHost::read_clipboard`, and
   `flush_clipboard` after every vim key — and `GetClipboardData` waits on a
   delayed-render source (Excel, Office), so a slow or hung source app stalls the
   TUI; moving them off-thread is the fix. Not done 2026-10-18, for two reasons:
@@ -2990,7 +3030,12 @@ and **not** fixed.
   whenever `CF_DIBV5` is listed — Office puts a bitmap beside its text, so
   Ctrl+] on copied cells likely attaches a picture of them (unverified: no
   Office here). Not verified: delayed-render stall lengths, real
-  PrintScreen/Snipping Tool output, aarch64.
+  PrintScreen/Snipping Tool output, aarch64. **Questions:** (a) move clipboard
+  calls off the UI thread (a worker, with reads waiting for queued writes to
+  drain)? (b) prefer text over PNG when the clipboard offers both? (c) the
+  upstream list above lives in kryptic-sh/hjkl, where another session had
+  uncommitted work on 2026-10-20 — fix it from here and release hjkl, or leave
+  it to that repo's own work?
 
 ## Correctness review 2026-08-14
 
@@ -3006,18 +3051,22 @@ Windows liveness probe, shipped 2026-09-15 as `hrdr_tools::process_alive`).**
 
 **Hardening (open — triage):**
 
-1. **`compaction_tail_start` charges the always-kept newest turn against the
+1. **[Deferred — question for the owner; see the index at the top]**
+   **`compaction_tail_start` charges the always-kept newest turn against the
    preserve budget** (`hrdr-agent/src/compaction.rs`). `tokens` accumulates
    newest-first, so once the newest turn alone exceeds `preserve_recent_tokens`
    the walk breaks at the first older turn — no older turns are kept even if
    each is tiny, and the tail can be far smaller than the budget suggests.
    Matches the documented walk; worth revisiting only if a large newest turn is
-   seen to starve the tail.
-2. **Plain-engine trailing backslash traps Enter** (`hrdr-editor/src/plain.rs`):
+   seen to starve the tail. **Question:** stop charging the newest turn against
+   the budget, or keep the documented walk?
+2. **[Deferred — question for the owner; see the index at the top]**
+   **Plain-engine trailing backslash traps Enter** (`hrdr-editor/src/plain.rs`):
    any message ending in `\` never submits on plain Enter (it becomes a newline
    and eats the backslash); sending needs a second Enter. Documented escape
    design (Alt/Shift+Enter also newline), so deliberate — noted for a Windows
-   path / LaTeX-heavy user.
+   path / LaTeX-heavy user. **Question:** keep `\` + Enter as a newline, or send
+   a message that ends in `\` on Enter?
 
 **Cleared (suspected, traced, safe — do not re-investigate):** Anthropic
 cache-token accounting (`message_start_usage`:
@@ -3291,7 +3340,8 @@ single-flight coordinator (cancel-safe `RefresherGuard`).
 
 **Hardening (correct today, fragile — not vulnerabilities):**
 
-- **`open_system_handler` Windows `cmd /C start` escaping is partial**
+- **[Deferred — question for the owner; see the index at the top]**
+  **`open_system_handler` Windows `cmd /C start` escaping is partial**
   (`windows_escape_for_cmd_start`, `hrdr-app/src/commands/dispatch.rs`): only
   `&` is caret-escaped, so other cmd metacharacters (`|`, `<`, `>`, `%`, `^`) in
   a path would still be interpreted. Inert today: `open_browser` passes a fixed
@@ -3302,7 +3352,8 @@ single-flight coordinator (cancel-safe `RefresherGuard`).
   caret is literal, and no escape stops `%NAME%` expanding in a quoted `cmd /C`
   argument. A real fix builds the command line itself (`raw_arg`) and must keep
   the one live caller working: the percent-encoded OAuth authorize URL, which
-  today's `&`-only escaping handles.
+  today's `&`-only escaping handles. **Question:** build the `raw_arg` command
+  line now, ahead of any user-path caller, or keep waiting for one?
 
 The pre-existing `session.rs` reservation-lock lost-update (since fixed,
 `40bdb6f8`: `Reservation::drop` is the only release),
@@ -3498,11 +3549,14 @@ keys; TLS rustls, no cert bypass; OAuth CSRF/ state/PKCE; blob traversal;
 session/transcript 100 MiB caps; untrusted-content envelope nonce forgery —
 `wrap_untrusted` verifies the nonce absent from the body.
 
-**Hardening (correct today, fragile):** `verify` executes gate commands parsed
-from repo CI YAML — keep out of `JAIL_ TOOLS` (already is) and consider a
-`--dry-run`; session-file `read_only` and identity are still trusted from disk
-at resume (same-user files; the `cwd` is re-checked against the trust store
-since 2026-10-15).
+**Hardening (correct today, fragile):** **[Deferred — question for the owner;
+see the index at the top]** `verify` executes gate commands parsed from repo CI
+YAML — keep out of `JAIL_ TOOLS` (already is) and consider a `--dry-run`;
+session-file `read_only` and identity are still trusted from disk at resume
+(same-user files; the `cwd` is re-checked against the trust store since
+2026-10-15). **Questions:** add a `verify` dry run that lists the commands
+without running them? Re-derive `read_only` on resume rather than trusting the
+file?
 
 **Coverage:** hrdr-tools walked in full incl. `mcp/` and secret_diff; the
 platform-gated backends (Windows LowIntegrity, macOS Seatbelt) were only read —
@@ -3735,17 +3789,19 @@ remained open at that review and was fixed 2026-09-09. Rest cleared.**
 
 **Hardening (correct today, fragile):**
 
-- **A cron fire is late after a clock jump or a suspend** (`run_scheduler`,
-  `cron.rs`). Not DST, as this entry first said (corrected 2026-10-20, by
-  reading): `next_fire` resolves the target day's local time with that day's own
-  offset (`to_local_datetime`), so `next - Local::now()` is the true interval
-  across a transition, and the sleep is monotonic. What does shift a fire is the
-  wall clock moving during the sleep (a manual change, an NTP step), or a
-  suspend where the monotonic clock does not count suspended time: the one
-  pending fire is delivered late, never dropped, and the loop recomputes from
-  `Local::now()` after it. Sleeping in bounded chunks and re-checking the wall
-  clock would cap the lateness; not done, since nothing here can move the clock
-  in a test to show it works.
+- **A cron fire is late after a clock jump or a suspend** **[Deferred — question
+  for the owner; see the index at the top]** (`run_scheduler`, `cron.rs`). Not
+  DST, as this entry first said (corrected 2026-10-20, by reading): `next_fire`
+  resolves the target day's local time with that day's own offset
+  (`to_local_datetime`), so `next - Local::now()` is the true interval across a
+  transition, and the sleep is monotonic. What does shift a fire is the wall
+  clock moving during the sleep (a manual change, an NTP step), or a suspend
+  where the monotonic clock does not count suspended time: the one pending fire
+  is delivered late, never dropped, and the loop recomputes from `Local::now()`
+  after it. Sleeping in bounded chunks and re-checking the wall clock would cap
+  the lateness; not done, since nothing here can move the clock in a test to
+  show it works. **Question:** ship the chunked sleep without a test that can
+  show it, or leave the late fire?
 
 **Coverage:** full codebase scope (working tree clean at review start). Read in
 full: `hrdr-llm` sse.rs + the three backends' stream loops and map_event,
