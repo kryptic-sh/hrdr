@@ -11346,6 +11346,39 @@ async fn a_jailed_session_moved_by_a_resume_reads_no_project_names() {
     );
 }
 
+/// The `/cwd` half: a jailed session moved into a directory the user HAS
+/// trusted is still jailed, so `TuiHost::cwd_changed` reads none of that
+/// directory's commands or skills either — the session's skip, not the
+/// target's trust answer, decides.
+#[tokio::test]
+async fn a_jailed_session_moved_by_cwd_reads_no_project_names() {
+    let mut h = Harness::jailed(vec![]).await;
+    let other = tempfile::tempdir().unwrap();
+    let other_path = hrdr_tools::canonical_cwd(other.path()).unwrap();
+    let commands_dir = other_path.join(".hrdr/commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    std::fs::write(commands_dir.join("ship.md"), "PROJECT-COMMAND-BODY").unwrap();
+    let bundle = other_path.join(".hrdr/skills/proj-skill");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        "---\nname: proj-skill\ndescription: the project's own skill\n---\nBODY",
+    )
+    .unwrap();
+    hrdr_agent::trust::trust(&other_path, true).expect("record the trust answer");
+
+    h.submit(&format!("/cwd {}", other_path.display())).await;
+    assert_eq!(h.app.dir_cwd, other_path, "the move happened");
+    assert!(
+        !h.app.commands.iter().any(|c| c.name == "ship"),
+        "a jailed session must not discover the new directory's command"
+    );
+    assert!(
+        !h.app.skills.skills.iter().any(|s| s.name == "proj-skill"),
+        "nor its skill"
+    );
+}
+
 /// `/effort` opens a picker of the model's own levels, "Default" on top,
 /// highest effort first; picking a level sets + persists it, and picking
 /// Default clears the override.

@@ -1431,7 +1431,7 @@ directory's files may then do:
   deliberately required rather than defaulted so a new host cannot forget to
   answer.
 
-  Coverage gap:
+  Coverage:
   `a_jailed_session_neither_offers_nor_expands_the_projects_own_names`
   (`hrdr-tui/src/app/e2e.rs`) drives `/reload`, the `/commands` picker and a
   `:name` submit under a jailed harness, and
@@ -1440,9 +1440,9 @@ directory's files may then do:
   `a_jailed_session_moved_by_a_resume_reads_no_project_names` (2026-10-18)
   covers `App::apply_cwd`, reached from `apply_session` when a resumed session
   names a different cwd — the path that moves a jailed session without asking
-  the trust store. The one frontend rediscovery site still correct by inspection
-  only is `TuiHost::cwd_changed` (`/cwd`, which reaches it only for a directory
-  the user _has_ trusted); both go through `App::rediscover`.
+  the trust store, and `a_jailed_session_moved_by_cwd_reads_no_project_names`
+  (2026-10-20) covers `TuiHost::cwd_changed` (`/cwd` into a directory the user
+  _has_ trusted); both go through `App::rediscover`.
 
 - **A jailed session cannot `/cwd` into another untrusted directory.** The hole
   is closed — `/cwd` refuses a directory nobody has answered for, so a trusted
