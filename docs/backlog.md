@@ -1894,8 +1894,8 @@ synchronous and holds no lock across an await.
 reasoned from lock scopes, not from a racing repro. TUI modal/picker key routing
 was judged only at its `begin_*` entry points. `login.rs`,
 `commands/prompt_commands.rs`, `completion.rs` and `sessions.rs` were read only
-where dispatch calls into them. `open_system_handler`'s Windows and macOS arms
-are `#[cfg]`- gated and were not compiled.
+where dispatch calls into them. `open_system_handler`'s macOS arm is
+`#[cfg]`-gated and compiled only on CI; the Windows arm compiles locally now.
 
 ---
 
@@ -2010,7 +2010,12 @@ property of code that still exists. Read before "simplifying" any of them.
 different process. What is left: a lock written by an older hrdr (no lease), or
 one whose owner cannot be probed (`ProcessLiveness::Unknown`), still falls back
 to the pid alone; the wrap-up round shares `overflow_compacted` (`turn_loop.rs`)
-— a second overflow on the forced wrap-up errors the turn.
+— a second overflow on the forced wrap-up errors the turn. Giving the wrap-up
+its own once-only flag was tried and declined 2026-10-20: the first compaction
+already summarized everything before the current turn, which compaction keeps
+verbatim, so the second one has nothing to shrink and the turn errors anyway
+("too large to compact … nothing left to shrink"). Only a mid-turn steer adds a
+turn a second compaction could fold.
 
 **From the 2026-08-05 correctness pass:** `fetch`'s `is_blocked_host` is
 advisory — correctness rests on the connect-time `SsrfGuardResolver`, one
