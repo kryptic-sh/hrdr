@@ -3228,6 +3228,78 @@ async fn a_mid_stream_retry_keeps_the_partial_and_the_reply_apart() {
     );
 }
 
+/// The same separation when the stream dies of a context overflow after some
+/// text: the compaction notice lands between the cut-off text and the reply
+/// the compacted retry streams, so neither is appended to the other.
+#[tokio::test]
+async fn a_mid_stream_overflow_keeps_the_partial_and_the_reply_apart() {
+    let server = MockServer::start(vec![
+        MockResp::Sse(vec![
+            text_chunk("c1", "Half an ans"),
+            json!({
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "context_length_exceeded"
+                }
+            })
+            .to_string(),
+        ]),
+        MockResp::Sse(vec![
+            text_chunk("s1", "Summary of the conversation so far."),
+            stop_chunk("s1"),
+            "[DONE]".to_string(),
+        ]),
+        MockResp::Sse(vec![
+            text_chunk("c2", "The whole answer"),
+            stop_chunk("c2"),
+            "[DONE]".to_string(),
+        ]),
+    ])
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    for i in 0..8 {
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::user(format!("turn {i}")));
+        Arc::make_mut(&mut agent.messages).push(ChatMessage::assistant(format!("reply {i}")));
+    }
+    let mut entries: Vec<crate::Entry> = Vec::new();
+    agent
+        .run_input("hello", |ev| {
+            crate::transcript::apply_event(&mut entries, &ev);
+        })
+        .await
+        .unwrap();
+
+    let shown: Vec<String> = entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::EntryKind::Assistant(s) => Some(format!("assistant: {s}")),
+            crate::EntryKind::System(s) if s.ends_with("compacting and retrying") => {
+                Some("compaction notice".to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "assistant: Half an ans",
+            "compaction notice",
+            "assistant: The whole answer"
+        ],
+        "{entries:#?}"
+    );
+    assert!(
+        !agent.messages().iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("Half an ans"))),
+        "{:#?}",
+        agent.messages()
+    );
+}
+
 // ── the retry budget is shared, not multiplied ────────────────────────
 
 /// THE headline guarantee: connecting and draining share ONE budget, so

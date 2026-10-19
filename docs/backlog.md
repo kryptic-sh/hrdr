@@ -1964,7 +1964,10 @@ Not bugs; things whose surprise is worth having written down.
   history the model sees holds only the reply. Pinned for the drain retry by
   `mock_server::a_mid_stream_retry_keeps_the_partial_and_the_reply_apart`
   (mutation-checked 2026-10-19: without the notice the two run together as "Half
-  an ansThe whole answer"); the other two paths are by reading. Hiding the
+  an ansThe whole answer"), and for the overflow by
+  `a_mid_stream_overflow_keeps_the_partial_and_the_reply_apart` (2026-10-20:
+  without its two notices the same run-together). The dropped parameter's path
+  is by reading — a parameter is refused at connect, before any text. Hiding the
   partial outright needs a "discard what I streamed for this round" event, which
   is a protocol change across every `AgentEvent` consumer and the transcript
   log, not a local one — not worth it while the partial is labelled.
