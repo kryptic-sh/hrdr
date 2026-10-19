@@ -987,6 +987,16 @@ pub enum ProjectInstructions {
     Skip,
 }
 
+/// The working directory's verification gate, or none when its files are not
+/// to be read: the CI config is repo-authored like `AGENTS.md`, and
+/// [`gate_section`] states its commands as what "done" means.
+pub(crate) fn project_gate(cwd: &Path, project: ProjectInstructions) -> hrdr_tools::Gate {
+    match project {
+        ProjectInstructions::Load => hrdr_tools::Gate::detect(cwd),
+        ProjectInstructions::Skip => hrdr_tools::Gate::default(),
+    }
+}
+
 /// Gather the working directory's `AGENTS.md` plus the operator's global file.
 ///
 /// **The working directory only — no ancestor walk.** Trust is answered per

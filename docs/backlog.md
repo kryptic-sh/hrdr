@@ -2016,23 +2016,14 @@ to the pid alone; the wrap-up round shares `overflow_compacted` (`turn_loop.rs`)
 advisory — correctness rests on the connect-time `SsrfGuardResolver`, one
 refactor from being the only guard (`web.rs`).
 
-**From the 2026-08-05 security audit:** the verification-gate prompt section is
-repo-authored content the trust gate does not cover — `Gate::detect` runs
-unconditionally (at agent construction, hrdr-agent `lib.rs`) and `gate_section`
-(`prompt.rs`) renders the parsed CI commands as authoritative fact ("run them …
-before you report work finished"), even from an untrusted directory; inert today
-because `JAIL_TOOLS` (`hrdr-tools/src/lib.rs`: read/grep/find/ls/tree) has no
-shell or `verify` and `gate_section` skips the runner line when `verify` isn't
-registered, but it is the one instruction surface the trust gate does not
-protect, and it becomes a live injection vector if jail ever gains
-`verify`/`shell`; `atomic_write` write-path TOCTOU (`tools/mutation.rs` —
-admitted in the comment; requires a hostile process racing the agent's own
-edits); MCP tool descriptions ride into the tools cache block unwrapped
-(`handshake_and_list` in `mcp/client.rs`, `Box::leak`) — a compromised
-operator-installed server can steer the model through its descriptions, where
-results are wrapped as untrusted; `/export` writes to any absolute path the user
-names (`export_conversation` — equivalent to the user's own shell redirection,
-but the transcript contains model output).
+**From the 2026-08-05 security audit:** `atomic_write` write-path TOCTOU
+(`tools/mutation.rs` — admitted in the comment; requires a hostile process
+racing the agent's own edits); MCP tool descriptions ride into the tools cache
+block unwrapped (`handshake_and_list` in `mcp/client.rs`, `Box::leak`) — a
+compromised operator-installed server can steer the model through its
+descriptions, where results are wrapped as untrusted; `/export` writes to any
+absolute path the user names (`export_conversation` — equivalent to the user's
+own shell redirection, but the transcript contains model output).
 
 **From the 2026-08-06 correctness pass:**
 

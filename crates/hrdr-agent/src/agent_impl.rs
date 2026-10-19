@@ -443,7 +443,7 @@ impl Agent {
         // and the ledger that notices when it did not. Two discoveries could
         // disagree, and a prompt naming one bar while the note measured another
         // would be worse than having neither.
-        let gate = Arc::new(hrdr_tools::Gate::detect(&config.cwd));
+        let gate = Arc::new(prompt::project_gate(&config.cwd, project_instructions));
         ctx.verification
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -930,7 +930,10 @@ impl Agent {
         // A different project has a different gate, and the ledger must move with
         // the prompt — measuring a new project against the old project's CI is
         // exactly the kind of confident wrong answer the gate exists to remove.
-        self.gate = Arc::new(hrdr_tools::Gate::detect(&self.ctx.cwd));
+        self.gate = Arc::new(prompt::project_gate(
+            &self.ctx.cwd,
+            self.project_instructions,
+        ));
         self.ctx
             .verification
             .lock()

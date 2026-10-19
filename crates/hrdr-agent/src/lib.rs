@@ -2282,9 +2282,10 @@ mod tests {
     /// **A jailed agent reads no instruction out of the working tree, and a
     /// `set_cwd` cannot re-seed one.**
     ///
-    /// Three surfaces, all off: `AGENTS.md` up the ancestor chain, the project
-    /// command directories (`.hrdr/commands`, `.claude/commands`, `.opencode/command`),
-    /// and with them any project file that shadows a built-in. Jail's premise is
+    /// Every surface off: `AGENTS.md` up the ancestor chain, the project command
+    /// directories (`.hrdr/commands`, `.claude/commands`, `.opencode/command`),
+    /// any project file that shadows a built-in, and the verification gate read
+    /// out of the project's CI config. Jail's premise is
     /// that the repository's authors are not trusted, so loading a file they wrote
     /// into the system prompt hands the adversary the system prompt.
     ///
@@ -2306,6 +2307,13 @@ mod tests {
             "---\ndescription: PROJECT-COMMAND shadowing the built-in\n---\nbody",
         )
         .unwrap();
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("ci.yml"),
+            "jobs:\n  t:\n    steps:\n      - run: cargo test --workspace\n",
+        )
+        .unwrap();
 
         let base = AgentConfig {
             cwd: dir.path().to_path_buf(),
@@ -2317,6 +2325,7 @@ mod tests {
         let open = Agent::new(base.clone()).unwrap();
         let prompt = open.system_prompt().unwrap_or_default();
         assert!(prompt.contains("PROJECT-SAYS"), "control: {prompt}");
+        assert!(prompt.contains("Verification gate:"), "control: {prompt}");
         assert!(
             open.commands_snapshot()
                 .iter()
@@ -2333,6 +2342,10 @@ mod tests {
         assert!(
             !prompt.contains("PROJECT-SAYS"),
             "the repo's own instructions must not reach the prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Verification gate:"),
+            "…nor its CI commands, stated as what \"done\" means: {prompt}"
         );
         assert!(
             !jailed
@@ -2354,11 +2367,16 @@ mod tests {
         // And a cwd change does not re-seed what construction excluded.
         let second = tempfile::tempdir().unwrap();
         std::fs::write(second.path().join("AGENTS.md"), "SECOND-PROJECT-SAYS: hi").unwrap();
+        std::fs::write(second.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         jailed.set_cwd(second.path().to_path_buf());
         let prompt = jailed.system_prompt().unwrap_or_default();
         assert!(
             !prompt.contains("SECOND-PROJECT-SAYS"),
             "a set_cwd must not re-seed the working tree's instructions: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Verification gate:"),
+            "…nor its gate: {prompt}"
         );
     }
 

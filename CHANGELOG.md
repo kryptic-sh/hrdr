@@ -13,6 +13,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was appended to whatever file it pointed at, created if missing. The store is
   now opened without following a final-component link and refused unless it is a
   regular file (`trust::trust`, `crates/hrdr-agent`).
+- **A jailed session's prompt no longer carries the project's CI commands.** The
+  verification gate read out of the working tree's CI config (or its manifests)
+  was stated as what "done" means even in `jail`, which loads no other
+  repo-authored instruction. It is now skipped wherever project instructions
+  are, at startup and on a working-directory change (`prompt::project_gate`,
+  `crates/hrdr-agent`).
 
 ### Changed
 
