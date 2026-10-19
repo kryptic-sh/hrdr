@@ -2847,7 +2847,12 @@ and **not** fixed.
   the direct write in `browser_login_completion_line` needs
   `token_saved: true`). Still unexplained. The test now reports the file's
   contents when the save unexpectedly succeeds, so the next failure shows what
-  rewrote it.
+  rewrote it — or, as a `NotFound` read error, that the file was deleted, which
+  `read_config_doc` would also let succeed (a missing file reads as an empty
+  document). Not reproduced 2026-10-19: 25 back-to-back parallel runs of
+  `cargo test -p hrdr-app --lib` on Windows all passed (179 tests each), so it
+  likely needs the load of the full workspace suite, like the other flakes
+  recorded here.
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
