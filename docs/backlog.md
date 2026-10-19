@@ -1431,8 +1431,7 @@ directory's files may then do:
   deliberately required rather than defaulted so a new host cannot forget to
   answer.
 
-  Coverage:
-  `a_jailed_session_neither_offers_nor_expands_the_projects_own_names`
+  Coverage: `a_jailed_session_neither_offers_nor_expands_the_projects_own_names`
   (`hrdr-tui/src/app/e2e.rs`) drives `/reload`, the `/commands` picker and a
   `:name` submit under a jailed harness, and
   `a_skipped_project_expands_neither_its_commands_nor_its_skills`
@@ -1893,9 +1892,13 @@ synchronous and holds no lock across an await.
 **Not covered by this pass:** no runtime exercise. The concurrency claims are
 reasoned from lock scopes, not from a racing repro. TUI modal/picker key routing
 was judged only at its `begin_*` entry points. `login.rs`,
-`commands/prompt_commands.rs`, `completion.rs` and `sessions.rs` were read only
-where dispatch calls into them. `open_system_handler`'s macOS arm is
-`#[cfg]`-gated and compiled only on CI; the Windows arm compiles locally now.
+`commands/prompt_commands.rs`, `completion.rs` and `sessions.rs` were reviewed
+in full 2026-10-20 (one read-only pass, findings re-traced): `login.rs`'s four
+findings shipped; the other three had none, beyond a cosmetic one —
+`prompt_completions` rewrites `.`/`:` to `/` before searching descriptions, so
+`:v1.2` does not match a description holding "v1.2". `open_system_handler`'s
+macOS arm is `#[cfg]`-gated and compiled only on CI; the Windows arm compiles
+locally now.
 
 ---
 
@@ -2871,7 +2874,9 @@ and **not** fixed.
   hrdr-app lib tests (175 passed; the binary took 59s against ~5s alone), but
   the output was filtered away before the names were read, so whether this test
   was among them is unknown; the next four workspace runs, logged in full, were
-  all green. Next time, run with `--no-fail-fast` into a log file.
+  all green. Next time, run with `--no-fail-fast` into a log file. Four more
+  full `--no-fail-fast` workspace runs on 2026-10-20, logged, passed every
+  hrdr-app test (one failed only a `watch` test, since fixed).
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
@@ -2928,8 +2933,8 @@ and **not** fixed.
   check does work. Inert today: no workspace crate depends on `dirs` directly
   (only transitively — checked 2026-10-20), and both of hrdr's own `home_dir`
   helpers (`agents_dir`, `sandbox`) read `HOME`/`USERPROFILE`. A `clippy.toml`
-  ban was considered and declined: it would name a crate nothing here links,
-  and adding `dirs` is already a dependency decision that would surface it.
+  ban was considered and declined: it would name a crate nothing here links, and
+  adding `dirs` is already a dependency decision that would surface it.
 - **Windows test runs with a failure leaked their temp dirs — fixed
   2026-10-15.** libtest ends a binary with a failed test through
   `std::process::exit`, which on Windows is `ExitProcess`: no `atexit` handler
