@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The trusted-directories store no longer writes through a symlink.** A link
+  planted at `$XDG_CACHE_HOME/hrdr/trusted-dirs` was followed, so a trust answer
+  was appended to whatever file it pointed at, created if missing. The store is
+  now opened without following a final-component link and refused unless it is a
+  regular file (`trust::trust`, `crates/hrdr-agent`).
+
 ### Changed
 
 - **`message_session` says why a registered session could not be messaged.** A

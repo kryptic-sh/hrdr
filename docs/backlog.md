@@ -2070,11 +2070,13 @@ overrides it). Residual, recorded as hardening below.
   `expected_state` should be preserved — a future "echo the expected value"
   change would leak the CSRF token.
 - `trust::trust` opens the trusted-dirs store with `create(true)`: a
-  pre-existing world-readable file keeps its mode and a symlink is followed. The
-  mode half is mitigated (re-checked 2026-10-15): the store's directory is
-  forced to `0700` on every trust write (`auth::create_dir_owner_only`, existing
-  directories included), so no other user can reach the file. The symlink half
-  is same-user only. Low sensitivity (directory paths).
+  pre-existing world-readable file keeps its mode. Mitigated (re-checked
+  2026-10-15): the store's directory is forced to `0700` on every trust write
+  (`auth::create_dir_owner_only`, existing directories included), so no other
+  user can reach the file. Low sensitivity (directory paths). A final-component
+  symlink is refused since 2026-10-20
+  (`a_symlinked_store_is_not_written_through`); a symlinked parent directory is
+  still traversed, and `stored()` reads through a link.
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
   then `atomic_write` re-opens the path; a symlink swap between the two could
   redirect a write. Same-user, no privilege boundary.

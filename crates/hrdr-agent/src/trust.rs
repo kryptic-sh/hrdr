@@ -106,7 +106,10 @@ pub fn trust(dir: &Path, unix_style_paths: bool) -> Result<()> {
             )
         })?;
     }
-    let mut f = hrdr_llm::owner_only_options()
+    // No-follow: a link planted at the store's path is refused rather than
+    // written through. Unix fails the open itself; Windows opens the link,
+    // which the file-type check below then refuses.
+    let mut f = hrdr_llm::owner_only_options_no_follow()
         .append(true)
         .create(true)
         .open(&path)
@@ -116,6 +119,12 @@ pub fn trust(dir: &Path, unix_style_paths: bool) -> Result<()> {
                 hrdr_tools::display_path(&path, unix_style_paths)
             )
         })?;
+    if !f.metadata()?.file_type().is_file() {
+        anyhow::bail!(
+            "{} is not a regular file",
+            hrdr_tools::display_path(&path, unix_style_paths)
+        );
+    }
     writeln!(f, "{k}").with_context(|| {
         format!(
             "writing {}",
@@ -305,6 +314,24 @@ mod tests {
             is_trusted(real.path()),
             "the link was stored as its target, so the target reads as trusted"
         );
+    }
+
+    /// A link planted at the store's own path is refused, not written
+    /// through: its target is neither created nor appended to.
+    #[test]
+    fn a_symlinked_store_is_not_written_through() {
+        let (_store, _lock) = private_store();
+        let path = trusted_dirs_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("target");
+        if !hrdr_test_support::symlink_or_skip(&target, &path) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(trust(dir.path(), true).is_err());
+        assert!(!target.exists(), "the link's target was never created");
     }
 
     /// No store yet is the same answer as an empty one, not an error.
