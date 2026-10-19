@@ -547,25 +547,7 @@ mod tests {
     /// passed over.
     #[test]
     fn the_workspace_root_is_the_nearest_workspace_manifest() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("Cargo.toml"),
-            "[workspace]
-members = []
-",
-        )
-        .unwrap();
-        let member = root.path().join("crates").join("one");
-        std::fs::create_dir_all(&member).unwrap();
-        std::fs::write(
-            member.join("Cargo.toml"),
-            "[package]
-name = \"one\"
-version.workspace = true
-",
-        )
-        .unwrap();
-
+        let (root, member) = fake_workspace();
         assert_eq!(
             super::workspace_root_from(&member).as_deref(),
             Some(root.path())
@@ -575,6 +557,61 @@ version.workspace = true
             super::workspace_root_from(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap(),
             "this checkout's own root, found the same way"
         );
+    }
+
+    /// The walk starts from the `CARGO_MANIFEST_DIR` cargo sets at run time, not
+    /// the one compiled in — the case of a binary built in another worktree and
+    /// reused here. A child run of this binary is handed a fake member's dir.
+    #[test]
+    fn the_workspace_root_follows_the_run_time_manifest_dir() {
+        let (root, member) = fake_workspace();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::workspace_root_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CARGO_MANIFEST_DIR", &member)
+            .env("HRDR_EXPECTED_WORKSPACE_ROOT", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child test ran: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[ignore = "child of the_workspace_root_follows_the_run_time_manifest_dir"]
+    fn workspace_root_child() {
+        let expected = std::env::var_os("HRDR_EXPECTED_WORKSPACE_ROOT").unwrap();
+        assert_eq!(super::workspace_root(), Path::new(&expected));
+    }
+
+    /// A workspace root holding one member, whose manifest only inherits.
+    fn fake_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\n",
+        )
+        .unwrap();
+        let member = root.path().join("crates").join("one");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"one\"\nversion.workspace = true\n",
+        )
+        .unwrap();
+        (root, member)
     }
 
     /// A sandbox is reclaimed only once nothing holds its liveness lock, so a
