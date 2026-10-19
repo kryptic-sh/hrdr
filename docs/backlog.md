@@ -3736,11 +3736,17 @@ remained open at that review and was fixed 2026-09-09. Rest cleared.**
 
 **Hardening (correct today, fragile):**
 
-- **Cron fire across a DST transition** (`cron.rs:383-389`): `wait` is a
-  wall-clock difference computed before the sleep; a transition between
-  computation and fire shifts one delivery by an hour. The loop recomputes
-  `next_fire` from `Local::now()` after every delivery, so later fires
-  self-correct; no missed fire, at most one mistimed.
+- **A cron fire is late after a clock jump or a suspend** (`run_scheduler`,
+  `cron.rs`). Not DST, as this entry first said (corrected 2026-10-20, by
+  reading): `next_fire` resolves the target day's local time with that day's own
+  offset (`to_local_datetime`), so `next - Local::now()` is the true interval
+  across a transition, and the sleep is monotonic. What does shift a fire is the
+  wall clock moving during the sleep (a manual change, an NTP step), or a
+  suspend where the monotonic clock does not count suspended time: the one
+  pending fire is delivered late, never dropped, and the loop recomputes from
+  `Local::now()` after it. Sleeping in bounded chunks and re-checking the wall
+  clock would cap the lateness; not done, since nothing here can move the clock
+  in a test to show it works.
 
 **Coverage:** full codebase scope (working tree clean at review start). Read in
 full: `hrdr-llm` sse.rs + the three backends' stream loops and map_event,
@@ -3790,8 +3796,8 @@ code changed by the audit itself.
 - **cron schedule arithmetic.** `parse_field` bounds-checks every range
   (`start`/`end` inside `lo..=hi`, `start <= end`, `step != 0`), `step_by`
   cannot overflow, the Feb-29 case is bounded by `NEXT_FIRE_HORIZON_DAYS`, and
-  the unreachable-schedule refusal happens at create time. The one recorded DST
-  mistiming has no security content.
+  the unreachable-schedule refusal happens at create time. The one recorded
+  mistiming (a late fire after a clock jump) has no security content.
 - **`cron`/`goal` in jail.** `JAIL_TOOLS` is the fixed 5-tool set
   (`lib.rs:1712`) — read/grep/find/ls/tree — so neither tool reaches a jailed
   agent.
