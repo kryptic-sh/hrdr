@@ -293,6 +293,31 @@ async fn native_refresh_close_and_new_generation() {
     assert!(replacement.dequeue().is_none());
 }
 
+/// A connection the server drops unanswered leaves its reason behind, so a
+/// session that is open while a peer's probes fail can say what failed.
+#[tokio::test]
+async fn a_dropped_connection_leaves_its_reason() {
+    let root = root();
+    let target = runtime(root.path(), "target", "/target").await;
+    assert_eq!(target.last_dropped(), None);
+    assert!(
+        raw(&target, serde_json::json!({"version": VERSION}))
+            .await
+            .is_err()
+    );
+    let reason = timeout(DEADLINE, async {
+        loop {
+            if let Some(reason) = target.last_dropped() {
+                break reason;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the worker's failure is recorded");
+    assert!(reason.starts_with("connection failed: "), "{reason}");
+}
+
 async fn raw(target: &Messaging, request: serde_json::Value) -> io::Result<Reply> {
     let mut connection =
         Connection::connect(&target.directory, &target.descriptor().endpoint, DEADLINE).await?;

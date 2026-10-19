@@ -274,10 +274,22 @@ push each verified slice to `main` before proceeding to the next slice.
    registered but not answering is refused with its probe's answer ("registered
    but did not answer (…)"), and only a peer missing from the registry
    altogether still reads "no running session" — so the next recurrence says
-   which of the two dropped it. Not reproduced locally (12 runs of the two
-   messaging tests together, 6 of the full `tui_pty` suite, Windows, pinned
-   host). No test covers `stopped_by` being set: nothing can make a pipe accept
-   fail on demand. Same day, one parallel `local_ipc` run failed
+   which of the two dropped it. It did, on the next recurrence (`35094198`, run
+   39341063820, Windows build + smoke, 2026-10-20, 212 ms,
+   `peer open: true, stopped by: None`): "registered but did not answer (The
+   pipe is being closed. (os error 232))" — `ERROR_NO_DATA`, which a pipe write
+   gets once the other end has closed, so the peer's server dropped the probe's
+   connection early, twice running (the retry included). One mechanism was tried
+   and falsified the same day: a client that opens the pipe and closes it before
+   the server's `ConnectNamedPipe` does not deafen the listener (the accept
+   succeeds and the next client is served). The serve loop discarded both the
+   accept errors it treats as transient and every worker's error, so the peer
+   could not say why; it now keeps the latest (`Messaging::last_dropped`,
+   `a_dropped_connection_leaves_its_reason`), and the pty test prints it beside
+   `stopped by`. Not reproduced locally (12 runs of the two messaging tests
+   together, 6 of the full `tui_pty` suite, Windows, pinned host). No test
+   covers `stopped_by` being set: nothing can make a pipe accept fail on demand.
+   Same day, one parallel `local_ipc` run failed
    `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
    stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a full
    Windows workspace run beside other sessions' builds: that test and

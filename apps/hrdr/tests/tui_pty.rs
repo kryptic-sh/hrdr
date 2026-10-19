@@ -1084,9 +1084,11 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
     let bodies = server.chat_bodies();
     assert!(
         bodies[1].to_string().contains(&peer_id),
-        "the sessions tool listed the peer (peer open: {}, stopped by: {:?}): {}",
+        "the sessions tool listed the peer (peer open: {}, stopped by: {:?}, last dropped: \
+         {:?}): {}",
         peer.is_open(),
         peer.stopped_by(),
+        peer.last_dropped(),
         bodies[1]
     );
 
@@ -1099,10 +1101,11 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
         // answered, so the answer itself is what explains a miss.
         assert!(
             start.elapsed() < EXIT,
-            "the peer never received the message (peer open: {}, stopped by: {:?}); \
-             message_session answered: {}",
+            "the peer never received the message (peer open: {}, stopped by: {:?}, last \
+             dropped: {:?}); message_session answered: {}",
             peer.is_open(),
             peer.stopped_by(),
+            peer.last_dropped(),
             bodies[2]["messages"]
                 .as_array()
                 .and_then(|messages| messages.last())

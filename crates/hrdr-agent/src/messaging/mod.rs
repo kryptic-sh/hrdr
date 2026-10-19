@@ -44,6 +44,9 @@ struct State {
     open: bool,
     /// The accept error that stopped the server, when one did rather than a close.
     stopped_by: Option<String>,
+    /// Why the most recent connection was dropped without an answer: an accept
+    /// the loop treated as transient, or a worker that failed or ran out of time.
+    last_dropped: Option<String>,
     inbox: VecDeque<PeerMessage>,
     bytes: usize,
 }
@@ -97,6 +100,7 @@ impl Messaging {
                 descriptor,
                 open: true,
                 stopped_by: None,
+                last_dropped: None,
                 inbox: VecDeque::new(),
                 bytes: 0,
             }),
@@ -256,6 +260,14 @@ impl Messaging {
         self.shared.state.lock().unwrap().stopped_by.clone()
     }
 
+    /// Why the most recent connection this runtime dropped went unanswered, if
+    /// one did. The serve loop carries on after these — they are one peer's
+    /// failures, not the server's — so a session can be open and serving while
+    /// a peer's probes fail, and this is what says what failed on this side.
+    pub fn last_dropped(&self) -> Option<String> {
+        self.shared.state.lock().unwrap().last_dropped.clone()
+    }
+
     /// Resolve on the next arrival or close, without inspecting the inbox — for a
     /// consumer that dequeues elsewhere and only needs waking. An arrival with no
     /// waiter is kept for the next call, so none is lost between calls. Shares
@@ -314,7 +326,17 @@ async fn serve(
                 if result.is_ok() { shared.state.lock().unwrap().descriptor = descriptor; }
                 let _ = command.reply.send(result);
             }
-            Some(_) = workers.join_next(), if !workers.is_empty() => {}
+            Some(joined) = workers.join_next(), if !workers.is_empty() => {
+                let dropped = match joined {
+                    Ok(Ok(Ok(()))) => None,
+                    Ok(Ok(Err(error))) => Some(format!("connection failed: {error}")),
+                    Ok(Err(_)) => Some("connection timed out".to_string()),
+                    Err(error) => Some(format!("connection worker ended: {error}")),
+                };
+                if dropped.is_some() {
+                    shared.state.lock().unwrap().last_dropped = dropped;
+                }
+            }
             accepted = listener.accept(DEADLINE), if workers.len() < MAX_WORKERS => {
                 match accepted {
                     Ok(connection) => {
@@ -326,7 +348,13 @@ async fn serve(
                             timeout(MESSAGE_DEADLINE, receive(connection, &directory, &shared)).await
                         });
                     }
-                    Err(error) if unavailable(&error) => {},
+                    Err(error) if unavailable(&error) => {
+                        // An idle accept times out every DEADLINE; that is no drop.
+                        if error.kind() != io::ErrorKind::TimedOut {
+                            shared.state.lock().unwrap().last_dropped =
+                                Some(format!("accept failed: {error}"));
+                        }
+                    },
                     Err(error) => {
                         shared.state.lock().unwrap().stopped_by = Some(error.to_string());
                         break;
