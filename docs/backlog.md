@@ -1918,14 +1918,6 @@ Not bugs; things whose surprise is worth having written down.
   (`a_cache_hit_shares_the_cached_memory`). Correct by design (a stale hit is
   worse than a re-read); it only means the cache's win is platform-dependent.
 
-- **A worktree sharing `CARGO_TARGET_DIR` leaves stale guard binaries.**
-  `hrdr-test-support`'s `workspace_root` is `env!("CARGO_MANIFEST_DIR")`, baked
-  in at compile time, and cargo fingerprints path crates by workspace-relative
-  path — so a test binary built from a second worktree is reused, unchanged, by
-  the main checkout, and the repo-guard tests (`duration_constant_names`,
-  `every_test_binary_is_sandboxed`) look for the other worktree's manifest. Once
-  that worktree is removed they fail with "the root manifest is readable:
-  NotFound". Seen 2026-10-15; `cargo clean -p hrdr-test-support` clears it.
 - **A panicking tool now waits for its batch siblings before the turn ends.**
   Since the tool-batch dispatch change (2026-08-04, `run_tool_batch` spawns each
   call as its own task and resumes the panic after `join_all`), a panicking

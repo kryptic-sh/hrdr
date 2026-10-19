@@ -319,16 +319,32 @@ fn drop_deferred_temp_dirs() {
     drop(roots);
 }
 
-/// The workspace root: this crate is `<root>/crates/hrdr-test-support`, so the
-/// root is the manifest dir's grandparent. Test binaries that walk the whole
-/// workspace (crate inventory, duration-constant scan, the leak guard) all
-/// derive it the same way.
+/// The workspace root: the nearest directory, from the running package up,
+/// whose `Cargo.toml` is a `[workspace]` manifest. Test binaries that walk the
+/// whole workspace (crate inventory, duration-constant scan, the leak guard)
+/// all derive it the same way.
+///
+/// Starts from the `CARGO_MANIFEST_DIR` cargo sets when it runs a test, not
+/// this crate's compile-time one: cargo reuses a binary built from another
+/// worktree sharing `CARGO_TARGET_DIR`, and a path baked in at compile time
+/// then names that worktree. The compile-time path is the fallback for a
+/// binary run by hand.
 pub fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let start = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    workspace_root_from(&start).expect("a test runs inside the hrdr workspace")
+}
+
+/// The nearest ancestor of `start` (itself included) holding a `[workspace]`
+/// manifest.
+fn workspace_root_from(start: &Path) -> Option<PathBuf> {
+    start
         .ancestors()
-        .nth(2)
-        .expect("crates/<crate> sits two levels under the workspace root")
-        .to_path_buf()
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("Cargo.toml"))
+                .is_ok_and(|manifest| manifest.lines().any(|line| line.trim() == "[workspace]"))
+        })
+        .map(Path::to_path_buf)
 }
 
 /// Every crate directory listed in the root manifest's `[workspace] members`.
@@ -502,6 +518,8 @@ pub fn symlink_or_skip(target: &std::path::Path, link: &std::path::Path) -> bool
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     /// The sandbox's data root survives a private swap: after `with_test_env` the
     /// variable is the ctor's value again, not unset — unset sends the next test's
     /// sessions to the fallback under the real profile on Windows.
@@ -521,6 +539,41 @@ mod tests {
         assert_eq!(
             std::env::var_os("XDG_DATA_HOME").as_deref(),
             Some(sandboxed.as_os_str())
+        );
+    }
+
+    /// The root is found from wherever the walk starts, by its `[workspace]`
+    /// manifest — a member's own manifest, which only inherits from it, is
+    /// passed over.
+    #[test]
+    fn the_workspace_root_is_the_nearest_workspace_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]
+members = []
+",
+        )
+        .unwrap();
+        let member = root.path().join("crates").join("one");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]
+name = \"one\"
+version.workspace = true
+",
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::workspace_root_from(&member).as_deref(),
+            Some(root.path())
+        );
+        assert_eq!(
+            super::workspace_root(),
+            super::workspace_root_from(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap(),
+            "this checkout's own root, found the same way"
         );
     }
 
