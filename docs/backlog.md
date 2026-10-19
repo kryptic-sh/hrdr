@@ -2859,7 +2859,11 @@ and **not** fixed.
   document). Not reproduced 2026-10-19: 25 back-to-back parallel runs of
   `cargo test -p hrdr-app --lib` on Windows all passed (179 tests each), so it
   likely needs the load of the full workspace suite, like the other flakes
-  recorded here.
+  recorded here. That same day one `cargo test --workspace` run failed 4 of the
+  hrdr-app lib tests (175 passed; the binary took 59s against ~5s alone), but
+  the output was filtered away before the names were read, so whether this test
+  was among them is unknown; the next four workspace runs, logged in full, were
+  all green. Next time, run with `--no-fail-fast` into a log file.
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
   was not reproduced. Wide/combining glyph clipping and the additional
   header-visibility pass's cost remain unmeasured. Overlay coverage
