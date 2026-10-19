@@ -887,7 +887,7 @@ impl Agent {
                 content.push_str(&format!(
                     "\n\n[note: you've used {used} of {max} tool rounds this turn — checkpoint \
                      your work (commit what's done) and sequence what remains; the turn ends \
-                     at {max}]",
+                     at {max} unless a new user message resets the count]",
                     max = self.max_steps
                 ));
             }

@@ -2177,7 +2177,10 @@ async fn agent_run_warns_once_at_eighty_percent_of_the_round_budget() {
     // It names where it is and where the wall is, and what to do with the
     // remaining budget.
     assert!(warned[0].contains("used 4 of 5 tool rounds"), "{warned:?}");
-    assert!(warned[0].contains("the turn ends at 5"), "{warned:?}");
+    assert!(
+        warned[0].contains("the turn ends at 5 unless a new user message resets the count"),
+        "{warned:?}"
+    );
     assert!(warned[0].contains("sequence what remains"), "{warned:?}");
 
     // Nothing about the hard cap changed: all five rounds ran and the
