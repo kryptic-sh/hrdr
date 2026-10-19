@@ -494,7 +494,7 @@ pub fn browser_login_start(
                     .await
                 {
                     Ok(()) => (true, None),
-                    Err(e) => (false, Some(format!("{e:#}"))),
+                    Err(e) => (false, Some(login_failure(&e))),
                 };
             BrowserLoginOutcome {
                 login_id,
@@ -538,7 +538,7 @@ pub fn browser_login_start(
         let (token_saved, error) =
             match tokio::time::timeout(hrdr_agent::CHATGPT_LOGIN_BACKSTOP, flow).await {
                 Ok(Ok(())) => (true, None),
-                Ok(Err(e)) => (false, Some(format!("{e:#}"))),
+                Ok(Err(e)) => (false, Some(login_failure(&e))),
                 Err(_) => (false, Some("ChatGPT login timed out".to_string())),
             };
         // The OAuth credential is stored in — and resolved from — the merged
@@ -556,6 +556,14 @@ pub fn browser_login_start(
         provider: "openai".to_string(),
         future,
     }))
+}
+
+/// A failed browser login's reason: the whole chain, so a network failure
+/// says what failed beneath "requesting an OpenRouter API key". The flows keep
+/// tokens, codes and response bodies out of their errors, so the chain is safe
+/// to show.
+fn login_failure(e: &anyhow::Error) -> String {
+    format!("{e:#}")
 }
 
 /// The provider slot a browser login targets, or `None` when `name` is not a
@@ -832,6 +840,16 @@ mod tests {
             assert!(line.contains(&format!("{provider} login failed")));
             assert!(line.contains("authorization was rejected"));
         }
+    }
+
+    /// A failed login reports its root cause, not only the step that failed.
+    #[test]
+    fn a_login_failure_names_its_cause() {
+        let e = anyhow::anyhow!("connection refused").context("requesting an OpenRouter API key");
+        assert_eq!(
+            login_failure(&e),
+            "requesting an OpenRouter API key: connection refused"
+        );
     }
 
     /// A ChatGPT login whose default could not be saved says so, with why,
