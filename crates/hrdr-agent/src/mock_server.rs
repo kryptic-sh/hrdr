@@ -3170,6 +3170,64 @@ async fn agent_run_429_then_200_retry() {
     assert!(text.contains("Retry succeeded"));
 }
 
+/// A stream that dies after some text is retried from the start, and the
+/// retry re-streams the whole reply. The frontend has no event to take
+/// back what it showed, so what keeps the two apart is the retry notice:
+/// it lands between them, and the reducer starts the restreamed reply as
+/// an entry of its own instead of appending it to the cut-off one.
+#[tokio::test]
+async fn a_mid_stream_retry_keeps_the_partial_and_the_reply_apart() {
+    let server = MockServer::start(vec![
+        // Ends without `[DONE]`: the drain fails after some text.
+        MockResp::Sse(vec![text_chunk("c1", "Half an ans")]),
+        MockResp::Sse(vec![
+            text_chunk("c2", "The whole answer"),
+            stop_chunk("c2"),
+            "[DONE]".to_string(),
+        ]),
+    ])
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(test_cfg(server.base_url(), dir.path())).unwrap();
+    let mut entries: Vec<crate::Entry> = Vec::new();
+    agent
+        .run_input("hello", |ev| {
+            crate::transcript::apply_event(&mut entries, &ev);
+        })
+        .await
+        .unwrap();
+
+    let shown: Vec<String> = entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            crate::EntryKind::Assistant(s) => Some(format!("assistant: {s}")),
+            crate::EntryKind::System(s) if s.starts_with("stream interrupted") => {
+                Some("retry notice".to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "assistant: Half an ans",
+            "retry notice",
+            "assistant: The whole answer"
+        ],
+        "{entries:#?}"
+    );
+    // The cut-off text never reaches the conversation the model sees.
+    assert!(
+        !agent.messages().iter().any(|m| m
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains("Half an ans"))),
+        "{:#?}",
+        agent.messages()
+    );
+}
+
 // ── the retry budget is shared, not multiplied ────────────────────────
 
 /// THE headline guarantee: connecting and draining share ONE budget, so

@@ -1943,17 +1943,24 @@ Not bugs; things whose surprise is worth having written down.
   stops selecting. Neither is a defect; both are what is left of "the always-on
   prompt is too long".
 
-- **A mid-stream retry can double the text the user already saw.**
-  `drain_stream` forwards `AgentEvent::Text` to the frontend as it arrives, so a
-  stream that fails after emitting some output and is then retried — by
-  `RetryBudget` on a transient error, or now by `recover_context_overflow` on a
-  drain-time `context_length_exceeded` (PR #24) — re-streams the model's reply
-  from the start, and the frontend has no signal to discard the first partial.
-  Not new and not observed in practice: Codex reports overflow as a
-  `response.failed` event before any content. Noted because the overflow path
-  widened the set of errors that reach the retry, and because the fix (a
-  "discard what I streamed for this round" event) is a protocol change, not a
-  local one.
+- **A mid-stream retry leaves the cut-off reply on screen.** `drain_stream`
+  forwards `AgentEvent::Text` to the frontend as it arrives, so a stream that
+  fails after emitting some output and is then retried — by `RetryBudget` on a
+  transient error, by `recover_context_overflow` on a drain-time
+  `context_length_exceeded`, or by `drop_unsupported_param` — re-streams the
+  model's reply from the start, and the frontend has no signal to discard the
+  first partial. It is not doubled into one block: every retry path emits a
+  `Notice` first (the drain retry's "stream interrupted — retrying", the
+  overflow's compaction notices, the dropped parameter's queued notice), and
+  `transcript::apply_event` starts the restreamed text as a new assistant entry
+  after it. So the user sees the partial, the notice, then the whole reply; the
+  history the model sees holds only the reply. Pinned for the drain retry by
+  `mock_server::a_mid_stream_retry_keeps_the_partial_and_the_reply_apart`
+  (mutation-checked 2026-10-19: without the notice the two run together as "Half
+  an ansThe whole answer"); the other two paths are by reading. Hiding the
+  partial outright needs a "discard what I streamed for this round" event, which
+  is a protocol change across every `AgentEvent` consumer and the transcript
+  log, not a local one — not worth it while the partial is labelled.
 - **Building a sandbox policy touches the parent repo's `.git`.**
   `git_metadata_roots` `create_dir_all`s `refs/heads/hrdr` and
   `logs/refs/heads/hrdr` so they exist to be canonicalized and bind-mounted — so
