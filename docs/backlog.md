@@ -3074,10 +3074,10 @@ line-by-line: `tools/replace.rs`, `todo.rs`, `tree.rs`, `ls.rs`, `find.rs`,
 `verify.rs`, `watch.rs`, `secret_diff.rs`, `gate.rs`, `guardrails.rs`,
 `hooks.rs`, `web.rs`, `verification.rs`, `ansi.rs`, `test_nudge.rs`, `mcp/*`,
 the remaining TUI (selectors, popups, theme, tui.rs, trust_prompt.rs), the bulk
-of test modules, and all integration-test dirs. GAP: `hrdr-app/src/login.rs`
-structure and routing skimmed (wizard flow, browser-login completion lines) —
-not line-by-line. Security-specific classes were out of scope for this pass (the
-audit covers them).
+of test modules, and all integration-test dirs. `hrdr-app/src/login.rs`, skimmed
+here, was reviewed in full 2026-10-20 (see the dispatch.rs review).
+Security-specific classes were out of scope for this pass (the audit covers
+them).
 
 ## Security audit 2026-08-14
 
@@ -3149,11 +3149,10 @@ gate, mcp/*, the tool implementations), hrdr-tui (render paths, trust*prompt),
 `apps/hrdr/src/main.rs`. Skimmed, not line-by-line: `chatgpt_models.rs`
 account-catalog fetch, compaction summarization internals, budget.rs, MCP client
 wiring, the TUI's `app.rs` input-handler detail and selectors,
-`apps/hrdr/tests/*`beyond the headless suite.
-GAP:`hrdr-app/src/login.rs`wizard/browser-login completion lines
-and`hrdr-agent/src/prompt.rs`prompt _text_ — read, not audited
-line-by-line.`apps/hrdr/src/main.rs` beyond the trust gate was not audited by
-chunk 1 (covered by chunk 2).
+`apps/hrdr/tests/*`beyond the headless suite. GAP: `hrdr-agent/src/prompt.rs`
+prompt _text_ — read, not audited line-by-line. (`hrdr-app/src/login.rs`, also
+listed here, was reviewed in full 2026-10-20.)`apps/hrdr/src/main.rs` beyond the
+trust gate was not audited by chunk 1 (covered by chunk 2).
 
 ## Performance review 2026-08-14
 
