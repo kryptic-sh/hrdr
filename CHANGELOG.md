@@ -19,6 +19,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repo-authored instruction. It is now skipped wherever project instructions
   are, at startup and on a working-directory change (`prompt::project_gate`,
   `crates/hrdr-agent`).
+- **A browser login is refused for a custom provider spelled like a built-in.**
+  The `/login` picker's OAuth rows are fixed per built-in name, so with a
+  `[providers.openrouter]` (or `openai`, `chatgpt`) entry pointed elsewhere,
+  picking "OpenRouter — OAuth" still ran OpenRouter's flow and saved the key it
+  minted in the slot that custom provider reads, sending it to the custom
+  endpoint. The flow now refuses before binding a listener or opening a browser,
+  and says to log in with an API key (`browser_login_start`, `crates/hrdr-app`).
 
 ### Changed
 

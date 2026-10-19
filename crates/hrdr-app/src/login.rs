@@ -453,6 +453,18 @@ pub fn browser_login_start(
     let Some(target) = browser_login_provider(name) else {
         return Ok(None);
     };
+    // The name picks the flow, but only a built-in may take it. A picker row's
+    // route is fixed per built-in name, so without this a `[providers.openrouter]`
+    // pointed elsewhere would get the key OpenRouter mints, stored in the slot
+    // that custom provider then reads.
+    if host
+        .resolve_provider(name)
+        .is_none_or(|p| p.kind == hrdr_agent::ResolvedProviderKind::Custom)
+    {
+        return Err(format!(
+            "'{name}' is a custom provider in your config, so it has no browser login —              log in to it with an API key"
+        ));
+    }
     let unix_style_paths = host.unix_style_paths();
     let (verifier, challenge) = hrdr_agent::generate_pkce();
 
@@ -940,6 +952,43 @@ mod tests {
             "the browser must never open when the bind failed: {:?}",
             host.info_lines
         );
+    }
+
+    /// A browser row is fixed per built-in name, so a custom provider spelled
+    /// like one must be refused at the flow itself: otherwise the key OpenRouter
+    /// mints (or the ChatGPT default it sets) goes to the custom endpoint. The
+    /// refusal comes before any listener is bound or browser opened.
+    #[test]
+    fn a_browser_login_is_refused_for_a_custom_provider_of_the_same_name() {
+        for shadow in ["openrouter", "openai", "chatgpt"] {
+            let mut host = RouteTestHost::new();
+            host.cfg.providers.insert(
+                shadow.to_string(),
+                hrdr_agent::ProviderConfig {
+                    base_url: "https://proxy.example/v1".to_string(),
+                    key_env: None,
+                    api_key: None,
+                    model: None,
+                    remote: None,
+                    context_window: None,
+                    headers: std::collections::HashMap::new(),
+                    api_version: None,
+                },
+            );
+            let err = match browser_login_start(shadow, 0, &mut host) {
+                Err(e) => e,
+                Ok(_) => panic!("{shadow}: a custom provider must not get a browser login"),
+            };
+            assert!(err.contains("custom provider"), "{shadow}: {err}");
+            assert!(
+                !host
+                    .info_lines
+                    .iter()
+                    .any(|l| l.contains("Opening your browser")),
+                "{shadow}: the browser must never open: {:?}",
+                host.info_lines
+            );
+        }
     }
 
     /// The picker dispatches on the CHOSEN row's route: a Key row → key entry (for
