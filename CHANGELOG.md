@@ -26,6 +26,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   minted in the slot that custom provider reads, sending it to the custom
   endpoint. The flow now refuses before binding a listener or opening a browser,
   and says to log in with an API key (`browser_login_start`, `crates/hrdr-app`).
+- **A ChatGPT login whose default model could not be saved says so.** The failed
+  write of `model` to `config.toml` was dropped and the login still read "set as
+  your default"; it now names the error. A failed browser login also reports its
+  whole cause, not only the outermost step (`crates/hrdr-app`).
+- **Logging in to a keyless provider with no model no longer repeats the
+  message.** "needs a model" was printed by the model picker's prompt and again
+  as a failure (`crates/hrdr-app`).
 
 ### Changed
 

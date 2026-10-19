@@ -11,10 +11,12 @@ use crate::Session;
 /// so the resumed session is owned exclusively — the locked counterpart used by
 /// startup auto-resume.
 ///
-/// Selection: newest for the cwd, more than a bare system prompt. Returns:
+/// Selection: newest readable session for the cwd, more than a bare system
+/// prompt. A corrupt file lists with no cwd, so it is never the candidate — the
+/// newest readable one behind it is. Returns:
 /// * `Ok(Some((id, session, lock)))` — resume this and hold the guard;
-/// * `Ok(None)` — nothing worth resuming here (no candidate, corrupt newest, or
-///   content too thin);
+/// * `Ok(None)` — nothing worth resuming here (no candidate, a candidate that no
+///   longer loads when opened, or content too thin);
 /// * `Err(SessionBusy)` — the newest session is already open in another live
 ///   instance. Startup auto-resume treats this the same as `None` (start fresh)
 ///   rather than surfacing a jarring error; only an explicit `/resume` refuses.

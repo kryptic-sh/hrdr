@@ -279,8 +279,9 @@ fn apply_keyless(name: &str, host: &mut dyn CommandHost) {
                 p.base_url
             ));
         }
-        // A provider that can't name a model has already opened the picker
-        // (`apply_provider_or_pick`); anything else is a real failure.
+        // A provider that can't name a model has already said so and opened the
+        // picker (`apply_provider_or_pick`); anything else is a real failure.
+        Err(crate::ProviderSwitchError::NeedsModel { .. }) => {}
         Err(e) => host.info(e.to_string()),
     }
 }
@@ -493,7 +494,7 @@ pub fn browser_login_start(
                     .await
                 {
                     Ok(()) => (true, None),
-                    Err(e) => (false, Some(e.to_string())),
+                    Err(e) => (false, Some(format!("{e:#}"))),
                 };
             BrowserLoginOutcome {
                 login_id,
@@ -537,7 +538,7 @@ pub fn browser_login_start(
         let (token_saved, error) =
             match tokio::time::timeout(hrdr_agent::CHATGPT_LOGIN_BACKSTOP, flow).await {
                 Ok(Ok(())) => (true, None),
-                Ok(Err(e)) => (false, Some(e.to_string())),
+                Ok(Err(e)) => (false, Some(format!("{e:#}"))),
                 Err(_) => (false, Some("ChatGPT login timed out".to_string())),
             };
         // The OAuth credential is stored in — and resolved from — the merged
@@ -590,25 +591,24 @@ pub fn browser_login_completion_line(
         // `provider` key (the config loader rejects the old split layout). A
         // provider with a known default model (ChatGPT) is persisted; one without
         // (OpenRouter) is left for the user's `/model` pick to record.
-        if outcome.provider == "openai" {
-            let _ = hrdr_agent::persist_setting(
+        let default_saved = if outcome.provider == "openai" {
+            hrdr_agent::persist_setting(
                 "model",
                 hrdr_agent::ConfigValue::Str(&format!(
                     "openai://{}",
                     hrdr_agent::CHATGPT_DEFAULT_MODEL
                 )),
                 unix_style_paths,
-            );
-        }
+            )
+            .map(drop)
+        } else {
+            Ok(())
+        };
         match outcome.provider.as_str() {
             "openrouter" => "✓ logged in to OpenRouter. Key saved — pick a model with /model \
                              to use it now."
                 .to_string(),
-            _ => format!(
-                "✓ signed in with ChatGPT. Tokens saved and set as your default (model \
-                 {}) — /model to switch models.",
-                hrdr_agent::CHATGPT_DEFAULT_MODEL
-            ),
+            _ => chatgpt_signed_in_line(default_saved),
         }
     } else {
         format!(
@@ -616,6 +616,23 @@ pub fn browser_login_completion_line(
             outcome.provider,
             outcome.error.as_deref().unwrap_or("unknown error")
         )
+    }
+}
+
+/// The line for a saved ChatGPT login, which also says whether the default model
+/// was saved: a config file that cannot be written must not read as "set as your
+/// default" when the next start will not use it.
+fn chatgpt_signed_in_line(default_saved: anyhow::Result<()>) -> String {
+    match default_saved {
+        Ok(()) => format!(
+            "✓ signed in with ChatGPT. Tokens saved and set as your default (model \
+             {}) — /model to switch models.",
+            hrdr_agent::CHATGPT_DEFAULT_MODEL
+        ),
+        Err(e) => format!(
+            "✓ signed in with ChatGPT. Tokens saved, but it could not be set as your \
+             default ({e:#}) — /model to pick a model."
+        ),
     }
 }
 
@@ -815,6 +832,30 @@ mod tests {
             assert!(line.contains(&format!("{provider} login failed")));
             assert!(line.contains("authorization was rejected"));
         }
+    }
+
+    /// A ChatGPT login whose default could not be saved says so, with why,
+    /// rather than claiming the default was set.
+    #[test]
+    fn a_chatgpt_login_whose_default_was_not_saved_says_so() {
+        let saved = chatgpt_signed_in_line(Ok(()));
+        assert!(saved.contains("saved and set as your default"), "{saved}");
+
+        let failed = chatgpt_signed_in_line(Err(
+            anyhow::anyhow!("not valid TOML").context("reading config file ~/cfg.toml")
+        ));
+        assert!(
+            !failed.contains("saved and set as your default"),
+            "{failed}"
+        );
+        assert!(
+            failed.contains("could not be set as your default"),
+            "{failed}"
+        );
+        assert!(
+            failed.contains("reading config file ~/cfg.toml: not valid TOML"),
+            "the whole cause, not only its outer context: {failed}"
+        );
     }
 
     /// The wizard's numeric pick indexes the CHOICE list (not `BUILTIN_PROVIDERS`)
@@ -1026,6 +1067,17 @@ mod tests {
             host.model_picker_for.as_deref(),
             Some("local"),
             "a keyless provider with no model opens its model picker"
+        );
+        let needs_model: Vec<&String> = host
+            .info_lines
+            .iter()
+            .filter(|l| l.contains("model"))
+            .collect();
+        assert_eq!(
+            needs_model.len(),
+            1,
+            "the missing model is said once, by the picker's prompt: {:?}",
+            host.info_lines
         );
     }
 
