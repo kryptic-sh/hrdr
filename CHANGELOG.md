@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-10-19
+
 ### Changed
 
 - **Vim undo reaches across a history recall.** Up/Down recall, taking a queued
@@ -8050,7 +8052,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/kryptic-sh/hrdr/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/kryptic-sh/hrdr/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/kryptic-sh/hrdr/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/kryptic-sh/hrdr/compare/v0.15.3...v0.16.0
