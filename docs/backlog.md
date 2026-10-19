@@ -538,7 +538,15 @@ no caller in the tree — it survives only as a public re-export of a published
 crate (found 2026-10-16).
 
 Intermittent failures seen in runs during the messaging work and not
-root-caused: watch-delivery timing and session-save timing. (The third,
+root-caused: session-save timing. Watch-delivery timing was the tests' own
+waits: on 2026-10-20 a full `hrdr-tools` run failed
+`watch_delivers_after_the_condition_flips` (15s wait, 3 Git Bash rounds take
+~11s idle) in three consecutive runs, then
+`watch_one_second_timeout_gets_a_polling_opportunity` (10s), while the machine
+was shared with other sessions. Both now wait `ruling_deadline` — the ceiling
+plus one `CHECK_TIMEOUT` plus one interval, by which the watch must have ruled —
+and two full runs passed. The other `wait_done` callers keep fixed 10s/15s waits
+and have not failed. (The third,
 `a_coalesced_transcript_folds_exactly_like_the_event_stream`'s `took_ms`
 mismatch, was the two folds stamping a reasoning block's duration from the wall
 clock; the test compares that a duration was recorded, not its milliseconds,

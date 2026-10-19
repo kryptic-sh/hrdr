@@ -466,6 +466,17 @@ mod tests {
         }
     }
 
+    /// The latest a watch with this ceiling and interval can have ruled: the
+    /// ceiling is checked between rounds, so a round begun just inside it runs
+    /// out its own [`CHECK_TIMEOUT`], then sleeps one interval, before the
+    /// check that ends the watch. Waiting this long lets the watch decide the
+    /// outcome — a timeout still fails an "exited 0" assertion — where a
+    /// shorter fixed wait failed under suite load on Windows, whose Git Bash
+    /// rounds take seconds each, before the watch had ruled.
+    fn ruling_deadline(timeout_secs: u64, interval_secs: u64) -> Duration {
+        Duration::from_secs(timeout_secs + interval_secs) + CHECK_TIMEOUT + Duration::from_secs(5)
+    }
+
     /// A check that exits 0 only after `pass_after` runs, counting into a file
     /// in `dir` — the shape the "condition flips" tests need.
     fn flip_check(dir: &std::path::Path, pass_after: u64) -> String {
@@ -570,15 +581,16 @@ mod tests {
         let mut ctx = ToolContext::new(dir.path());
         ctx.enforce_timeout_floor = false; // sub-floor interval for a fast poll
         let check = flip_check(dir.path(), 3);
+        const CEILING_SECS: u64 = 30;
         let ack = tool()
             .execute(
-                serde_json::json!({"check": check, "interval_secs": 1, "timeout_secs": 30}),
+                serde_json::json!({"check": check, "interval_secs": 1, "timeout_secs": CEILING_SECS}),
                 &ctx,
             )
             .await
             .unwrap();
         let id = ack_id(&ack);
-        let entry = wait_done(&ctx, id, Duration::from_secs(15)).await;
+        let entry = wait_done(&ctx, id, ruling_deadline(CEILING_SECS, 1)).await;
         let result = entry.result.expect("a done watch has a result");
         assert!(result.contains("exited 0"), "{result}");
         // The third poll's own output (the counter reaching 3) is in the result.
@@ -893,7 +905,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let entry = wait_done(&ctx, ack_id(&ack), Duration::from_secs(10)).await;
+        let entry = wait_done(
+            &ctx,
+            ack_id(&ack),
+            ruling_deadline(MIN_WATCH_TIMEOUT_SECS, 1),
+        )
+        .await;
         assert!(
             entry.result.unwrap().contains("exited 0"),
             "the first poll did not observe the passing check"
