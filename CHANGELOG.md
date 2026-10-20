@@ -36,6 +36,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Vim mode moves to hjkl 0.43.** It brings operator + mark motions (`d'a`,
+  `y'a`) and fixes users of the vim input box will notice: `.` after `o`/`O` and
+  after an insert with a line break, `dw` at a line's end, `das`/`dis` across a
+  blank line, Visual `X`/`D`/`C`/`S`/`R`/`Y` on whole lines, and on Windows a
+  failed clipboard write no longer empties the clipboard (every `hjkl-*`
+  dependency, `Cargo.toml`).
+
 - **`message_session` says why a registered session could not be messaged.** A
   send to a session that discovery found registered but not answering was
   refused as "no running session", the same words as one that had exited, so the

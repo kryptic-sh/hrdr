@@ -109,13 +109,13 @@ only the list. Delete a line when its question is answered.
   follow-ups_); handle-relative no-follow opens (_Consistency / robustness_); a
   profile with no search tool (_Known behaviour to revisit_); an image dimension
   check, and a real-time lock-staleness test (_Deferred 2026-08-11 — media_);
-  the hrdr clipboard worker, text-over-PNG, and releasing hjkl's clipboard fixes
-  into hrdr (_Windows support review_); `compaction_tail_start` and the trailing
-  backslash (_Correctness review 2026-08-14_); `verify` dry run and resumed
-  `read_only` (_Security audit 2026-08-30_); the cron late fire (_Correctness
-  review 2026-09-04_); the unix completion-identity red/green (_Windows support
-  review_); per-surface shell choice (queue item 6) and broadening the
-  self-update handoff (queue item 8).
+  the hrdr clipboard worker, text-over-PNG, and an hjkl release carrying the
+  clipboard fixes (_Windows support review_); `compaction_tail_start` and the
+  trailing backslash (_Correctness review 2026-08-14_); `verify` dry run and
+  resumed `read_only` (_Security audit 2026-08-30_); the cron late fire
+  (_Correctness review 2026-09-04_); the unix completion-identity red/green
+  (_Windows support review_); per-surface shell choice (queue item 6) and
+  broadening the self-update handoff (queue item 8).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -133,11 +133,10 @@ Fixed 2026-10-18 (`vim_editor`, pinned by `vim_tests::keys_drive_the_vim_fsm`).
 The hjkl engine itself is capable — `dw`, counts, `ciw`/`ci"`, `.`, undo/redo,
 visual delete, named registers, `/` search, macros, marks and `R` all worked in
 the probe; `:` is a no-op by design (ex commands are the host's). What remains
-is how hrdr hosts it. Every `hjkl-*` crate resolves to 0.42.2; hjkl 0.43.0
-(2026-10-20) is out since, a breaking minor for `hjkl-vim`, not yet adopted —
-see the clipboard entry under the Windows support review for the upgrade
-question. Evidence is marked: **[ran]** observed, **[read]** from the code,
-**[inferred]** not confirmed.
+is how hrdr hosts it. Every `hjkl-*` crate resolves to 0.43.0, the newest on
+crates.io (adopted 2026-10-20; its `hjkl-vim` API breaks touched nothing hrdr
+uses — the workspace built and passed unchanged). Evidence is marked: **[ran]**
+observed, **[read]** from the code, **[inferred]** not confirmed.
 
 1. **Vim e2e coverage.** [ran] `app::e2e::ctrl_d_scrolls_and_never_quits` never
    feeds a key to the engine — which is how the crash went unnoticed. The
@@ -3016,11 +3015,10 @@ and **not** fixed.
   byte, and a 256 MiB read cap — on top of `b2e2e257` (allocate before
   `EmptyClipboard`, 2026-10-18). Each was shown red by reverting it; the ignored
   real-clipboard round trip was not run (it would replace the owner's
-  clipboard). **hrdr does not have them yet:** it pins hjkl 0.42.2, the fixes
-  are unreleased, and hjkl's last release (0.43.0) is a breaking minor for
-  `hjkl-vim`. **[Deferred — question for the owner; see the index at the top]**
-  **Question:** cut an hjkl release with these and move hrdr to it (a minor
-  upgrade with hjkl-vim API changes to absorb in `hrdr-editor`), or wait for
+  clipboard). **hrdr has only the first:** it is on hjkl 0.43.0 (which carries
+  `b2e2e257`), and `99b0d328` is unreleased. **[Deferred — question for the
+  owner; see the index at the top]** **Question:** cut an hjkl release (a
+  publish to crates.io) carrying `99b0d328` and move hrdr to it, or wait for
   hjkl's own next release? Left upstream, by decision or nature: `set_text`
   stops at an interior NUL (`CF_UNICODETEXT` is NUL-terminated, so the format
   cannot carry one); line endings are not converted (hjkl's own backlog holds

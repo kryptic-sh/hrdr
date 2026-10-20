@@ -31,20 +31,20 @@ hrdr-tui = { path = "crates/hrdr-tui", version = "0.17.1" }
 hrdr-test-support = { path = "crates/hrdr-test-support" }
 
 # hjkl — crates.io pins (caret-minor; lockfile holds the exact patch).
-hjkl-engine = "0.42"
-hjkl-vim = "0.42"
-hjkl-buffer = "0.42"
-hjkl-buffer-tui = "0.42"
-hjkl-engine-tui = "0.42"
-hjkl-clipboard = "0.42"
-hjkl-holler = "0.42"
-hjkl-holler-tui = "0.42"
-hjkl-theme = "0.42"
-hjkl-markdown = "0.42"
-hjkl-markdown-tui = "0.42"
-hjkl-xdg = "0.42"
-hjkl-icons = "0.42"
-hjkl-splash = "0.42"
+hjkl-engine = "0.43"
+hjkl-vim = "0.43"
+hjkl-buffer = "0.43"
+hjkl-buffer-tui = "0.43"
+hjkl-engine-tui = "0.43"
+hjkl-clipboard = "0.43"
+hjkl-holler = "0.43"
+hjkl-holler-tui = "0.43"
+hjkl-theme = "0.43"
+hjkl-markdown = "0.43"
+hjkl-markdown-tui = "0.43"
+hjkl-xdg = "0.43"
+hjkl-icons = "0.43"
+hjkl-splash = "0.43"
 
 # third-party
 tokio = { version = "1", features = ["full"] }
