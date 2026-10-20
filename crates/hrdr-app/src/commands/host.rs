@@ -263,6 +263,12 @@ pub trait CommandHost {
         }
     }
 
+    /// Open `url` in the user's browser (a browser login's authorize page). The
+    /// default launches the OS default handler; a test host records it instead.
+    fn open_browser(&mut self, url: &str) {
+        let _ = open_system_handler(std::path::Path::new(url));
+    }
+
     /// Open `path` in an editor (`/edit`). The default launches the OS default
     /// handler (`xdg-open` / `open` / `start`); the TUI overrides to suspend the
     /// terminal and run `$EDITOR` instead.

@@ -702,7 +702,7 @@ fn open_browser(url: &str, label: &str, deadline: &str, host: &mut dyn CommandHo
          If it doesn't open, visit:\n{url}\n\
          Waiting for you to finish in the browser (up to {deadline}). Esc aborts."
     ));
-    let _ = crate::open_system_handler(std::path::Path::new(url));
+    host.open_browser(url);
 }
 
 /// OpenRouter (5-minute callback deadline): wait for the callback code, exchange
@@ -840,6 +840,87 @@ mod tests {
             assert!(line.contains(&format!("{provider} login failed")));
             assert!(line.contains("authorization was rejected"));
         }
+    }
+
+    /// A browser login the provider refuses ends with a failed outcome naming
+    /// why, through the real flow: the callback listener is bound, the
+    /// authorize page "opened" (recorded by the host), and the provider's
+    /// error callback answered on the loopback port with this login's state.
+    #[tokio::test]
+    async fn a_refused_browser_login_reports_why() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut host = RouteTestHost::new();
+        let start = browser_login_start("openrouter", 7, &mut host)
+            .expect("the listener binds")
+            .expect("openrouter has a browser login");
+        let opened = host.opened.last().expect("the authorize page was opened");
+        let callback = percent_decode(
+            opened
+                .split("callback_url=")
+                .nth(1)
+                .and_then(|rest| rest.split('&').next())
+                .expect("the authorize URL carries the callback"),
+        );
+        let (authority, state) = callback
+            .strip_prefix("http://localhost:")
+            .and_then(|rest| rest.split_once("/auth/callback?state="))
+            .expect("a loopback callback with its state");
+        let port: u16 = authority.parse().unwrap();
+        // The flow is lazy: it accepts the callback only while it is polled.
+        let login = tokio::spawn(start.future);
+
+        let mut provider = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        provider
+            .write_all(
+                format!(
+                    "GET /auth/callback?error=access_denied&error_description=denied&state={state} \
+                     HTTP/1.1\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut page = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.read_to_end(&mut page),
+        )
+        .await
+        .expect("the listener answers")
+        .unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), login)
+            .await
+            .expect("the refusal ends the login")
+            .unwrap();
+        assert_eq!(outcome.login_id, 7);
+        assert!(!outcome.token_saved);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("authorization failed: denied")
+        );
+        assert_eq!(
+            browser_login_completion_line(&outcome, false),
+            "openrouter login failed: authorization failed: denied"
+        );
+    }
+
+    /// `%XX` escapes decoded, for reading the form-encoded callback URL back.
+    fn percent_decode(s: &str) -> String {
+        let mut out = Vec::new();
+        let mut bytes = s.bytes();
+        while let Some(b) = bytes.next() {
+            if b == b'%' {
+                let hex: String = bytes.by_ref().take(2).map(char::from).collect();
+                out.push(u8::from_str_radix(&hex, 16).unwrap());
+            } else {
+                out.push(b);
+            }
+        }
+        String::from_utf8(out).unwrap()
     }
 
     /// A failed login reports its root cause, not only the step that failed.
@@ -1227,6 +1308,7 @@ mod tests {
         model: hrdr_agent::ModelRef,
         model_picker_for: Option<String>,
         info_lines: Vec<String>,
+        opened: Vec<String>,
     }
 
     impl RouteTestHost {
@@ -1242,6 +1324,7 @@ mod tests {
                 agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
                 model,
                 model_picker_for: None,
+                opened: Vec::new(),
                 info_lines: Vec::new(),
             }
         }
@@ -1256,6 +1339,10 @@ mod tests {
         }
         fn begin_model_selector_for(&mut self, provider: &str) {
             self.model_picker_for = Some(provider.to_string());
+        }
+        // Never launch a real browser from a test.
+        fn open_browser(&mut self, url: &str) {
+            self.opened.push(url.to_string());
         }
         // Never write to the real user config from a test.
         fn persist_setting(&mut self, _key: &str, _value: hrdr_agent::ConfigValue) {}
