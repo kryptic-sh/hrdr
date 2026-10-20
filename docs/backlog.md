@@ -323,9 +323,12 @@ push each verified slice to `main` before proceeding to the next slice.
    "reading the reply"; `a_failed_probe_names_the_step_it_failed_at`), so the
    next recurrence says on which side and when the pipe closed. **[Deferred —
    question for the owner; see the index at the top]** Not fixed: the cause is
-   unknown until it recurs, and it has not reproduced locally. **Question:**
-   meanwhile, retry `a_live_tui_messages_a_peer_and_is_woken_by_its_reply` once
-   on CI? The build
+   unknown until it recurs, and it has not reproduced locally — on 2026-10-20
+   the test passed 15 of 15 runs alone and 36 of 36 under load (nine rounds of
+   four concurrent copies, each beside a full `hrdr-tools` lib run), Windows,
+   pinned ConPTY host. CI's Windows runner is the only place it has failed.
+   **Question:** meanwhile, retry
+   `a_live_tui_messages_a_peer_and_is_woken_by_its_reply` once on CI? The build
    - smoke job runs it under `cargo test`, which has no retry, so that means
      moving the `tui_pty` suite to nextest there (whose passing retries are
      still reported as flaky, keeping the evidence) — or keep it failing the
