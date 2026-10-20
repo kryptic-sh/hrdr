@@ -5774,6 +5774,10 @@ mod tests {
         let Some(shell) = hrdr_tools::Shell::detect() else {
             return;
         };
+        // The watch's own lifetime, and so the longest round 2 can take to run:
+        // a fixed shorter wait failed under workspace-suite load on Windows,
+        // where each round spawns a Git Bash.
+        const WATCH_TIMEOUT_SECS: u64 = 60;
         let mut agent = Agent::new(AgentConfig::default()).unwrap();
         agent.ctx.enforce_timeout_floor = false;
         let dir = tempfile::tempdir().unwrap();
@@ -5800,7 +5804,7 @@ mod tests {
         };
         let ack = hrdr_tools::WatchTool::new(shell)
             .execute(
-                serde_json::json!({"check": check, "interval_secs": 1, "timeout_secs": 60}),
+                serde_json::json!({"check": check, "interval_secs": 1, "timeout_secs": WATCH_TIMEOUT_SECS}),
                 &agent.ctx,
             )
             .await
@@ -5813,7 +5817,8 @@ mod tests {
             .expect("an id in the ack");
         // Wait until round 2 has run (counter == 2), then cancel before the
         // round 3 that would pass.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(WATCH_TIMEOUT_SECS);
         loop {
             let c = std::fs::read_to_string(&counter)
                 .ok()
