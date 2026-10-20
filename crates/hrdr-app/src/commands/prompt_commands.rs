@@ -177,6 +177,9 @@ pub fn prompt_completions(
         return Vec::new();
     }
     let q = command_match_key(query);
+    // Descriptions are prose, not names: `.` and `:` there are punctuation, so
+    // they are searched for as typed, not rewritten to the namespace separator.
+    let dq = query.to_ascii_lowercase();
     let mut scored: Vec<(u8, (String, String))> = Vec::new();
     let mut push = |name: &str, description: &str| {
         let nl = command_match_key(name);
@@ -184,7 +187,7 @@ pub fn prompt_completions(
             0
         } else if nl.contains(&q) {
             1
-        } else if description.to_ascii_lowercase().contains(&q) {
+        } else if description.to_ascii_lowercase().contains(&dq) {
             2
         } else {
             return;
@@ -307,6 +310,21 @@ mod tests {
         // A space kills completion; non-: input yields nothing.
         assert!(names(":ship ").is_empty());
         assert!(names("/ship").is_empty());
+    }
+
+    /// `.` and `:` are namespace separators only in a name; in a description
+    /// they are punctuation, and a query holding them finds it as written.
+    #[test]
+    fn a_description_matches_its_own_punctuation() {
+        let commands = vec![command("bump", "move to v1.2: the next minor")];
+        let names = |i: &str| {
+            prompt_completions(i, &commands, &[])
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(":v1.2"), vec![":bump"]);
+        assert_eq!(names(":V1.2:"), vec![":bump"]);
     }
 
     /// A namespaced command completes from its namespace, whichever separator

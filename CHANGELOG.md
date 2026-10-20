@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`:` completion finds a description by its punctuation.** A query was
+  searched for in command and skill descriptions with `.` and `:` rewritten to
+  the namespace separator `/`, so `:v1.2` never matched a description holding
+  "v1.2". Descriptions are now searched for the query as typed
+  (`prompt_completions`, `crates/hrdr-app`).
 - **The Homebrew formula loads on Homebrew 7.** Homebrew now loads every formula
   in a tap for each OS and architecture when it taps it, and this one only had
   its URLs under `on_macos`, so `brew tap kryptic-sh/tap` failed with "invalid

@@ -1940,11 +1940,9 @@ reasoned from lock scopes, not from a racing repro. TUI modal/picker key routing
 was judged only at its `begin_*` entry points. `login.rs`,
 `commands/prompt_commands.rs`, `completion.rs` and `sessions.rs` were reviewed
 in full 2026-10-20 (one read-only pass, findings re-traced): `login.rs`'s four
-findings shipped; the other three had none, beyond a cosmetic one —
-`prompt_completions` rewrites `.`/`:` to `/` before searching descriptions, so
-`:v1.2` does not match a description holding "v1.2". `open_system_handler`'s
-macOS arm is `#[cfg]`-gated and compiled only on CI; the Windows arm compiles
-locally now.
+findings shipped; the other three had one cosmetic finding, since fixed.
+`open_system_handler`'s macOS arm is `#[cfg]`-gated and compiled only on CI; the
+Windows arm compiles locally now.
 
 ---
 
