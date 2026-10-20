@@ -581,17 +581,20 @@ coverage uses a Windows readonly fixture
 2026-10-18: a read-only file does not stop a unix rename, a read-only directory
 fails the lock before the write, and a directory at the path fails the read —
 nothing makes only `write_atomic` fail — and the label is one `with_context` in
-`save_entry_at` shared by every platform, which the Windows test pins. Blob lock
-and OAuth refresh persistence errors remain ignored, with native labels in those
-discarded errors. The OAuth one is **[Deferred — question for the owner; see the
-index at the top]**: `coordinated_oauth_access` passes `coordinated_access_core`
-a persist callback that drops `save_oauth_entry_at`'s error, so a failed save of
-a rotated refresh token goes unnoticed until the next start cannot refresh.
-`hrdr-agent` has no logging channel, and failing the request would throw away an
-access token that is valid for this session, so surfacing it means choosing a
-channel. `valid_access_token`, the uncoordinated variant that drops the same
-error, has no caller in the tree — it survives only as a public re-export of a
-published crate (found 2026-10-16).
+`save_entry_at` shared by every platform, which the Windows test pins. A failed
+blob-store lock is ignored by design, not oversight (`lock_blob_store`'s doc: a
+save proceeds unguarded rather than lose an attachment or the session, with
+`BLOB_GRACE_SECS` as the fallback, and the collector skips its pass). The OAuth
+refresh persistence error is also discarded, and that one is **[Deferred —
+question for the owner; see the index at the top]**: `coordinated_oauth_access`
+passes `coordinated_access_core` a persist callback that drops
+`save_oauth_entry_at`'s error, so a failed save of a rotated refresh token goes
+unnoticed until the next start cannot refresh. `hrdr-agent` has no logging
+channel, and failing the request would throw away an access token that is valid
+for this session, so surfacing it means choosing a channel.
+`valid_access_token`, the uncoordinated variant that drops the same error, has
+no caller in the tree — it survives only as a public re-export of a published
+crate (found 2026-10-16).
 
 Intermittent failures seen in runs during the messaging work and not
 root-caused: session-save timing. Watch-delivery timing was the tests' own
@@ -2897,15 +2900,17 @@ and **not** fixed.
   further active gaps, not exhaustive proof. Startup diagnostics recover a typed
   preference from valid TOML or default to `true`; failed reloads retain the
   active style. The reload regression exercises manual dispatch and the mtime
-  handler, not the watcher/event loop; a successful reload's notice is asserted
-  (`a_successful_config_reload_applies_it_and_says_so`). The failure test takes
-  its whole expected toast from `reload_checked`, but also requires the literal
-  diagnostic in it (`could not parse config file:` after the styled path, or the
-  `sandbox_writable_roots` message), and `reload_message_tests` pins the prefix
-  — rewording the diagnostic fails it (mutation-checked 2026-10-18). Only the
-  TOML parser's own excerpt is unpinned, deliberately: that text is the `toml`
-  crate's. Preserve filesystem identities, Unix literal backslashes, parser
-  excerpts, protocol URIs, and captured shell output.
+  handler; the watcher-to-loop link is driven by
+  `a_config_save_reaches_the_loop_through_the_watcher` (2026-10-20, red without
+  the `ConfigChanged` arm or the watcher's ping); a successful reload's notice
+  is asserted (`a_successful_config_reload_applies_it_and_says_so`). The failure
+  test takes its whole expected toast from `reload_checked`, but also requires
+  the literal diagnostic in it (`could not parse config file:` after the styled
+  path, or the `sandbox_writable_roots` message), and `reload_message_tests`
+  pins the prefix — rewording the diagnostic fails it (mutation-checked
+  2026-10-18). Only the TOML parser's own excerpt is unpinned, deliberately:
+  that text is the `toml` crate's. Preserve filesystem identities, Unix literal
+  backslashes, parser excerpts, protocol URIs, and captured shell output.
 - **Completion identity verification gaps:** Unix collision tests in
   `hrdr-app/src/util.rs` and `hrdr-tui/src/app/e2e.rs` passed Linux/macOS CI in
   `37912493951`; local verification was Windows-only, including a failing
@@ -2972,10 +2977,12 @@ and **not** fixed.
   full `--no-fail-fast` workspace runs on 2026-10-20, logged, passed every
   hrdr-app test (one failed only a `watch` test, since fixed).
 - **Idle logo verification gaps:** Visual behavior in Windows Terminal/Alacritty
-  was not reproduced. Wide/combining glyph clipping and the additional
-  header-visibility pass's cost remain unmeasured. Overlay coverage
-  intentionally does not affect animation eligibility; only transcript viewport
-  visibility does.
+  was not reproduced. Wide/combining glyph clipping remains unmeasured. The
+  header-visibility pass's cost was measured 2026-10-20 with a throwaway probe
+  (deleted) in `--release` on Windows, 120×40, header on screen: 118.7–120.1 µs
+  per frame with the pass, 114.7–118.8 µs with it disabled — inside run-to-run
+  noise. Overlay coverage intentionally does not affect animation eligibility;
+  only transcript viewport visibility does.
 
 **Coverage gaps (stated as gaps):**
 
