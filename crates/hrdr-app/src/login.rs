@@ -463,7 +463,8 @@ pub fn browser_login_start(
         .is_none_or(|p| p.kind == hrdr_agent::ResolvedProviderKind::Custom)
     {
         return Err(format!(
-            "'{name}' is a custom provider in your config, so it has no browser login —              log in to it with an API key"
+            "'{name}' is a custom provider in your config, so it has no browser login — log \
+             in to it with an API key"
         ));
     }
     let unix_style_paths = host.unix_style_paths();
@@ -1119,7 +1120,13 @@ mod tests {
                 Err(e) => e,
                 Ok(_) => panic!("{shadow}: a custom provider must not get a browser login"),
             };
-            assert!(err.contains("custom provider"), "{shadow}: {err}");
+            assert_eq!(
+                err,
+                format!(
+                    "'{shadow}' is a custom provider in your config, so it has no browser login \
+                     — log in to it with an API key"
+                )
+            );
             assert!(
                 !host
                     .info_lines
