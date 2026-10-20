@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-20
+
+### Breaking
+
+- **`hrdr-editor`'s re-exported key types follow hjkl 0.43.** `EditorKey` and
+  `EditorKeyCode` are `hjkl_engine` types, and the move from hjkl 0.42 to 0.43
+  makes them the newer crate's types, so code naming them against hjkl 0.42 no
+  longer matches. The hrdr binary is unaffected (`crates/hrdr-editor`).
+
 ### Fixed
 
 - **`:` completion finds a description by its punctuation.** A query was
@@ -8110,7 +8119,8 @@ Together with the block cache, a 2000-entry transcript now draws in **0.39ms**
   more terminals than Shift+Enter); Shift+Enter still works where the terminal
   reports it, and `\`+Enter works everywhere.
 
-[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/kryptic-sh/hrdr/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/kryptic-sh/hrdr/compare/v0.17.1...v0.18.0
 [0.17.1]: https://github.com/kryptic-sh/hrdr/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/kryptic-sh/hrdr/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/kryptic-sh/hrdr/compare/v0.16.0...v0.16.1
