@@ -109,8 +109,8 @@ only the list. Delete a line when its question is answered.
   follow-ups_); handle-relative no-follow opens (_Consistency / robustness_); a
   profile with no search tool (_Known behaviour to revisit_); an image dimension
   check, and a real-time lock-staleness test (_Deferred 2026-08-11 — media_);
-  the hrdr clipboard worker, text-over-PNG, and the upstream hjkl-clipboard
-  fixes (_Windows support review_); `compaction_tail_start` and the trailing
+  the hrdr clipboard worker, text-over-PNG, and releasing hjkl's clipboard fixes
+  into hrdr (_Windows support review_); `compaction_tail_start` and the trailing
   backslash (_Correctness review 2026-08-14_); `verify` dry run and resumed
   `read_only` (_Security audit 2026-08-30_); the cron late fire (_Correctness
   review 2026-09-04_); the unix completion-identity red/green (_Windows support
@@ -133,10 +133,11 @@ Fixed 2026-10-18 (`vim_editor`, pinned by `vim_tests::keys_drive_the_vim_fsm`).
 The hjkl engine itself is capable — `dw`, counts, `ciw`/`ci"`, `.`, undo/redo,
 visual delete, named registers, `/` search, macros, marks and `R` all worked in
 the probe; `:` is a no-op by design (ex commands are the host's). What remains
-is how hrdr hosts it. hjkl deps are current: every `hjkl-*` crate resolves to
-0.42.2, the newest on crates.io, and the hjkl repo holds only dependency bumps
-since `v0.42.2` (checked 2026-10-18). Evidence is marked: **[ran]** observed,
-**[read]** from the code, **[inferred]** not confirmed.
+is how hrdr hosts it. Every `hjkl-*` crate resolves to 0.42.2; hjkl 0.43.0
+(2026-10-20) is out since, a breaking minor for `hjkl-vim`, not yet adopted —
+see the clipboard entry under the Windows support review for the upgrade
+question. Evidence is marked: **[ran]** observed, **[read]** from the code,
+**[inferred]** not confirmed.
 
 1. **Vim e2e coverage.** [ran] `app::e2e::ctrl_d_scrolls_and_never_quits` never
    feeds a key to the engine — which is how the crash went unnoticed. The
@@ -3008,24 +3009,24 @@ and **not** fixed.
   `CloseClipboard` on every path, `GlobalFree` only when `SetClipboardData`
   fails, FFI types and constants right for x86_64 and aarch64 (by reading).
   Fixed in hrdr the same day: vim `"+p` kept Windows `\r` (`clipboard_text` in
-  `hrdr-editor/src/host.rs`). Open, **upstream** (kryptic-sh/hjkl,
-  `backend/windows.rs`):
-  - `ClipboardOpen::new` calls `OpenClipboard` once — no retry — and drops
-    `GetLastError`, so a clipboard-history or RDP-sync app holding the clipboard
-    for a moment fails a copy or paste outright [ran: every read failed in
-    microseconds while another process held it].
-  - `get_text` uses strict `String::from_utf16`: one lone surrogate fails the
-    whole read; `set_text` truncates at an interior NUL; neither converts line
-    endings.
-  - `dib_png::dib_to_png` ignores `biCompression` and the colour masks and takes
-    the fourth byte as alpha, so a classic PrintScreen bitmap (alpha 0) likely
-    pastes as a transparent PNG; 16-bit and palette DIBs error. It negates
-    `height_raw` plainly (overflow on `i32::MIN`).
-  - `get_png`/`get_bytes` copy `GlobalSize` bytes, which may exceed what was
-    written; `cf_hdrop::parse` errors on an odd length instead of trimming.
-  - `set_*` call `EmptyClipboard` before allocating, so a failed write erases
-    the user's clipboard; `set_png` can leave only the PNG format.
-  - No size cap on a read.
+  `hrdr-editor/src/host.rs`). **Upstream** (kryptic-sh/hjkl): fixed there
+  2026-10-20 in `99b0d328` — `OpenClipboard` retried, lossy `CF_UNICODETEXT`,
+  `dib_to_png` honouring `biCompression`/masks with all-zero alpha read as
+  opaque and no `i32::MIN` overflow, `cf_hdrop::parse` tolerating a trailing odd
+  byte, and a 256 MiB read cap — on top of `b2e2e257` (allocate before
+  `EmptyClipboard`, 2026-10-18). Each was shown red by reverting it; the ignored
+  real-clipboard round trip was not run (it would replace the owner's
+  clipboard). **hrdr does not have them yet:** it pins hjkl 0.42.2, the fixes
+  are unreleased, and hjkl's last release (0.43.0) is a breaking minor for
+  `hjkl-vim`. **[Deferred — question for the owner; see the index at the top]**
+  **Question:** cut an hjkl release with these and move hrdr to it (a minor
+  upgrade with hjkl-vim API changes to absorb in `hrdr-editor`), or wait for
+  hjkl's own next release? Left upstream, by decision or nature: `set_text`
+  stops at an interior NUL (`CF_UNICODETEXT` is NUL-terminated, so the format
+  cannot carry one); line endings are not converted (hjkl's own backlog holds
+  that decision; hrdr strips `\r` in `clipboard_text`); `get_png`/`get_bytes`
+  copy the whole `GlobalSize` block, whose slack past the written bytes the PNG
+  and CF_HTML parsers ignore; 16-bit and palette DIBs are still refused.
 
   Open, **in hrdr** [read] **[Deferred — question for the owner; see the index
   at the top]** every clipboard call is a synchronous OS call on the UI thread —
@@ -3043,11 +3044,12 @@ and **not** fixed.
   Ctrl+] on copied cells likely attaches a picture of them (unverified: no
   Office here). Not verified: delayed-render stall lengths, real
   PrintScreen/Snipping Tool output, aarch64. **Questions:** (a) move clipboard
-  calls off the UI thread (a worker, with reads waiting for queued writes to
-  drain)? (b) prefer text over PNG when the clipboard offers both? (c) the
-  upstream list above lives in kryptic-sh/hjkl, where another session had
-  uncommitted work on 2026-10-20 — fix it from here and release hjkl, or leave
-  it to that repo's own work?
+  calls off the UI thread? Writes could go to a worker, but a vim `"+p` reads
+  through hjkl's synchronous `Host::read_clipboard`, so every read would have to
+  wait for queued writes to drain — a design change, not a fix. (b) prefer text
+  over PNG when the clipboard offers both? That fixes Office cells pasting as a
+  picture (unverified — no Office here) but breaks a browser's "copy image",
+  which offers text beside the image too.
 
 ## Correctness review 2026-08-14
 
