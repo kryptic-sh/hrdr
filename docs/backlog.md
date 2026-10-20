@@ -651,14 +651,16 @@ candidate causes. The post-kill drain gap was real and is fixed: a line the
 command had not finished was dropped with the read loop, which the new
 unfinished-line case shows deterministically (it fails without the drain). The
 1s deadline could also expire before Git Bash started under load; both tests now
-use `test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS`. Which cause produced the CI
-failures is unknown — neither was reproduced on demand. Since 2026-10-18 the
-test runs every shell in `Shell::available()`, so on Windows the PowerShell
-branches (the unfinished line included) run beside Git Bash; they pass locally.
-The same day, one full `hrdr-tools` run in WSL under load (a release build
-running beside it) failed
-`proc::tests::git_runner_deadline_covers_readers_after_the_leader_exits` on its
-`TimedOut` kind assertion; five isolated reruns passed. A full Windows
+use `test_env::PRINT_THEN_SLEEP_TIMEOUT_SECS`. Which cause produced the
+2026-10-14 CI failures is unknown — neither was reproduced on demand. On
+2026-10-20 CI run `39402872279` failed the first test's PowerShell branch at the
+5s deadline with no output at all, after the drain fix — so startup outlasting
+the deadline is real; the constant is 10s since. Since 2026-10-18 the test runs
+every shell in `Shell::available()`, so on Windows the PowerShell branches (the
+unfinished line included) run beside Git Bash; they pass locally. The same day,
+one full `hrdr-tools` run in WSL under load (a release build running beside it)
+failed `proc::tests::git_runner_deadline_covers_readers_after_the_leader_exits`
+on its `TimedOut` kind assertion; five isolated reruns passed. A full Windows
 `hrdr-tools` run on 2026-10-14 likewise failed
 `proc::tests::git_runner_kills_an_overflowing_program_without_waiting_for_its_timeout`
 (its 2s budget for a `.cmd` printing 10,000 lines); three isolated reruns
