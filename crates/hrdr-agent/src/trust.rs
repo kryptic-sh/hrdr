@@ -51,14 +51,25 @@ fn key(dir: &Path) -> String {
 }
 
 /// Every directory in the store. Missing file, unreadable file and empty file
-/// are all the same answer: nothing is trusted yet.
+/// are all the same answer: nothing is trusted yet. So is a link planted at the
+/// store's path: like [`trust`], the read refuses to follow it, so a list kept
+/// elsewhere cannot vouch for anything.
 fn stored() -> Vec<String> {
+    use std::io::Read;
+
     let Some(p) = trusted_dirs_path() else {
         return Vec::new();
     };
-    let Ok(text) = std::fs::read_to_string(p) else {
+    let Ok(mut f) = hrdr_llm::owner_only_options_no_follow().read(true).open(p) else {
         return Vec::new();
     };
+    if !f.metadata().is_ok_and(|m| m.file_type().is_file()) {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    if f.read_to_string(&mut text).is_err() {
+        return Vec::new();
+    }
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -332,6 +343,24 @@ mod tests {
 
         assert!(trust(dir.path(), true).is_err());
         assert!(!target.exists(), "the link's target was never created");
+    }
+
+    /// A link planted at the store's path is not read through either: a list
+    /// kept elsewhere, naming a directory, does not make it trusted.
+    #[test]
+    fn a_symlinked_store_is_not_read_through() {
+        let (_store, _lock) = private_store();
+        let path = trusted_dirs_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("target");
+        std::fs::write(&target, format!("{}\n", key(dir.path()))).unwrap();
+        if !hrdr_test_support::symlink_or_skip(&target, &path) {
+            return;
+        }
+
+        assert!(!is_trusted(dir.path()));
     }
 
     /// No store yet is the same answer as an empty one, not an error.

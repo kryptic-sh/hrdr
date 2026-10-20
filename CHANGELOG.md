@@ -13,11 +13,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its URLs under `on_macos`, so `brew tap kryptic-sh/tap` failed with "invalid
   syntax in tap" and no kryptic-sh tool could be installed. The URLs moved out
   of `on_macos` and `depends_on :macos` keeps the formula macOS-only.
-- **The trusted-directories store no longer writes through a symlink.** A link
-  planted at `$XDG_CACHE_HOME/hrdr/trusted-dirs` was followed, so a trust answer
-  was appended to whatever file it pointed at, created if missing. The store is
-  now opened without following a final-component link and refused unless it is a
-  regular file (`trust::trust`, `crates/hrdr-agent`).
+- **The trusted-directories store no longer reads or writes through a symlink.**
+  A link planted at `$XDG_CACHE_HOME/hrdr/trusted-dirs` was followed, so a trust
+  answer was appended to whatever file it pointed at, created if missing, and a
+  list kept at the link's target decided which directories were trusted. The
+  store is now opened without following a final-component link and refused
+  unless it is a regular file; a refused read trusts nothing (`trust::trust`,
+  `trust::is_trusted`, `crates/hrdr-agent`).
 - **A jailed session's prompt no longer carries the project's CI commands.** The
   verification gate read out of the working tree's CI config (or its manifests)
   was stated as what "done" means even in `jail`, which loads no other

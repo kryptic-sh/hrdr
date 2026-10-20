@@ -2123,9 +2123,11 @@ overrides it). Residual, recorded as hardening below.
   2026-10-15): the store's directory is forced to `0700` on every trust write
   (`auth::create_dir_owner_only`, existing directories included), so no other
   user can reach the file. Low sensitivity (directory paths). A final-component
-  symlink is refused since 2026-10-20
-  (`a_symlinked_store_is_not_written_through`); a symlinked parent directory is
-  still traversed, and `stored()` reads through a link.
+  symlink is refused since 2026-10-20 on write and on read
+  (`a_symlinked_store_is_not_written_through`,
+  `a_symlinked_store_is_not_read_through`); a symlinked parent directory is
+  still traversed — `owner_only_options_no_follow` covers the final component
+  only, and the parent is the user's own 0700 cache directory.
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
   then `atomic_write` re-opens the path; a symlink swap between the two could
   redirect a write. Same-user, no privilege boundary.
