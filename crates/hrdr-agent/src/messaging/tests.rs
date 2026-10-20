@@ -507,6 +507,42 @@ async fn discovery_reports_a_session_that_did_not_accept_and_why() {
     assert_eq!(a.discover().await.unwrap(), vec![a.descriptor()]);
 }
 
+/// A failed probe says which step of the exchange failed, so a session that
+/// "did not answer" can be traced to the connect, the greeting, the request or
+/// the reply.
+#[tokio::test]
+async fn a_failed_probe_names_the_step_it_failed_at() {
+    use hrdr_tools::local_ipc::{Listener, Registration};
+
+    let root = root();
+    let a = runtime(root.path(), "a", "/one").await;
+    let directory = UserDirectory::open_in(root.path()).unwrap();
+    let mut listener = Listener::bind(&directory).unwrap();
+    let descriptor = SessionDescriptor {
+        endpoint: listener.endpoint().clone(),
+        session_id: "silent".into(),
+        session_name: "silent".into(),
+        working_directory: "/silent".into(),
+    };
+    let _registration = Registration::publish(&listener, descriptor.clone()).unwrap();
+    // Hang up on both probe attempts before sending a greeting.
+    let silent = tokio::spawn(async move {
+        for _ in 0..2 {
+            drop(listener.accept(DEADLINE).await.unwrap());
+        }
+        listener
+    });
+
+    let found = a.discover_detailed().await.unwrap();
+    let _listener = silent.await.unwrap();
+    let (_, reason) = found
+        .unreachable
+        .iter()
+        .find(|(session, _)| session == &descriptor)
+        .expect("the silent session is reported");
+    assert!(reason.starts_with("reading the greeting: "), "{reason}");
+}
+
 /// A session answering `Unavailable` once — the shape a connect that failed
 /// transiently takes — gets the same single retry a failed probe does, so a
 /// live session is not dropped from the listing on one miss.

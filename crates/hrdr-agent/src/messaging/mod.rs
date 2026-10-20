@@ -466,9 +466,11 @@ async fn exchange(
             Err(error) if unavailable(&error) => {
                 return Ok((SendStatus::Unavailable, target.clone()));
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(at_step("connecting", error)),
         };
-        let hello: Hello = protocol::read(&mut connection).await?;
+        let hello: Hello = protocol::read(&mut connection)
+            .await
+            .map_err(|error| at_step("reading the greeting", error))?;
         protocol::version(hello.version)?;
         if !SessionRef::from(target).matches(&hello.descriptor) {
             return Ok((SendStatus::SessionChanged, hello.descriptor));
@@ -481,12 +483,22 @@ async fn exchange(
                 payload,
             },
         )
-        .await?;
-        let reply: Reply = protocol::read_within(&mut connection, reply_deadline).await?;
+        .await
+        .map_err(|error| at_step("sending the request", error))?;
+        let reply: Reply = protocol::read_within(&mut connection, reply_deadline)
+            .await
+            .map_err(|error| at_step("reading the reply", error))?;
         protocol::version(reply.version)?;
         Ok((reply.status, hello.descriptor))
     })
     .await?
+}
+
+/// `error` prefixed with the step of an exchange it failed at, its kind kept
+/// for the callers that branch on it. A peer that "did not answer" is otherwise
+/// one bare OS error, with no telling which side hung up when.
+fn at_step(step: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{step}: {error}"))
 }
 
 async fn retry<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {

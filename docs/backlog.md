@@ -310,13 +310,22 @@ push each verified slice to `main` before proceeding to the next slice.
    accept errors it treats as transient and every worker's error, so the peer
    could not say why; it now keeps the latest (`Messaging::last_dropped`,
    `a_dropped_connection_leaves_its_reason`), and the pty test prints it beside
-   `stopped by`. Not reproduced locally (12 runs of the two messaging tests
-   together, 6 of the full `tui_pty` suite, Windows, pinned host). No test
-   covers `stopped_by` being set: nothing can make a pipe accept fail on demand.
-   Same day, one parallel `local_ipc` run failed
-   `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
-   stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a full
-   Windows workspace run beside other sessions' builds: that test and
+   `stopped by`. It recurred with that in place (`c13626e3`, run 39416820368,
+   Windows build + smoke, 2026-10-20, 324 ms): the same 232, and
+   `last dropped: None` — the peer's server recorded no failed accept, no worker
+   error and no worker timeout, so whatever closed the pipe did not go through a
+   server path that errors. Reading the server rules out a cancelled accept: the
+   pending instance lives on the `Listener` across cancellation, and nothing
+   after `connect` completes awaits. Since then each step of `exchange` labels
+   its error ("connecting", "reading the greeting", "sending the request",
+   "reading the reply"; `a_failed_probe_names_the_step_it_failed_at`), so the
+   next recurrence says on which side and when the pipe closed. Not reproduced
+   locally (12 runs of the two messaging tests together, 6 of the full `tui_pty`
+   suite, Windows, pinned host). No test covers `stopped_by` being set: nothing
+   can make a pipe accept fail on demand. Same day, one parallel `local_ipc` run
+   failed `native_cross_process_rejects_malformed_truncated_and_stalled_frames`
+   after stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a
+   full Windows workspace run beside other sessions' builds: that test and
    `native_cross_process_sequential_clients` failed on a `TimedOut` connect, and
    in the same binary `lsp::tests::pre_warm_spawns_the_server_before_any_edit`
    and `json_rpc_error_responses_are_forwarded_not_discarded` found "the python3
