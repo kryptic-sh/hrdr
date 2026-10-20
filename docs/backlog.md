@@ -135,7 +135,9 @@ only the list. Delete a line when its question is answered.
   lives:** a real `fork` test and unlock-failure injection for the IPC lock
   (_Session coordination → "CI run `37922581404`" paragraph_); a second wrap-up
   compaction (_Hardening notes, 2026-08-04 correctness pass_); a clippy ban on
-  `dirs::home_dir` (_Windows support review → Coverage gaps_).
+  `dirs::home_dir` (_Windows support review → Coverage gaps_); and, from earlier
+  sessions, a batch's siblings outliving a panicking tool and the labelled
+  partial reply left by a mid-stream retry (_Known behaviour to revisit_).
 - **Added 2026-10-20, third pass:** declined 08-30 perf #16, the running token
   counter (_Performance review 2026-09-04_); macOS end-to-end tests for the
   strict Seatbelt profile and network (_Hardening notes_); CI as the only runner
@@ -328,33 +330,31 @@ push each verified slice to `main` before proceeding to the next slice.
    four concurrent copies, each beside a full `hrdr-tools` lib run), Windows,
    pinned ConPTY host. CI's Windows runner is the only place it has failed.
    **Question:** meanwhile, retry
-   `a_live_tui_messages_a_peer_and_is_woken_by_its_reply` once on CI? The build
-   - smoke job runs it under `cargo test`, which has no retry, so that means
-     moving the `tui_pty` suite to nextest there (whose passing retries are
-     still reported as flaky, keeping the evidence) — or keep it failing the
-     run. Not reproduced locally (12 runs of the two messaging tests together, 6
-     of the full `tui_pty` suite, Windows, pinned host). No test covers
-     `stopped_by` being set: nothing can make a pipe accept fail on demand. Same
-     day, one parallel `local_ipc` run failed
-     `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
-     stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a full
-     Windows workspace run beside other sessions' builds: that test and
-     `native_cross_process_sequential_clients` failed on a `TimedOut` connect,
-     and in the same binary
-     `lsp::tests::pre_warm_spawns_the_server_before_any_edit` and
-     `json_rpc_error_responses_are_forwarded_not_discarded` found "the python3
-     language server is not available"; all four passed alone and in the next
-     full run. Real-process coverage: `tests/tui_pty.rs`
-     (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
-     shutdown leaves discovery) and `tests/headless_messaging.rs` (busy
-     delivery, disabling), on the CI matrix; verified locally on Windows only so
-     far.
-     `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
-     covers `/new` rotation and the exit report across processes. Still
-     unexercised across processes: access-control denial for a foreign OS user.
-     Mutation check: removing the TUI's arrival wake did not fail the pty test —
-     something else woke the loop there — so the wake is guarded only by the
-     in-process test that waits for `PeerReady`.
+   `a_live_tui_messages_a_peer_and_is_woken_by_its_reply` once on CI? The
+   build-and-smoke job runs it under `cargo test`, which has no retry, so that
+   means moving the `tui_pty` suite to nextest there (whose passing retries are
+   still reported as flaky, keeping the evidence) — or keep it failing the run.
+   Not reproduced locally (12 runs of the two messaging tests together, 6 of the
+   full `tui_pty` suite, Windows, pinned host). No test covers `stopped_by`
+   being set: nothing can make a pipe accept fail on demand. Same day, one
+   parallel `local_ipc` run failed
+   `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
+   stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a full
+   Windows workspace run beside other sessions' builds: that test and
+   `native_cross_process_sequential_clients` failed on a `TimedOut` connect, and
+   in the same binary `lsp::tests::pre_warm_spawns_the_server_before_any_edit`
+   and `json_rpc_error_responses_are_forwarded_not_discarded` found "the python3
+   language server is not available"; all four passed alone and in the next full
+   run. Real-process coverage: `tests/tui_pty.rs`
+   (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
+   shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
+   disabling), on the CI matrix; verified locally on Windows only so far.
+   `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
+   covers `/new` rotation and the exit report across processes. Still
+   unexercised across processes: access-control denial for a foreign OS user.
+   Mutation check: removing the TUI's arrival wake did not fail the pty test —
+   something else woke the loop there — so the wake is guarded only by the
+   in-process test that waits for `PeerReady`.
 
    Verify delivery, discovery, disabling, busy/idle behavior, and sender
    attribution before declaring this complete. Support Windows, macOS, and Linux
@@ -2093,7 +2093,9 @@ Not bugs; things whose surprise is worth having written down.
   runs beside a long sibling (e.g. a shell at its five-minute timeout). A
   `FuturesUnordered` join that aborts siblings on the first panic would restore
   the old immediacy; deferred as a rework of the riskiest slice for an edge
-  case.
+  case. **[Deferred — question for the owner; see the index at the top]** A
+  judgment call, not your word. **Question:** accept the delay, or abort a
+  batch's siblings on the first panic?
 
 - **A profile can allow-list itself into having no search tool.** **[Deferred —
   question for the owner; see the index at the top]** `read_only` keeps a shell
@@ -2128,7 +2130,10 @@ Not bugs; things whose surprise is worth having written down.
   is by reading — a parameter is refused at connect, before any text. Hiding the
   partial outright needs a "discard what I streamed for this round" event, which
   is a protocol change across every `AgentEvent` consumer and the transcript
-  log, not a local one — not worth it while the partial is labelled.
+  log, not a local one — not worth it while the partial is labelled. **[Deferred
+  — question for the owner; see the index at the top]** A judgment call, not
+  your word. **Question:** keep the labelled partial, or add the discard event
+  so a retried reply replaces it?
 - **Building a sandbox policy touches the parent repo's `.git`.**
   `git_metadata_roots` `create_dir_all`s `refs/heads/hrdr` and
   `logs/refs/heads/hrdr` so they exist to be canonicalized and bind-mounted — so
