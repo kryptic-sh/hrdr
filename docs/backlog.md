@@ -131,6 +131,11 @@ only the list. Delete a line when its question is answered.
   `xvfb-run`/headless-Sway guidance in CI (_Session coordination → "GUI-testing
   prompt guidance"_); a live image smoke per dialect (_Deferred 2026-08-11 —
   media attachments_).
+- **Declined by judgment 2026-10-20, yours to overrule — each tagged where it
+  lives:** a real `fork` test and unlock-failure injection for the IPC lock
+  (_Session coordination → "CI run `37922581404`" paragraph_); a second wrap-up
+  compaction (_Hardening notes, 2026-08-04 correctness pass_); a clippy ban on
+  `dirs::home_dir` (_Windows support review → Coverage gaps_).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -565,7 +570,10 @@ run: forking a multithreaded test binary is unsound beyond a bare `_exit`, and
 the test reaches the same state without it. Unlock failure injection is
 declined: its only effect is one stderr line, so a test would need a child
 process to capture stderr plus an injection hook in `OwnedLock::drop`, all to
-pin a message nothing reads.
+pin a message nothing reads. **[Deferred — question for the owner; see the index
+at the top]** Both were declined by judgment, not on your word. **Question:**
+accept both, or want either built (a unix-only CI test that forks and has the
+child drop the guard; a child-process test capturing the unlock-failure line)?
 
 During the export/editor label slice, an additional local leak-guard run
 reported `a_real_tool_round_keeps_the_scrolled_up_viewport` failing with
@@ -2138,7 +2146,9 @@ its own once-only flag was tried and declined 2026-10-20: the first compaction
 already summarized everything before the current turn, which compaction keeps
 verbatim, so the second one has nothing to shrink and the turn errors anyway
 ("too large to compact … nothing left to shrink"). Only a mid-turn steer adds a
-turn a second compaction could fold.
+turn a second compaction could fold. **[Deferred — question for the owner; see
+the index at the top]** Declined by judgment after trying it. **Question:**
+accept that, or give the wrap-up its own compaction for the steered case anyway?
 
 **From the 2026-08-05 correctness pass:** `fetch`'s `is_blocked_host` is
 advisory — correctness rests on the connect-time `SsrfGuardResolver`, one
@@ -3020,7 +3030,9 @@ and **not** fixed.
   `owner_only_options_no_follow_refuses_a_symlink`; Windows'
   `FILE_FLAG_OPEN_REPARSE_POINT` half is covered on every platform by
   `owner_only_options_no_follow_never_reaches_a_link_target`) and the Landlock
-  backend. **Not unix by nature, still gated:** none. The last,
+  backend. **Not unix by nature, still gated:** none — so nothing here is
+  actionable; each remaining unix-only test checks a unix mechanism (mode bits,
+  `O_NOFOLLOW`, Landlock) that has no Windows counterpart to test. The last,
   `a_jailed_delegation_requires_a_contained_cwd`'s symlink escape, now links to
   the caller's own parent instead of `/` and fails on Windows when containment
   is checked lexically. What remains is unix by nature: the `hrdr-llm`
@@ -3062,6 +3074,8 @@ and **not** fixed.
   helpers (`agents_dir`, `sandbox`) read `HOME`/`USERPROFILE`. A `clippy.toml`
   ban was considered and declined: it would name a crate nothing here links, and
   adding `dirs` is already a dependency decision that would surface it.
+  **[Deferred — question for the owner; see the index at the top]**
+  **Question:** accept, or add the `disallowed-methods` entry now as a tripwire?
 - **Windows test runs with a failure leaked their temp dirs — fixed
   2026-10-15.** libtest ends a binary with a failed test through
   `std::process::exit`, which on Windows is `ExitProcess`: no `atexit` handler
@@ -4089,8 +4103,10 @@ Ranked by impact, biggest first:
 4. **08-30 #12/#13/#16/#17 (LOW), settled 2026-10-14.** #12 (`replace`'s literal
    path counts matches before replacing) is declined: the count is what bounds
    the output size before the replacement allocates. #13 shipped (`memory.rs`
-   `Lowered`). #16 stays held by decision. #17's original entry (a dispatch args
-   clone) no longer exists to re-check; re-measure before acting on it.
+   `Lowered`). #16 is the no-usage re-estimate, now 08-30 #10, declined as
+   risk > value in 2026-08-04 #3. #17 is closed (checked 2026-10-20): dispatch
+   no longer clones the args to render a label; the one clone left, in
+   `recorded_args`, builds the record on purpose.
 
 **Checked, not findings (new code since 08-30):**
 
