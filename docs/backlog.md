@@ -3061,7 +3061,7 @@ opening-fence whitespace, the wrap-up History gap, the `read_capped_text`
 truncation marker, and the Windows lock pid-ownership guard (its residual, a
 Windows liveness probe, shipped 2026-09-15 as `hrdr_tools::process_alive`).**
 
-**Hardening (open — triage):**
+**Hardening (triaged — both deferred to the owner):**
 
 1. **[Deferred — question for the owner; see the index at the top]**
    **`compaction_tail_start` charges the always-kept newest turn against the
@@ -3150,7 +3150,7 @@ is the fix-first item. (All four findings shipped 2026-08-14: retention-sweep
 escape, OAuth bind-order, headless terminal escape, and the capture-cap
 medium.)**
 
-**Hardening (open — triage):**
+**Hardening (triaged — one declined, one a standing note):**
 
 - **`gate.rs` parses untrusted CI YAML** (`serde_yaml_ng::from_str` over up to
   16 × 512 KiB workflow files). Investigated 2026-08-14: `serde_yaml_ng`'s
