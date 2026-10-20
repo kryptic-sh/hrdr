@@ -139,7 +139,9 @@ only the list. Delete a line when its question is answered.
 - **Added 2026-10-20, third pass:** declined 08-30 perf #16, the running token
   counter (_Performance review 2026-09-04_); macOS end-to-end tests for the
   strict Seatbelt profile and network (_Hardening notes_); CI as the only runner
-  of the unix-only guard tests (_Windows support review → Coverage gaps_).
+  of the unix-only guard tests (_Windows support review → Coverage gaps_); a CI
+  retry for the pty peer-messaging flake until it is explained (_Session
+  coordination, queue item 1_).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -319,27 +321,37 @@ push each verified slice to `main` before proceeding to the next slice.
    after `connect` completes awaits. Since then each step of `exchange` labels
    its error ("connecting", "reading the greeting", "sending the request",
    "reading the reply"; `a_failed_probe_names_the_step_it_failed_at`), so the
-   next recurrence says on which side and when the pipe closed. Not reproduced
-   locally (12 runs of the two messaging tests together, 6 of the full `tui_pty`
-   suite, Windows, pinned host). No test covers `stopped_by` being set: nothing
-   can make a pipe accept fail on demand. Same day, one parallel `local_ipc` run
-   failed `native_cross_process_rejects_malformed_truncated_and_stalled_frames`
-   after stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a
-   full Windows workspace run beside other sessions' builds: that test and
-   `native_cross_process_sequential_clients` failed on a `TimedOut` connect, and
-   in the same binary `lsp::tests::pre_warm_spawns_the_server_before_any_edit`
-   and `json_rpc_error_responses_are_forwarded_not_discarded` found "the python3
-   language server is not available"; all four passed alone and in the next full
-   run. Real-process coverage: `tests/tui_pty.rs`
-   (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
-   shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
-   disabling), on the CI matrix; verified locally on Windows only so far.
-   `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
-   covers `/new` rotation and the exit report across processes. Still
-   unexercised across processes: access-control denial for a foreign OS user.
-   Mutation check: removing the TUI's arrival wake did not fail the pty test —
-   something else woke the loop there — so the wake is guarded only by the
-   in-process test that waits for `PeerReady`.
+   next recurrence says on which side and when the pipe closed. **[Deferred —
+   question for the owner; see the index at the top]** Not fixed: the cause is
+   unknown until it recurs, and it has not reproduced locally. **Question:**
+   meanwhile, retry `a_live_tui_messages_a_peer_and_is_woken_by_its_reply` once
+   on CI? The build
+   - smoke job runs it under `cargo test`, which has no retry, so that means
+     moving the `tui_pty` suite to nextest there (whose passing retries are
+     still reported as flaky, keeping the evidence) — or keep it failing the
+     run. Not reproduced locally (12 runs of the two messaging tests together, 6
+     of the full `tui_pty` suite, Windows, pinned host). No test covers
+     `stopped_by` being set: nothing can make a pipe accept fail on demand. Same
+     day, one parallel `local_ipc` run failed
+     `native_cross_process_rejects_malformed_truncated_and_stalled_frames` after
+     stalling for 43s; four reruns passed in ~5s. Again 2026-10-18, in a full
+     Windows workspace run beside other sessions' builds: that test and
+     `native_cross_process_sequential_clients` failed on a `TimedOut` connect,
+     and in the same binary
+     `lsp::tests::pre_warm_spawns_the_server_before_any_edit` and
+     `json_rpc_error_responses_are_forwarded_not_discarded` found "the python3
+     language server is not available"; all four passed alone and in the next
+     full run. Real-process coverage: `tests/tui_pty.rs`
+     (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
+     shutdown leaves discovery) and `tests/headless_messaging.rs` (busy
+     delivery, disabling), on the CI matrix; verified locally on Windows only so
+     far.
+     `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
+     covers `/new` rotation and the exit report across processes. Still
+     unexercised across processes: access-control denial for a foreign OS user.
+     Mutation check: removing the TUI's arrival wake did not fail the pty test —
+     something else woke the loop there — so the wake is guarded only by the
+     in-process test that waits for `PeerReady`.
 
    Verify delivery, discovery, disabling, busy/idle behavior, and sender
    attribution before declaring this complete. Support Windows, macOS, and Linux
