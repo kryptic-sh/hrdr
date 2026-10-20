@@ -126,7 +126,11 @@ only the list. Delete a line when its question is answered.
   agent capability_); the `enqueue_save_as` snapshot (_Performance review
   2026-08-14_); the per-round base64 re-encode (_Performance review
   2026-08-28_); deleting the two unmerged `wip/windows-paste-transport*`
-  branches (_queue item 9_).
+  branches (_queue item 9_); a second OS account for the foreign-user IPC denial
+  test (_Session coordination → "Resume/verification gaps"_); running the
+  `xvfb-run`/headless-Sway guidance in CI (_Session coordination → "GUI-testing
+  prompt guidance"_); a live image smoke per dialect (_Deferred 2026-08-11 —
+  media attachments_).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -529,13 +533,23 @@ push each verified slice to `main` before proceeding to the next slice.
 rule in `templates/write.md` names `xvfb-run -a` and a Sway compositor started
 with `WLR_BACKENDS=headless`. Neither was run: this machine's WSL has neither
 installed, and installing them needs the owner's sudo. The Windows and macOS
-statements say only that no general headless display exists there.
+statements say only that no general headless display exists there. **[Deferred —
+question for the owner; see the index at the top]** Local testing is native
+Windows only, so WSL is out. **Question:** verify the two commands in a CI step
+on the Linux runner (an extra job installing Sway), or leave the guidance
+unexecuted?
 
 **Resume/verification gaps — 2026-10-09:** Work after the current messaging
 runtime slice was deferred at the user's wrap-up request. The queue above stays
 open. Linux and macOS execution relies on CI (local testing is native Windows
 only). Native foreign-account access-denial and remote-machine pipe rejection
-were not exercised; retain those as security coverage gaps. Transport CI run
+were not exercised; retain those as security coverage gaps. **[Deferred —
+question for the owner; see the index at the top]** Both need something this
+machine does not have: a second local OS account (creating one needs
+administrator rights) and a second machine on the network for the pipe's
+remote-client rejection. **Question:** provision a second account (here or as a
+CI step that creates one and runs the client as it), or accept the reading of
+the ACL and the reject-remote-clients flag as the evidence? Transport CI run
 `37799426844` passed after rerunning its unprovisioned macOS Clippy job; that
 result does not cover later registration/runtime changes.
 
@@ -543,8 +557,15 @@ CI run `37922581404` (`82f51778`) passed Windows/Linux/macOS nextest, ordinary
 tests under leak guards, Clippy, build/smoke, dependency checks, and
 release-target builds after the streaming fixture and lock-lifetime corrections.
 The duplicate-handle regression demonstrates delayed close-only release, not
-proof of the earlier macOS failure's cause. Actual fork inheritance, foreign-PID
-guard destruction, and unlock/stderr failure injection remain untested.
+proof of the earlier macOS failure's cause. Foreign-PID guard destruction — the
+state a forked child is in when it drops an inherited `OwnedLock` — is pinned
+since 2026-10-20 by `a_foreign_process_dropping_the_guard_keeps_the_lock` (red
+with the PID check removed; run on Windows, unix by CI). A real `fork` is not
+run: forking a multithreaded test binary is unsound beyond a bare `_exit`, and
+the test reaches the same state without it. Unlock failure injection is
+declined: its only effect is one stderr line, so a test would need a child
+process to capture stderr plus an injection hook in `OwnedLock::drop`, all to
+pin a message nothing reads.
 
 During the export/editor label slice, an additional local leak-guard run
 reported `a_real_tool_round_keeps_the_scrolled_up_viewport` failing with
@@ -753,9 +774,9 @@ review time.** Each item carries its own tag below.
    once, memoized in its `elided` argument, and `estimate_tail_window` sizes
    each tail stage over a slice of it.
 
-**Not settled without profiling:** the per-frame transcript layout loop
-(`draw_transcript`, `ui.rs`) at very long transcripts, and item 2's real
-lock-contention timing.
+**Not settled without profiling:** item 2's real lock-contention timing. (The
+per-frame transcript layout loop at very long transcripts was measured
+2026-10-15 — see "Frame cost measured 2026-08-13".)
 
 ## Tidy review 2026-08-04
 
@@ -1230,7 +1251,10 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   can end and would litter after the first missed one.
 - **Not covered:** no test drives a real provider with a real image. Every
   dialect assertion is on the JSON hrdr builds, so the shapes are pinned against
-  the docs, not against a live endpoint that accepted them.
+  the docs, not against a live endpoint that accepted them. **[Deferred —
+  question for the owner; see the index at the top]** **Question:** run a manual
+  smoke with your keys (one image to each dialect: OpenAI, Anthropic, Codex), or
+  accept the docs-pinned shapes?
 
 ### Left by the vendor-doc audit, 2026-08-11
 
