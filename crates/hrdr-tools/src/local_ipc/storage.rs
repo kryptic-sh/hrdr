@@ -53,6 +53,17 @@ impl OwnedLock {
     }
 }
 
+#[cfg(test)]
+impl OwnedLock {
+    /// A lock taken here but recorded as process `pid`'s: the state a guard
+    /// inherited across `fork` is in when the child drops it.
+    pub(super) fn acquire_as(file: File, pid: u32) -> io::Result<Self> {
+        let mut lock = Self::acquire(file)?;
+        lock.pid = pid;
+        Ok(lock)
+    }
+}
+
 impl Drop for OwnedLock {
     fn drop(&mut self) {
         // An inherited handle must not unlock the acquiring process's lock.

@@ -37,6 +37,33 @@ fn owned_lock_releases_while_duplicate_remains_open() {
     assert!(duplicate.metadata().unwrap().is_file());
 }
 
+/// A guard dropped by a process that did not acquire it — a forked child
+/// holding an inherited copy — leaves the acquirer's lock held.
+#[test]
+fn a_foreign_process_dropping_the_guard_keeps_the_lock() {
+    let root = test_root();
+    let path = root.path().join("owner.lock");
+    let file = std::fs::File::create(&path).unwrap();
+    let acquirer = file.try_clone().unwrap();
+    let inherited =
+        crate::local_ipc::storage::OwnedLock::acquire_as(file, std::process::id().wrapping_add(1))
+            .unwrap();
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    drop(inherited);
+    assert_eq!(
+        io::Error::from(contender.try_lock().unwrap_err()).kind(),
+        io::ErrorKind::WouldBlock,
+        "the foreign drop released the acquirer's lock"
+    );
+    acquirer.unlock().unwrap();
+    contender.try_lock().unwrap();
+    contender.unlock().unwrap();
+}
+
 #[test]
 fn endpoint_validation_and_roundtrip() {
     let endpoint = EndpointId::fresh();
