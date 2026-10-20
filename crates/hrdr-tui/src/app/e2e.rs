@@ -10414,6 +10414,31 @@ async fn a_successful_config_reload_applies_it_and_says_so() {
     }
 }
 
+/// The hot reload end to end: a save the OS watcher sees reaches the UI loop
+/// as `ConfigChanged` and applies the new config. The other reload tests call
+/// `maybe_reload_config` themselves, which skips this link.
+#[tokio::test]
+async fn a_config_save_reaches_the_loop_through_the_watcher() {
+    let _home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let path = hrdr_agent::config_file_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let before = h.app.cfg.unix_style_paths;
+    let _watch = h.app.start_config_watch();
+    // Let the OS watcher register before touching the file.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    std::fs::write(&path, format!("unix_style_paths = {}\n", !before)).unwrap();
+    h.wait_for("the watcher's reload ping", |m| {
+        matches!(m, TurnMsg::ConfigChanged)
+    })
+    .await;
+
+    assert_eq!(h.app.cfg.unix_style_paths, !before, "the save was applied");
+    let expected = hrdr_app::reload_hot_message(!before);
+    assert_eq!(h.app.toasts.last_body(), Some(expected.as_str()));
+}
+
 #[tokio::test]
 async fn config_diagnostic_path_style_reload_failures_keep_active_state() {
     let _home = isolated_data_home();
