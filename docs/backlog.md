@@ -363,10 +363,10 @@ push each verified slice to `main` before proceeding to the next slice.
    alone does not establish macOS/Linux runtime correctness. Record any missing
    platform verification explicitly rather than treating it as passed.
 
-2. **Remaining actionable backlog.** After messaging is finished and fully
-   tested, reassess the entries against current code and implement actionable
-   slices, with tests, review, verification, and separate coherent commits. Keep
-   items requiring user decisions explicit rather than guessing answers.
+2. **Remaining actionable backlog — done 2026-10-20.** Every entry was
+   classified (405 entries, each read where no status word or section placed
+   it); what is left waits on an owner answer in the index or on evidence that
+   cannot be produced here.
 3. **Backlog pruning — first pass done 2026-10-14.** Two read-only audits
    checked the entries after this queue against the code; only entries confirmed
    resolved (re-read at the cited symbol) were deleted, and shipped review
@@ -1288,7 +1288,9 @@ and `estimate_tokens_in_messages` prices them. What the six slices left open:
   dialect assertion is on the JSON hrdr builds, so the shapes are pinned against
   the docs, not against a live endpoint that accepted them. **[Deferred —
   question for the owner; see the index at the top]** **Question:** run a manual
-  smoke with your keys (one image to each dialect: OpenAI, Anthropic, Codex), or
+  smoke with your keys (one image to each dialect: OpenAI, Anthropic, Codex,
+  plus one PDF through OpenAI chat-completions, which settles whether its
+  `file_data` takes the `data:` URL hrdr sends — see "Doc is silent" below), or
   accept the docs-pinned shapes?
 
 ### Left by the vendor-doc audit, 2026-08-11
