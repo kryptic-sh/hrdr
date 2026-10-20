@@ -116,6 +116,17 @@ only the list. Delete a line when its question is answered.
   (_Correctness review 2026-09-04_); the unix completion-identity red/green
   (_Windows support review_); per-surface shell choice (queue item 6) and
   broadening the self-update handoff (queue item 8).
+- **Added 2026-10-20, second pass — each tagged where it lives:** an endpoint
+  override for testing the OAuth exchanges (_Session coordination →
+  "Config-mutation path tests"_); measuring a head-only summarization request,
+  and a nightly live-cache CI job (_Compaction rewrite_); skill metadata's
+  surface, `skill` in the jail set, and cached sets on the `:` send path
+  (_Deferred 2026-08-09 — Agent Skills_); a `write`-mode read allow-list
+  (_Sandbox follow-ups_); what memory drift detection should flag (_Tooling /
+  agent capability_); the `enqueue_save_as` snapshot (_Performance review
+  2026-08-14_); the per-round base64 re-encode (_Performance review
+  2026-08-28_); deleting the two unmerged `wip/windows-paste-transport*`
+  branches (_queue item 9_).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -361,11 +372,12 @@ push each verified slice to `main` before proceeding to the next slice.
    only — no per-call choice there. **[Deferred — question for the owner; see
    the index at the top]** **Question:** give those a shell choice too (a config
    key per surface, or one shared default), or keep them on the default shell?
-7. **TODO-to-TODO dependencies — question for the owner.** Watch-aware TODO
-   nudges shipped: an item's `waits_on` names a running watch (see the
-   changelog). The request's repeated "TODO item" wording could also mean one
-   TODO item waiting on another; that was not built. Should it be, and should a
-   blocked item then be exempt from the nudge the same way?
+7. **TODO-to-TODO dependencies — question for the owner.** **[Deferred —
+   question for the owner; see the index at the top]** Watch-aware TODO nudges
+   shipped: an item's `waits_on` names a running watch (see the changelog). The
+   request's repeated "TODO item" wording could also mean one TODO item waiting
+   on another; that was not built. Should it be, and should a blocked item then
+   be exempt from the nudge the same way?
 8. **Self-update, restart, and turn continuation — requested 2026-10-09.**
    Highest priority after finishing the current path-rendering slice, per the
    user's clarification; take this before the other Windows backlog items. Add a
@@ -466,7 +478,10 @@ push each verified slice to `main` before proceeding to the next slice.
    `wip/windows-paste-transport` (the original probes, also local) and
    `wip/windows-paste-transport-rebased` (the same probe commit rebased — its
    tip is not in `main`, despite having been called merged here). Both only on
-   the owner's word.
+   the owner's word. **[Deferred — question for the owner; see the index at the
+   top]** **Questions:** the publishing gate (see the index); may the two
+   `wip/windows-paste-transport*` branches be deleted; and the hand check in
+   Windows Terminal and a classic console needs your machine's terminals.
 10. **OpenAI OAuth usage-dashboard parity with Codex — requested 2026-10-09.**
     **[Deferred — question for the owner; see the index at the top]** Deferred
     until the earlier queued work is finished. Compare hrdr's
@@ -551,23 +566,32 @@ regression.
 Config-mutation path tests cover storage and frontend failures; OAuth
 completion's captured preference is source-inspected, not exercised by a
 dedicated async regression test. Credential-save browser capture is likewise
-source-inspected rather than covered by a network/save integration test.
-Credential replacement-failure coverage uses a Windows readonly fixture
+source-inspected rather than covered by a network/save integration test. Both
+are blocked, not skipped (checked 2026-10-20): the preference is only visible in
+a save that follows a successful code exchange, and `openrouter_exchange` and
+`openai_exchange` post to fixed provider URLs, so reaching the save needs the
+real provider or a new endpoint override in production code. The callback half
+is driven end to end by `a_refused_browser_login_reports_why`. **[Deferred —
+question for the owner; see the index at the top]** **Question:** add an
+endpoint override for the token exchanges (behind a cargo feature only tests
+enable, since an override that ships could redirect a login's code to another
+host), or accept these two as source-inspected? Credential replacement-failure
+coverage uses a Windows readonly fixture
 (`credential_save_write_failure_labels_follow_style`). A unix twin was declined
 2026-10-18: a read-only file does not stop a unix rename, a read-only directory
 fails the lock before the write, and a directory at the path fails the read —
 nothing makes only `write_atomic` fail — and the label is one `with_context` in
 `save_entry_at` shared by every platform, which the Windows test pins. Blob lock
 and OAuth refresh persistence errors remain ignored, with native labels in those
-discarded errors. The OAuth one is a question for the owner (see the index):
-`coordinated_oauth_access` passes `coordinated_access_core` a persist callback
-that drops `save_oauth_entry_at`'s error, so a failed save of a rotated refresh
-token goes unnoticed until the next start cannot refresh. `hrdr-agent` has no
-logging channel, and failing the request would throw away an access token that
-is valid for this session, so surfacing it means choosing a channel.
-`valid_access_token`, the uncoordinated variant that drops the same error, has
-no caller in the tree — it survives only as a public re-export of a published
-crate (found 2026-10-16).
+discarded errors. The OAuth one is **[Deferred — question for the owner; see the
+index at the top]**: `coordinated_oauth_access` passes `coordinated_access_core`
+a persist callback that drops `save_oauth_entry_at`'s error, so a failed save of
+a rotated refresh token goes unnoticed until the next start cannot refresh.
+`hrdr-agent` has no logging channel, and failing the request would throw away an
+access token that is valid for this session, so surfacing it means choosing a
+channel. `valid_access_token`, the uncoordinated variant that drops the same
+error, has no caller in the tree — it survives only as a public re-export of a
+published crate (found 2026-10-16).
 
 Intermittent failures seen in runs during the messaging work and not
 root-caused: session-save timing. Watch-delivery timing was the tests' own
@@ -896,6 +920,10 @@ it hits depends on where the provider's cache breakpoints sit, not on where the
 request ends. Nobody has measured it. Deciding needs the breakpoint behaviour
 confirmed against Anthropic's docs and then a real two-request comparison —
 which is the same setup the cache-fraction notice was built to make visible.
+**[Deferred — question for the owner; see the index at the top]** **Question:**
+spend a live-key measurement on it (two requests against Anthropic, comparing
+cached tokens for a whole-history and a head-only summarization), and switch to
+head-only if it still hits?
 
 ### Left open by the session-accounting work
 
@@ -906,7 +934,9 @@ serves a real hit. `CompactionReport`'s own doc admits why: it needs a live key
 and two sequential requests. The right shape is an `#[ignore]`d integration test
 that runs a turn, compacts, and asserts `cached_tokens > 0` on the summarization
 call, wired into a nightly CI job with a secret. That is an infrastructure
-decision, not a code change. Until it exists, the session rate in `/cost` is the
+decision, not a code change. **[Deferred — question for the owner; see the index
+at the top]** **Question:** add a provider key as a CI secret and a nightly job
+running the ignored test? Until it exists, the session rate in `/cost` is the
 only thing standing between a silent cache regression and a billing period.
 
 **Cache counters start at zero on a resume.** `AgentUsage`'s three new fields
@@ -1073,7 +1103,9 @@ The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
   bundle round-trip must not drop them, but no surface shows them — not the
   picker row, not the `skill` tool's output (which would spend tokens on a
   licence string the model cannot use). Decide a surface before adding one; the
-  parse and its test are already there.
+  parse and its test are already there. **[Deferred — question for the owner;
+  see the index at the top]** **Question:** show them in the `/commands` picker
+  row, or keep them stored only?
 - **A symlink _inside_ a skill root is not walked**, same as `discover_commands`
   and for the same reason (`ignore::WalkBuilder`'s default `follow_links(false)`
   is what makes a cycle a non-issue). A symlinked _root_ is walked, so
@@ -1103,7 +1135,10 @@ The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
   that cap stands. The grant is still the right shape (it is what makes the tool
   addable to the jail set a one-line change, and what lets a jailed agent open a
   bundle a user names), but the decision to leave `skill` out of `JAIL_TOOLS` is
-  worth revisiting deliberately rather than by default.
+  worth revisiting deliberately rather than by default. **[Deferred — question
+  for the owner; see the index at the top]** **Question:** add `skill` to
+  `JAIL_TOOLS`, so a jailed agent can load a bundle it is listed, or keep jail
+  to the five read tools?
 - **`prepare_outgoing_tracked` re-walks both command and skill roots on a `:`
   submit** (`crates/hrdr-app/src/util.rs`) — the walk sits inside the
   `input.trim_start().starts_with(':')` guard, so an ordinary message costs
@@ -1113,7 +1148,8 @@ The slice shipped whole: `hrdr-agent/src/skills.rs` (discovery, validation, the
   regression, and it has not been measured.
 
   **Open: whether the send path should use the frontend's cached sets instead of
-  re-walking.** The trade is immediacy against I/O. Today a command file added
+  re-walking.** **[Deferred — question for the owner; see the index at the
+  top]** The trade is immediacy against I/O. Today a command file added
   mid-session expands the moment you type its name — the caches are only
   refreshed by `/reload`, `/cwd` and `apply_cwd`, so reading them instead would
   mean a newly written `.hrdr/commands/foo.md` is `:foo` verbatim until one of
@@ -1625,8 +1661,11 @@ directory's files may then do:
 deletions taught is under [Standing constraints](#standing-constraints). What
 remains open:
 
-- **Curated read allow-list for `write` mode** — still the honest gap, but the
-  shape changed. A `shell` command in `write` mode can still
+- **Curated read allow-list for `write` mode** **[Deferred — question for the
+  owner; see the index at the top]** — still the honest gap, but the shape
+  changed. **Question:** build an allow-list (which paths outside the workspace
+  may a `write`-mode shell read), or leave reads open with the output redaction
+  below as the only guard? A `shell` command in `write` mode can still
   `cat ~/.ssh/id_rsa`. What did land is narrower and real: `shell` output now
   drops lines naming a credential file AND redacts the hunk body of a diff
   touching one (`DiffRedactor`), so the _accidental_ leak — a broad `rg`, a
@@ -1705,6 +1744,10 @@ mode hrdr has no slot for, `PermissionProfile::External { network }` —
   staleness plus the usage-tracking half recorded above. The external-drift half
   shipped 2026-08-05 (`5bc2e5d`) — see the memory item in
   [Permissions, isolation, and state](#permissions-isolation-and-state).
+  **[Deferred — question for the owner; see the index at the top]**
+  **Question:** what should count as stale or contradicted (an age, a file the
+  memory names no longer existing, a model-judged conflict), and should a pass
+  prune or only flag?
 - **Command follow-ups** (the feature shipped 2026-07-27 as "skills" and was
   renamed 2026-08-09 — `hrdr-agent/src/commands.rs` plus
   `prompt::commands_section`). Left out on purpose: no `command` usage signal
@@ -3236,8 +3279,11 @@ offsets, and the attachment digest memo; the memory cache serves a hit by `Arc`
    enqueue time on purpose, so a `/rename` or `/clear` cannot interleave with
    the write (see `enqueue_save`'s doc comment). Capturing it at promote time
    instead would change that contract, and this copy only happens when writes
-   back up. **Already optimized (traced and cleared — do not re-hunt):** session
-   save path (created-cache, compact JSON, transcript in a sibling jsonl,
+   back up. **[Deferred — question for the owner; see the index at the top]**
+   **Question:** keep the enqueue-time snapshot, or capture at promote time and
+   give `/rename` and `/clear` another way to stay ordered with the write?
+   **Already optimized (traced and cleared — do not re-hunt):** session save
+   path (created-cache, compact JSON, transcript in a sibling jsonl,
    off-thread); session listing per `/resume` keystroke (mtime-keyed
    `meta_cache`); compaction (single elision build, estimator, ladder
    pre-sizing, `compaction_tail_start` bounded by `DEFAULT_TAIL_TURNS = 2`);
@@ -3459,6 +3505,10 @@ tradeoff is different. Worth a deliberate re-decision with a real image/PDF
 session benchmark; the cheaper middle ground is to serialize requests by
 borrowing the cached encoding rather than building a `serde_json::Value` tree
 per round (the already-tracked "request serialization per round" gap).
+**[Deferred — question for the owner; see the index at the top]** **Question:**
+keep re-encoding, cache the encoding (a second resident copy at 4/3 the bytes),
+or take the borrow-on-serialize middle ground? Any of them wants a real
+image/PDF session benchmark first.
 
 **Coverage:** traced end-to-end — hrdr-tui `ui.rs` (transcript_chunks/flush/
 cache, status bar, selectors), `app.rs` on_key, `completion.rs`, `selector.rs`;
@@ -3600,12 +3650,13 @@ behavior-changing proposed.
    fragment that flushes), so one function would need a flag per caller; and
    deleting `run_hrdr_inner` (`tests/headless.rs`) — a one-line forwarder whose
    removal only makes two callers spell out `None`.
-3. **Flagged, decision left to owner** — `gate_rank` (`gate.rs`) vs `kind_rank`
-   (`verification.rs`) are the identical Format…Test mapping in two private fns,
-   but the maintainer's comment at `gate.rs` documents keeping them apart
-   ("three different questions"). Merging is behavior-identical today but
-   overturns a stated decision — left alone unless the duplication is wanted on
-   principle.
+3. **Flagged, decision left to owner** **[Deferred — question for the owner; see
+   the index at the top]** (re-confirmed under Tidy review 2026-09-04) —
+   `gate_rank` (`gate.rs`) vs `kind_rank` (`verification.rs`) are the identical
+   Format…Test mapping in two private fns, but the maintainer's comment at
+   `gate.rs` documents keeping them apart ("three different questions"). Merging
+   is behavior-identical today but overturns a stated decision — left alone
+   unless the duplication is wanted on principle.
 
 **Dropped (would change behavior):** `is_env_assignment` in guardrails vs
 verification accept _different_ syntax; `split_shell_words` deliberately
