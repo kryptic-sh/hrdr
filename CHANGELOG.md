@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The Homebrew formula loads on Homebrew 7.** Homebrew now loads every formula
+  in a tap for each OS and architecture when it taps it, and this one only had
+  its URLs under `on_macos`, so `brew tap kryptic-sh/tap` failed with "invalid
+  syntax in tap" and no kryptic-sh tool could be installed. The URLs moved out
+  of `on_macos` and `depends_on :macos` keeps the formula macOS-only.
 - **The trusted-directories store no longer writes through a symlink.** A link
   planted at `$XDG_CACHE_HOME/hrdr/trusted-dirs` was followed, so a trust answer
   was appended to whatever file it pointed at, created if missing. The store is
