@@ -1361,7 +1361,11 @@ mod tests {
             "{}|__recover-handoff|saved-session|--source-lease|123|456\r\n",
             temp.path().display()
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // The launched `.cmd` writes the marker on its own schedule; 2s ran
+        // out under a loaded full-workspace run. The loop leaves as soon as
+        // the marker matches, so the wait costs nothing when it passes.
+        const LAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + LAUNCH_WAIT;
         while fs::read_to_string(&marker).ok().as_deref() != Some(expected.as_str())
             && std::time::Instant::now() < deadline
         {
