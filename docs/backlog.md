@@ -126,16 +126,20 @@ only the list. Delete a line when its question is answered.
   agent capability_); the `enqueue_save_as` snapshot (_Performance review
   2026-08-14_); the per-round base64 re-encode (_Performance review
   2026-08-28_); deleting the two unmerged `wip/windows-paste-transport*`
-  branches (_queue item 9_); a second OS account for the foreign-user IPC denial
-  test (_Session coordination → "Resume/verification gaps"_); running the
-  `xvfb-run`/headless-Sway guidance in CI (_Session coordination → "GUI-testing
-  prompt guidance"_); a live image smoke per dialect (_Deferred 2026-08-11 —
-  media attachments_).
+  branches (_queue item 9_); a second OS account and a second machine for the
+  foreign-user and remote-client IPC rejection tests (_Session coordination →
+  "Resume/verification gaps"_); running the `xvfb-run`/headless-Sway guidance in
+  CI (_Session coordination → "GUI-testing prompt guidance"_); a live image
+  smoke per dialect (_Deferred 2026-08-11 — media attachments_).
 - **Declined by judgment 2026-10-20, yours to overrule — each tagged where it
   lives:** a real `fork` test and unlock-failure injection for the IPC lock
   (_Session coordination → "CI run `37922581404`" paragraph_); a second wrap-up
   compaction (_Hardening notes, 2026-08-04 correctness pass_); a clippy ban on
   `dirs::home_dir` (_Windows support review → Coverage gaps_).
+- **Added 2026-10-20, third pass:** declined 08-30 perf #16, the running token
+  counter (_Performance review 2026-09-04_); macOS end-to-end tests for the
+  strict Seatbelt profile and network (_Hardening notes_); CI as the only runner
+  of the unix-only guard tests (_Windows support review → Coverage gaps_).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -2210,12 +2214,21 @@ overrides it). Residual, recorded as hardening below.
   only, and the parent is the user's own 0700 cache directory.
 - Write-path TOCTOU is documented, not closed: `resolve_write` canonicalizes,
   then `atomic_write` re-opens the path; a symlink swap between the two could
-  redirect a write. Same-user, no privilege boundary.
+  redirect a write. Same-user, no privilege boundary. Closing it is the
+  handle-relative no-follow opens question under Consistency / robustness
+  (deferred to the owner there).
 - Landlock grants full `AccessFs::from_all` (incl. `REFER`) on writable roots —
   safe only because the `/` rule lacks REFER on the source side of a cross-root
   rename; the `NotEnforced` → refuse-spawn check is the backstop.
-- Seatbelt profiles are author-written and unvalidated on real macOS
-  (`seatbelt_profile`, `sandbox.rs`); only a macOS run can validate them.
+- Seatbelt profiles are author-written (`seatbelt_profile`, `sandbox.rs`). The
+  `write` profile is validated by the kernel on macOS CI —
+  `shell_write_outside_roots_is_denied_under_seatbelt` runs a real
+  `sandbox-exec` and passed in run `39411371973` (checked 2026-10-20). The
+  `read` (strict) profile and the network allowance are only compared as text.
+  **[Deferred — question for the owner; see the index at the top]**
+  **Question:** add macOS end-to-end tests for the strict profile's read refusal
+  and a confined network call (CI-only, since no Mac is here), or keep the text
+  checks?
 
 ---
 
@@ -3032,13 +3045,16 @@ and **not** fixed.
   `owner_only_options_no_follow_never_reaches_a_link_target`) and the Landlock
   backend. **Not unix by nature, still gated:** none — so nothing here is
   actionable; each remaining unix-only test checks a unix mechanism (mode bits,
-  `O_NOFOLLOW`, Landlock) that has no Windows counterpart to test. The last,
-  `a_jailed_delegation_requires_a_contained_cwd`'s symlink escape, now links to
-  the caller's own parent instead of `/` and fails on Windows when containment
-  is checked lexically. What remains is unix by nature: the `hrdr-llm`
-  `O_NOFOLLOW`/mode-bit tests, `sandbox.rs`'s `/etc` link, and `lsp.rs`'s
-  `within_root` case, which re-spells the path by letter case on Windows
-  instead. Also ported 2026-10-15:
+  `O_NOFOLLOW`, Landlock) that has no Windows counterpart to test. **[Deferred —
+  question for the owner; see the index at the top]** Their only runs are CI's,
+  since local testing is Windows-only. **Question:** accept CI as their sole
+  verification, or allow a local Linux run for changes to those guards? The
+  last, `a_jailed_delegation_requires_a_contained_cwd`'s symlink escape, now
+  links to the caller's own parent instead of `/` and fails on Windows when
+  containment is checked lexically. What remains is unix by nature: the
+  `hrdr-llm` `O_NOFOLLOW`/mode-bit tests, `sandbox.rs`'s `/etc` link, and
+  `lsp.rs`'s `within_root` case, which re-spells the path by letter case on
+  Windows instead. Also ported 2026-10-15:
   `a_dangling_symlink_cannot_escape_the_writable_roots` (the dangling-link
   sandbox escape; fails on Windows when dangling links go unresolved) and the
   symlink half of `a_writable_root_is_writable_all_the_way_down` — which cannot
@@ -4104,8 +4120,11 @@ Ranked by impact, biggest first:
    path counts matches before replacing) is declined: the count is what bounds
    the output size before the replacement allocates. #13 shipped (`memory.rs`
    `Lowered`). #16 is the no-usage re-estimate, now 08-30 #10, declined as
-   risk > value in 2026-08-04 #3. #17 is closed (checked 2026-10-20): dispatch
-   no longer clones the args to render a label; the one clone left, in
+   risk > value in 2026-08-04 #3. **[Deferred — question for the owner; see the
+   index at the top]** **Question:** accept the decline, or build the running
+   token counter (about eleven message-mutation sites to keep in step, to save
+   microseconds per round)? #17 is closed (checked 2026-10-20): dispatch no
+   longer clones the args to render a label; the one clone left, in
    `recorded_args`, builds the record on purpose.
 
 **Checked, not findings (new code since 08-30):**
