@@ -99,6 +99,90 @@ async fn a_peer_message_wakes_an_idle_session_with_its_provenance() {
     sender.close().await;
 }
 
+/// Start the app's messaging before the session has an id, as opening hrdr does.
+async fn started_provisional(h: &mut Harness) -> String {
+    assert!(h.app.state().id.is_none());
+    h.app.sync_messaging();
+    h.wait_for("messaging start", |msg| {
+        matches!(msg, TurnMsg::MessagingStarted(..))
+    })
+    .await;
+    assert!(
+        h.app.messaging.is_active(),
+        "messaging started: {:?}",
+        h.app.toasts.last_body()
+    );
+    super::super::messaging::provisional_session_id()
+}
+
+/// A session nobody has typed into is still a running session: it is
+/// published from the start, a peer can message it, and the message wakes it —
+/// a turn that gives the session its own id, as a typed first message would.
+#[tokio::test]
+async fn a_new_session_can_be_messaged_before_its_first_message() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![MockReply::Text("here".into())]).await;
+    let provisional = started_provisional(&mut h).await;
+
+    let sender = peer("early-sender").await;
+    let target = find(&sender, &provisional)
+        .await
+        .expect("the new session is discoverable");
+    assert_eq!(
+        sender.send(&target, "are you there?".into()).await.unwrap(),
+        SendStatus::Accepted
+    );
+    h.wait_for("peer arrival", |msg| matches!(msg, TurnMsg::PeerReady))
+        .await;
+    h.app.maybe_deliver_peer();
+    assert!(h.app.running(), "the arrival wakes the new session");
+    assert!(
+        h.app.state().id.is_some(),
+        "the woken turn claimed an id before it ran"
+    );
+    h.pump().await;
+
+    let texts = peer_texts(&h);
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].contains("are you there?"), "{}", texts[0]);
+    sender.close().await;
+}
+
+/// The first message names the session, and its registration is renamed in
+/// place: the same endpoint, now under the session's id, with what a peer sent
+/// before the rename still waiting in the inbox.
+#[tokio::test]
+async fn a_new_session_keeps_its_registration_and_inbox_when_it_gets_an_id() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    let provisional = started_provisional(&mut h).await;
+    let sender = peer("rename-sender").await;
+    let before = find(&sender, &provisional).await.unwrap();
+    assert_eq!(
+        sender.send(&before, "early".into()).await.unwrap(),
+        SendStatus::Accepted
+    );
+    assert_eq!(h.app.messaging.pending(), 1);
+
+    h.app.reserve_session_id("named by its first message");
+    h.app.await_saves().await;
+    let id = h.app.state().id.clone().unwrap();
+    h.app.sync_messaging();
+    h.wait_for("the rename", |msg| {
+        matches!(msg, TurnMsg::MessagingRefreshed(..))
+    })
+    .await;
+
+    let after = find(&sender, &id).await.expect("listed under its own id");
+    assert_eq!(after.endpoint, before.endpoint, "renamed, not rotated");
+    assert!(
+        find(&sender, &provisional).await.is_none(),
+        "the provisional id is gone"
+    );
+    assert_eq!(h.app.messaging.pending(), 1, "the inbox carried over");
+    sender.close().await;
+}
+
 #[tokio::test]
 async fn a_busy_session_takes_one_peer_message_at_a_time() {
     let _data_home = isolated_data_home();

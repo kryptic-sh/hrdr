@@ -228,9 +228,25 @@ push each verified slice to `main` before proceeding to the next slice.
    reaches the model, and the sender identity is this session's registration).
    Discovery now probes at most `PROBE_CONCURRENCY` candidates at once and skips
    a candidate whose probe fails instead of failing the whole scan. A brand-new
-   session is not discoverable until its first message mints an id; only the
-   main agent gets the tools — sub-agents cannot message peers, so no child
-   identity is issued yet. Headless `hrdr run` (`apps/hrdr`'s
+   session registers as it opens, under `new-<pid>`, and is renamed in place
+   when its first message mints the id (2026-10-29). While landing it,
+   `tui_pty`'s
+   `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
+   timed out five times (three full workspace runs, two runs of that binary
+   built with `--workspace`) waiting for an untouched TUI's provisional
+   registration: discovery listed nothing for it, live or unreachable, and the
+   output stream held no start-failure notice. It then passed ten whole-binary
+   runs in a row (seven with a temporary debug log, three without) and the next
+   full workspace run. Not explained. A temporary log showed provisional starts
+   staying in flight across dozens of loop wakes while every pty child registers
+   at launch at once — every child now contends for the discovery directory's
+   mutation lock together, where before each registered at its first message.
+   The wait now prints discovery and the escape-stripped stream's notice when it
+   runs out, so a recurrence says whether the start failed or never finished. A
+   start that fails is not retried until the session's id changes, so a
+   transient failure leaves an untouched session unlisted until its first
+   message. Only the main agent gets the tools — sub-agents cannot message
+   peers, so no child identity is issued yet. Headless `hrdr run` (`apps/hrdr`'s
    `headless_messaging`) registers as `run-<pid>` during its prompt's turn,
    closes admission when that turn ends, and runs the accepted messages as
    further turns; `tests/headless_messaging.rs` covers it across real processes.

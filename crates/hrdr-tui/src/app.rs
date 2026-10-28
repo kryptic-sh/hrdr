@@ -289,14 +289,20 @@ pub(crate) enum TurnMsg {
     Done(Option<String>),
     /// A deferred update coordinator was prepared after the requesting turn ended.
     UpdatePrepared(Result<AdmittedUpdate, String>),
-    /// Session messaging started for the session id, publishing `(name, cwd)`.
+    /// Session messaging started, publishing this registration; `true` when it
+    /// is published under the provisional id of a session with none yet.
     MessagingStarted(
-        String,
-        (String, String),
+        messaging::Published,
+        bool,
         Result<Arc<hrdr_agent::messaging::Messaging>, String>,
     ),
-    /// The session id's published `(name, cwd)` was refreshed.
-    MessagingRefreshed(String, (String, String), Result<(), String>),
+    /// This runtime's registration was republished (provisional flag as above).
+    MessagingRefreshed(
+        Arc<hrdr_agent::messaging::Messaging>,
+        messaging::Published,
+        bool,
+        Result<(), String>,
+    ),
     /// A peer message arrived; the loop iteration this wakes delivers it.
     PeerReady,
     /// An off-thread session save finished: `Ok(path)` once the snapshot is
@@ -3675,11 +3681,11 @@ impl App {
                     self.drain_pending_compaction();
                 }
             }
-            TurnMsg::MessagingStarted(id, published, result) => {
-                self.on_messaging_started(id, published, result);
+            TurnMsg::MessagingStarted(published, provisional, result) => {
+                self.on_messaging_started(published, provisional, result);
             }
-            TurnMsg::MessagingRefreshed(id, published, result) => {
-                self.on_messaging_refreshed(id, published, result);
+            TurnMsg::MessagingRefreshed(runtime, published, provisional, result) => {
+                self.on_messaging_refreshed(runtime, published, provisional, result);
             }
             TurnMsg::PeerReady => {}
             TurnMsg::UpdatePrepared(result) => {

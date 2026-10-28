@@ -1237,14 +1237,46 @@ fn a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages(
         }
     };
 
+    // A session is published as it opens, under a provisional `new-<pid>` id,
+    // and renamed in place when its first message gives it one of its own.
+    let own = |session: &SessionDescriptor| !session.session_id.starts_with("new-");
     s.wait_for("mock-model", BOOT);
+    let start = Instant::now();
+    while !published(&peer).iter().any(|session| !own(session)) {
+        // A start that failed says so on screen, and is not retried until the
+        // session gets an id: show it, and what discovery saw, rather than only
+        // that the wait ran out.
+        if start.elapsed() >= EXIT {
+            // A failed start reports through a toast, which can be gone from the
+            // final screen; the raw stream still holds it.
+            // ConPTY rewrites only changed cells, so the words of a redrawn
+            // line can arrive apart: search the escape-stripped stream for the
+            // distinctive word rather than the whole phrase.
+            let text = visible(&grab(&s.screen));
+            let notice = text.find("unavailable").map(|at| {
+                let mut from = at.saturating_sub(120);
+                while !text.is_char_boundary(from) {
+                    from -= 1;
+                }
+                text[from..].chars().take(400).collect::<String>()
+            });
+            panic!(
+                "the untouched session was never published provisionally; discovery saw \
+                 {:?}\nmessaging notice in the stream: {notice:?}\nscreen:\n{}",
+                rt.block_on(peer.discover_detailed())
+                    .map(|found| (found.live, found.unreachable)),
+                s.snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     s.send("first\r");
     s.wait_for("FIRST_SESSION_REPLY", EXIT);
     let mut first = None;
     poll(
-        "the first session to be published",
+        "the first session to be published under its own id",
         Box::new(|| {
-            first = published(&peer).pop();
+            first = published(&peer).into_iter().find(own);
             first.is_some()
         }),
     );
@@ -1267,7 +1299,7 @@ fn a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages(
         Box::new(|| {
             second = published(&peer)
                 .into_iter()
-                .find(|session| session.session_id != first.session_id);
+                .find(|session| own(session) && session.session_id != first.session_id);
             second.is_some()
         }),
     );

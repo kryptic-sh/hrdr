@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 /// session has an id, and between a session switch and the next start.
 pub(crate) type MessagingView = tokio::sync::watch::Receiver<Option<Arc<Messaging>>>;
 
-/// How long a tool waits for a start in flight. A brand-new session gets its id
-/// as its first turn starts, so the model's first reply can race the start.
+/// How long a tool waits for a start in flight. Messaging starts as the app
+/// opens, so a model reply in the session's first moments can race the start.
 const START_WAIT: Duration = Duration::from_secs(5);
 
 async fn running(view: &MessagingView) -> Result<Arc<Messaging>> {
@@ -31,8 +31,8 @@ async fn running(view: &MessagingView) -> Result<Arc<Messaging>> {
     match tokio::time::timeout(START_WAIT, view.wait_for(Option::is_some)).await {
         Ok(Ok(runtime)) => Ok(runtime.clone().expect("waited for a runtime")),
         _ => Err(anyhow!(
-            "session messaging is not running for this session; it starts once the \
-             session has been saved (after its first message)"
+            "session messaging is not running for this session: it is disabled \
+             (`session_messaging`), or it failed to start and said why"
         )),
     }
 }

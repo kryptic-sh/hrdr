@@ -999,9 +999,12 @@ to your OS user, and each sender is authenticated by the operating system. A
 message from another session reaches the agent marked as a peer message, never
 as something you typed. It wakes an idle agent, and a busy agent takes the next
 one after it has read the last. Messages wait in a bounded inbox, and a session
-that exits before delivering some reports how many were dropped. The
-registration follows the session: it is renamed with the session and moves when
-you switch sessions.
+that exits before delivering some reports how many were dropped. A session
+registers as it opens, under `new-<pid>` until its first message gives it an id,
+so a session nobody has typed into yet can already be found and messaged. The
+registration follows the session: it takes the session's id and name as they
+arrive, keeping anything waiting in its inbox, and moves when you switch
+sessions.
 
 The agent reaches other sessions through two tools. `sessions` lists them by
 session id, name and working directory, and `message_session` sends one a

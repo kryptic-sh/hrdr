@@ -57,6 +57,7 @@ struct Shared {
     worker_exit: Mutex<Option<Arc<tests::WorkerExit>>>,
 }
 struct Refresh {
+    session_id: String,
     name: String,
     cwd: String,
     reply: oneshot::Sender<io::Result<()>>,
@@ -133,10 +134,19 @@ impl Messaging {
         self.shared.state.lock().unwrap().descriptor.clone()
     }
 
-    pub async fn refresh(&self, name: String, cwd: String) -> io::Result<()> {
+    /// Republish this session under a new id, name and working directory. The
+    /// endpoint, and with it the inbox, stays: a frontend renames a registration
+    /// when its session gets an id, and rotates it (a new [`Self::start`]) only
+    /// when the conversation itself is replaced.
+    pub async fn refresh(&self, session_id: String, name: String, cwd: String) -> io::Result<()> {
         let (reply, result) = oneshot::channel();
         self.refresh
-            .send(Refresh { name, cwd, reply })
+            .send(Refresh {
+                session_id,
+                name,
+                cwd,
+                reply,
+            })
             .await
             .map_err(|_| closed())?;
         result.await.map_err(|_| closed())?
@@ -320,6 +330,7 @@ async fn serve(
             _ = &mut stopping => break,
             Some(command) = commands.recv() => {
                 let mut descriptor = shared.state.lock().unwrap().descriptor.clone();
+                descriptor.session_id = command.session_id;
                 descriptor.session_name = command.name;
                 descriptor.working_directory = command.cwd;
                 let result = retry(|| registration.refresh(&listener, descriptor.clone())).await;

@@ -9,13 +9,30 @@
 use super::messaging_tools::{MessageSessionTool, SessionsTool};
 use super::*;
 
+/// What a registration publishes: the session id peers address, and the name
+/// and working directory they are shown.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) cwd: String,
+}
+
 /// A started runtime and the registration it currently publishes.
 pub(crate) struct ActiveMessaging {
     runtime: Arc<hrdr_agent::messaging::Messaging>,
-    session_id: String,
-    /// The `(name, cwd)` last published, or last attempted if that failed.
-    published: (String, String),
+    /// What was last published, or last attempted if that failed.
+    published: Published,
+    /// Published under [`provisional_session_id`], before the session had an id.
+    provisional: bool,
     refreshing: bool,
+}
+
+/// The id a session is published under before it has one of its own. A session
+/// is named, and its id minted, from its first message; until then it is still
+/// a running session other sessions can find and message.
+pub(crate) fn provisional_session_id() -> String {
+    format!("new-{}", std::process::id())
 }
 
 /// The messaging lifecycle for the session's main agent.
@@ -95,30 +112,43 @@ impl MessagingState {
 }
 
 impl App {
-    /// Bring the published registration in line with the session: start it once
-    /// the session has an id, rotate it when the session is replaced, and refresh
-    /// the name and working directory peers see when either changes.
+    /// What this session should be published as now, and whether that id is
+    /// the provisional one.
+    fn wanted_registration(&self) -> (Published, bool) {
+        let (id, provisional) = match self.state().id.clone() {
+            Some(id) => (id, false),
+            None => (provisional_session_id(), true),
+        };
+        let published = Published {
+            name: published_name(&self.state().name, &id),
+            cwd: self.dir_cwd.display().to_string(),
+            id,
+        };
+        (published, provisional)
+    }
+
+    /// Bring the published registration in line with the session: start it as
+    /// the app opens, rotate it when the session is replaced, and refresh the id,
+    /// name and working directory peers see when any of them changes.
+    ///
+    /// A session with no id yet is published under [`provisional_session_id`].
+    /// When its first message mints the real id, the same registration is
+    /// renamed rather than rotated: it is the same conversation, so the endpoint
+    /// and any message already waiting in its inbox carry over.
     pub(crate) fn sync_messaging(&mut self) {
         if !self.messaging.enabled {
             return;
         }
-        let id = self.state().id.clone();
+        let (wanted, provisional) = self.wanted_registration();
         if self
             .messaging
             .active
             .as_ref()
-            .is_some_and(|active| Some(&active.session_id) != id.as_ref())
+            .is_some_and(|active| !active.provisional && active.published.id != wanted.id)
         {
             let previous = self.messaging.take_active().expect("checked above");
             self.close_messaging(previous);
         }
-        let Some(id) = id else {
-            return;
-        };
-        let wanted = (
-            published_name(&self.state().name, &id),
-            self.dir_cwd.display().to_string(),
-        );
         if let Some(active) = self.messaging.active.as_mut() {
             if active.refreshing || active.published == wanted {
                 return;
@@ -127,34 +157,35 @@ impl App {
             let runtime = active.runtime.clone();
             let tx = self.tx.clone();
             tokio::spawn(async move {
-                let (name, cwd) = wanted.clone();
-                let result = runtime.refresh(name, cwd).await;
+                let Published { id, name, cwd } = wanted.clone();
+                let result = runtime.refresh(id, name, cwd).await;
                 let _ = tx
                     .send(TurnMsg::MessagingRefreshed(
-                        id,
+                        runtime,
                         wanted,
+                        provisional,
                         result.map_err(|error| error.to_string()),
                     ))
                     .await;
             });
             return;
         }
-        if self.messaging.starting.is_some() || self.messaging.failed.as_ref() == Some(&id) {
+        if self.messaging.starting.is_some() || self.messaging.failed.as_ref() == Some(&wanted.id) {
             return;
         }
-        self.messaging.starting = Some(id.clone());
+        self.messaging.starting = Some(wanted.id.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let (name, cwd) = wanted.clone();
+            let Published { id, name, cwd } = wanted.clone();
             let result = async {
                 let directory = hrdr_tools::local_ipc::UserDirectory::open()?;
-                hrdr_agent::messaging::Messaging::start(directory, id.clone(), name, cwd).await
+                hrdr_agent::messaging::Messaging::start(directory, id, name, cwd).await
             }
             .await;
             let _ = tx
                 .send(TurnMsg::MessagingStarted(
-                    id,
                     wanted,
+                    provisional,
                     result.map(Arc::new).map_err(|error| error.to_string()),
                 ))
                 .await;
@@ -163,25 +194,27 @@ impl App {
 
     pub(crate) fn on_messaging_started(
         &mut self,
-        id: String,
-        published: (String, String),
+        published: Published,
+        provisional: bool,
         result: Result<Arc<hrdr_agent::messaging::Messaging>, String>,
     ) {
-        if self.messaging.starting.as_ref() == Some(&id) {
+        if self.messaging.starting.as_ref() == Some(&published.id) {
             self.messaging.starting = None;
         }
         match result {
             Ok(runtime) => {
                 let active = ActiveMessaging {
                     runtime,
-                    session_id: id,
                     published,
+                    provisional,
                     refreshing: false,
                 };
-                // The session moved on while the start was in flight.
-                if self.state().id.as_ref() != Some(&active.session_id)
-                    || self.messaging.active.is_some()
-                {
+                // The session moved on while the start was in flight. A
+                // provisional start that the session's new id overtook is kept:
+                // the next sync renames it.
+                let moved_on =
+                    !provisional && self.state().id.as_ref() != Some(&active.published.id);
+                if moved_on || self.messaging.active.is_some() {
                     self.close_messaging(active);
                 } else {
                     self.forward_arrivals(active.runtime.clone());
@@ -189,7 +222,7 @@ impl App {
                 }
             }
             Err(error) => {
-                self.messaging.failed = Some(id);
+                self.messaging.failed = Some(published.id);
                 self.system(format!("session messaging unavailable: {error}"));
             }
         }
@@ -197,21 +230,26 @@ impl App {
 
     pub(crate) fn on_messaging_refreshed(
         &mut self,
-        id: String,
-        published: (String, String),
+        runtime: Arc<hrdr_agent::messaging::Messaging>,
+        published: Published,
+        provisional: bool,
         result: Result<(), String>,
     ) {
         let Some(active) = self
             .messaging
             .active
             .as_mut()
-            .filter(|active| active.session_id == id)
+            .filter(|active| Arc::ptr_eq(&active.runtime, &runtime))
         else {
             return;
         };
         active.refreshing = false;
         // Recorded even on failure, so a value the registry refuses is reported
-        // once rather than retried on every frame.
+        // once rather than retried on every frame. A rename the registry refused
+        // leaves the registration under its old id, so it stays provisional.
+        if result.is_ok() {
+            active.provisional = provisional;
+        }
         active.published = published;
         if let Err(error) = result {
             self.system(format!(
@@ -287,6 +325,12 @@ impl App {
         let Some(steer) = active.runtime.dequeue() else {
             return;
         };
+        if !running {
+            // A message can now wake a session nobody has typed into yet. Claim its
+            // id before the turn, as a typed first message does, so a sub-agent the
+            // turn spawns has its transcript directory.
+            self.reserve_session_id(&steer.sent);
+        }
         self.registry.enqueue(hrdr_agent::MAIN_KEY, steer);
         if !running {
             self.launch_turn();

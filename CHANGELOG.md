@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **A new session can be messaged before its first message.** A session
+  registered for session messaging only once its first message minted its id, so
+  an hrdr nobody had typed into yet was invisible to every other session. It now
+  registers as it opens, under `new-<pid>`, and is renamed in place when its
+  first message names it — the same endpoint, with any message already waiting
+  kept. A peer message that wakes such a session claims its id before the turn,
+  as a typed message does. `Messaging::refresh` now takes the session id too
+  (`crates/hrdr-agent`, `crates/hrdr-tui`).
+
 ### Fixed
 
 - **Five dependency advisories closed.** `rustls-webpki` 0.103.16 refuses the

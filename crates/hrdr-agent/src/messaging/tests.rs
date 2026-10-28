@@ -251,7 +251,10 @@ async fn native_refresh_close_and_new_generation() {
     let a = runtime(root.path(), "a", "/one").await;
     let b = runtime(root.path(), "b", "/two").await;
     let old = b.descriptor();
-    b.refresh("renamed".into(), "/three".into()).await.unwrap();
+    b.refresh("b-saved".into(), "renamed".into(), "/three".into())
+        .await
+        .unwrap();
+    assert_eq!(b.descriptor().session_id, "b-saved");
     assert_eq!(b.descriptor().endpoint, old.endpoint);
     assert!(a.discover().await.unwrap().contains(&b.descriptor()));
     assert_eq!(
@@ -261,8 +264,15 @@ async fn native_refresh_close_and_new_generation() {
     let peer = a.dequeue().unwrap().peer.unwrap();
     assert_eq!(peer.session_name, "renamed");
     assert_eq!(peer.cwd, "/three");
+    // The rename keeps the endpoint but not the old id: an address naming it is
+    // told the session changed, and the renamed one is accepted.
     assert_eq!(
-        a.send(&old, "pending".into()).await.unwrap(),
+        a.send(&old, "stale".into()).await.unwrap(),
+        SendStatus::SessionChanged
+    );
+    let renamed = b.descriptor();
+    assert_eq!(
+        a.send(&renamed, "pending".into()).await.unwrap(),
         SendStatus::Accepted
     );
     assert_eq!(b.close().await, 1);
