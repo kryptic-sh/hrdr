@@ -144,6 +144,8 @@ only the list. Delete a line when its question is answered.
   of the unix-only guard tests (_Windows support review → Coverage gaps_); a CI
   retry for the pty peer-messaging flake until it is explained (_Session
   coordination, queue item 1_).
+- **Added 2026-10-29:** whether sub-agents should message other sessions, or
+  only each session's main agent (_Session coordination, queue item 1_).
 - **Should a blocking hook that cannot run fail closed?** A `pre_tool` or
   `user_prompt` hook that times out, cannot spawn or crashes only adds a note,
   so the call or message it guards goes ahead. _Known behaviour to revisit._
@@ -233,13 +235,17 @@ push each verified slice to `main` before proceeding to the next slice.
    backing off from `START_RETRY_DELAY`
    (`a_failed_start_is_retried_and_announced_once`). Only the main agent gets
    the tools — sub-agents cannot message peers, so no child identity is issued
-   yet. Headless `hrdr run` (`apps/hrdr`'s `headless_messaging`) registers as
-   `run-<pid>` during its prompt's turn, closes admission when that turn ends,
-   and runs the accepted messages as further turns;
-   `tests/headless_messaging.rs` covers it across real processes. One full-suite
-   run saw the peer's `Messaging::start` fail with `WouldBlock`: the directory
-   mutation lock is held across an fsync in `MutationGuard`, and the retry
-   budget was the 2s wire deadline. Directory operations now retry for
+   yet. **[Deferred — question for the owner; see the index at the top]**
+   **Question:** should sub-agents message other sessions too (each would need
+   its own identity on the wire — `PeerIdentity.agent` is always `"main"` today
+   — and a peer's reply would have to reach that sub-agent, not the main agent),
+   or is the session the unit that talks? Headless `hrdr run` (`apps/hrdr`'s
+   `headless_messaging`) registers as `run-<pid>` during its prompt's turn,
+   closes admission when that turn ends, and runs the accepted messages as
+   further turns; `tests/headless_messaging.rs` covers it across real processes.
+   One full-suite run saw the peer's `Messaging::start` fail with `WouldBlock`:
+   the directory mutation lock is held across an fsync in `MutationGuard`, and
+   the retry budget was the 2s wire deadline. Directory operations now retry for
    `DIRECTORY_DEADLINE`; one later full run passed, which does not prove the
    flake is gone. That fix left both ends of a message exchange on the 2s wire
    deadline while the receiver's sender check could wait out the full directory
