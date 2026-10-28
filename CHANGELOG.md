@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Five dependency advisories closed.** `rustls-webpki` 0.103.16 refuses the
+  distrusted intermediates RUSTSEC-2026-0382 names, and `webpki-root-certs`
+  1.0.11 drops the distrusted emSign roots (RUSTSEC-2026-0383) — both on every
+  HTTPS request hrdr makes. `zstd` 0.14.3 and `zstd-safe` 8.2.0 fix stream data
+  leaking across a reused context and an out-of-bounds `Vec` length
+  (RUSTSEC-2026-0391, RUSTSEC-2026-0398); hrdr compresses idle session files
+  with it. `pulldown-cmark` 0.13.5 fixes exponential wikilink event growth
+  (RUSTSEC-2026-0414) in the markdown renderer (`Cargo.lock`).
+
 ## [0.18.0] - 2026-10-20
 
 ### Breaking
