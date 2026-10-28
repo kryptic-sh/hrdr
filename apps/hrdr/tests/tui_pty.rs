@@ -1179,6 +1179,126 @@ fn a_live_tui_messages_a_peer_and_is_woken_by_its_reply() -> Result<(), String> 
     Ok(())
 }
 
+/// 12c. Two live TUIs — two real hrdr processes. One that nobody has typed into
+///      yet is found and messaged by the other's model, and is woken with the
+///      message, marked as coming from the sender's session rather than a human.
+#[test]
+fn two_live_tuis_message_each_other() -> Result<(), String> {
+    use hrdr_agent::messaging::Messaging;
+    use hrdr_tools::local_ipc::UserDirectory;
+
+    if skip_for_want_of_a_pty() {
+        return Ok(());
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    // Only looks: it finds the receiver by its project directory, and sends
+    // nothing — the message goes from one hrdr to the other.
+    let observer = rt
+        .block_on(Messaging::start(
+            UserDirectory::open().unwrap(),
+            format!("pty-observer-{}", std::process::id()),
+            "pty observer".into(),
+            "/pty-observer".into(),
+        ))
+        .unwrap();
+    let text = |id: &str, reply: &str| {
+        Chat::Sse(vec![
+            text_chunk(id, reply),
+            stop_chunk(id),
+            "[DONE]".to_string(),
+        ])
+    };
+    let place = |s: &Session| {
+        s._project
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    let receiver_server = MockServer::start(vec![text("b1", "RECEIVER_WOKEN")]);
+    let mut receiver = Session::spawn(&receiver_server.base_url());
+    receiver.wait_for("mock-model", BOOT);
+    let receiver_place = place(&receiver);
+    let start = Instant::now();
+    let target = loop {
+        if let Some(target) = rt
+            .block_on(observer.discover())
+            .unwrap()
+            .into_iter()
+            .find(|session| session.working_directory.contains(&receiver_place))
+        {
+            break target;
+        }
+        assert!(
+            start.elapsed() < EXIT,
+            "the untouched receiver was never published. Screen:\n{}",
+            receiver.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        target.session_id.starts_with("new-"),
+        "an untouched session is published under its provisional id: {target:?}"
+    );
+
+    let send_args = serde_json::json!({
+        "session_id": target.session_id,
+        "cwd": target.working_directory,
+        "message": "HELLO_FROM_THE_OTHER_TUI",
+    })
+    .to_string();
+    let sender_server = MockServer::start(vec![
+        Chat::Sse(vec![
+            tool_start_chunk("a1", "call-a1", "message_session"),
+            tool_args_chunk("a1", &send_args),
+            tool_calls_stop_chunk("a1"),
+            "[DONE]".to_string(),
+        ]),
+        text("a2", "SENDER_DONE"),
+    ]);
+    let mut sender = Session::spawn(&sender_server.base_url());
+    sender.wait_for("mock-model", BOOT);
+    sender.send("say hello to the other session\r");
+    sender.wait_for("SENDER_DONE", EXIT);
+    let answered = sender_server.chat_bodies()[1].to_string();
+    assert!(
+        answered.contains("accepted"),
+        "message_session answered: {answered}"
+    );
+
+    // The receiver's first model request is the wake, carrying the message.
+    let start = Instant::now();
+    while receiver_server.chat_bodies().is_empty() {
+        assert!(
+            start.elapsed() < EXIT,
+            "the message never woke the receiver. Screen:\n{}",
+            receiver.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let woke = receiver_server.chat_bodies()[0].to_string();
+    assert!(woke.contains("HELLO_FROM_THE_OTHER_TUI"), "{woke}");
+    assert!(woke.contains("not human input"), "{woke}");
+    assert!(
+        woke.contains(&place(&sender)),
+        "the sender is named by its own session: {woke}"
+    );
+
+    receiver.wait_for("RECEIVER_WOKEN", EXIT);
+    for session in [&mut sender, &mut receiver] {
+        session.send("\x11");
+        assert!(session.wait_exit(EXIT).success(), "clean exit");
+    }
+    rt.block_on(observer.close());
+    Ok(())
+}
+
 /// 12b. A live TUI that starts a new session stops publishing the old one and
 ///      publishes the new one under a fresh id; quitting it while a turn runs
 ///      reports the peer messages it never delivered — the one queued behind

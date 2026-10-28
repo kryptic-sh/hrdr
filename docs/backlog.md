@@ -229,26 +229,13 @@ push each verified slice to `main` before proceeding to the next slice.
    Discovery now probes at most `PROBE_CONCURRENCY` candidates at once and skips
    a candidate whose probe fails instead of failing the whole scan. A brand-new
    session registers as it opens, under `new-<pid>`, and is renamed in place
-   when its first message mints the id (2026-10-29). While landing it,
-   `tui_pty`'s
-   `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
-   timed out five times (three full workspace runs, two runs of that binary
-   built with `--workspace`) waiting for an untouched TUI's provisional
-   registration: discovery listed nothing for it, live or unreachable, and the
-   output stream held no start-failure notice. It then passed ten whole-binary
-   runs in a row (seven with a temporary debug log, three without) and the next
-   full workspace run. Not explained. A temporary log showed provisional starts
-   staying in flight across dozens of loop wakes while every pty child registers
-   at launch at once — every child now contends for the discovery directory's
-   mutation lock together, where before each registered at its first message.
-   The wait now prints discovery and the escape-stripped stream's notice when it
-   runs out, so a recurrence says whether the start failed or never finished. A
-   failed start is retried, backing off from `START_RETRY_DELAY`, since
-   2026-10-29 (`a_failed_start_is_retried_and_announced_once`). Only the main
-   agent gets the tools — sub-agents cannot message peers, so no child identity
-   is issued yet. Headless `hrdr run` (`apps/hrdr`'s `headless_messaging`)
-   registers as `run-<pid>` during its prompt's turn, closes admission when that
-   turn ends, and runs the accepted messages as further turns;
+   when its first message mints the id (2026-10-29). A failed start is retried,
+   backing off from `START_RETRY_DELAY`
+   (`a_failed_start_is_retried_and_announced_once`). Only the main agent gets
+   the tools — sub-agents cannot message peers, so no child identity is issued
+   yet. Headless `hrdr run` (`apps/hrdr`'s `headless_messaging`) registers as
+   `run-<pid>` during its prompt's turn, closes admission when that turn ends,
+   and runs the accepted messages as further turns;
    `tests/headless_messaging.rs` covers it across real processes. One full-suite
    run saw the peer's `Messaging::start` fail with `WouldBlock`: the directory
    mutation lock is held across an fsync in `MutationGuard`, and the retry
@@ -363,8 +350,11 @@ push each verified slice to `main` before proceeding to the next slice.
    language server is not available"; all four passed alone and in the next full
    run. Real-process coverage: `tests/tui_pty.rs`
    (`a_live_tui_messages_a_peer_and_is_woken_by_its_reply`: tools, peer wake,
-   shutdown leaves discovery) and `tests/headless_messaging.rs` (busy delivery,
-   disabling), on the CI matrix; verified locally on Windows only so far.
+   shutdown leaves discovery; `two_live_tuis_message_each_other`: one real hrdr
+   TUI messages another that nobody has typed into, which is woken with it — the
+   only test with hrdr on both ends) and `tests/headless_messaging.rs` (busy
+   delivery, disabling), on the CI matrix; verified locally on Windows only so
+   far.
    `a_switched_tui_session_republishes_and_its_exit_reports_undelivered_messages`
    covers `/new` rotation and the exit report across processes. Still
    unexercised across processes: access-control denial for a foreign OS user.
@@ -2928,6 +2918,15 @@ Promoted here when the effort that taught them was deleted:
   with two silent `return`s, so a run that exercised nothing was
   indistinguishable from one that passed. Any test gated on a prerequisite must
   assert where that prerequisite is guaranteed.
+- **A `-p hrdr` build and a `--workspace` build write the same
+  `target/debug/hrdr.exe`, and the pty tests launch whichever wrote it last.** A
+  workspace build cargo thinks is fresh does not copy its binary back, so after
+  a mutation check run with `cargo test -p hrdr` and a restore, the next
+  `cargo test --workspace` silently runs the MUTATED hrdr. On 2026-10-29 that
+  made three pty messaging tests fail run after run, which read as an
+  intermittent messaging bug until a forced relink made every one of them pass.
+  Mutation-check the pty tests with the same `--workspace` flag the gate uses,
+  or `touch apps/hrdr/src/main.rs` after restoring.
 - **`current_exe()` is the test binary inside a unit test.** A backend that
   re-execs hrdr therefore re-executes libtest and wedges the run; anything
   exercising the real wrapper belongs in `apps/hrdr/tests/`, where
