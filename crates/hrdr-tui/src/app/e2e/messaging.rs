@@ -148,6 +148,51 @@ async fn a_new_session_can_be_messaged_before_its_first_message() {
     sender.close().await;
 }
 
+/// A start that fails is retried, not given up: an unpublished session cannot
+/// be found, so one transient failure must not leave it unlisted. The failure
+/// is announced once, and the retry wakes an idle loop on its own.
+#[tokio::test]
+async fn a_failed_start_is_retried_and_announced_once() {
+    let _data_home = isolated_data_home();
+    let mut h = Harness::new(vec![]).await;
+    h.app.messaging.fail_next_starts = 2;
+    h.app
+        .messaging
+        .set_first_retry_delay(std::time::Duration::from_millis(50));
+    // The bus folds a repeated toast into one entry and counts the repeats, so
+    // the deliveries are the sum of those counts.
+    let failure_notices = |h: &Harness| {
+        h.app
+            .toasts
+            .history()
+            .filter(|toast| toast.body.contains("session messaging unavailable"))
+            .map(|toast| toast.count)
+            .sum::<u32>()
+    };
+
+    for attempt in 1..=2 {
+        h.app.sync_messaging();
+        h.wait_for("a failed start", |msg| {
+            matches!(msg, TurnMsg::MessagingStarted(_, _, Err(_)))
+        })
+        .await;
+        assert!(!h.app.messaging.is_active(), "attempt {attempt} failed");
+        h.wait_for("the retry wake", |msg| {
+            matches!(msg, TurnMsg::MessagingRetry)
+        })
+        .await;
+    }
+    assert_eq!(failure_notices(&h), 1, "one notice, not one per attempt");
+
+    let provisional = started_provisional(&mut h).await;
+    let sender = peer("retry-sender").await;
+    assert!(
+        find(&sender, &provisional).await.is_some(),
+        "the retried start published the session"
+    );
+    sender.close().await;
+}
+
 /// The first message names the session, and its registration is renamed in
 /// place: the same endpoint, now under the session's id, with what a peer sent
 /// before the rename still waiting in the inbox.

@@ -243,16 +243,16 @@ push each verified slice to `main` before proceeding to the next slice.
    mutation lock together, where before each registered at its first message.
    The wait now prints discovery and the escape-stripped stream's notice when it
    runs out, so a recurrence says whether the start failed or never finished. A
-   start that fails is not retried until the session's id changes, so a
-   transient failure leaves an untouched session unlisted until its first
-   message. Only the main agent gets the tools — sub-agents cannot message
-   peers, so no child identity is issued yet. Headless `hrdr run` (`apps/hrdr`'s
-   `headless_messaging`) registers as `run-<pid>` during its prompt's turn,
-   closes admission when that turn ends, and runs the accepted messages as
-   further turns; `tests/headless_messaging.rs` covers it across real processes.
-   One full-suite run saw the peer's `Messaging::start` fail with `WouldBlock`:
-   the directory mutation lock is held across an fsync in `MutationGuard`, and
-   the retry budget was the 2s wire deadline. Directory operations now retry for
+   failed start is retried, backing off from `START_RETRY_DELAY`, since
+   2026-10-29 (`a_failed_start_is_retried_and_announced_once`). Only the main
+   agent gets the tools — sub-agents cannot message peers, so no child identity
+   is issued yet. Headless `hrdr run` (`apps/hrdr`'s `headless_messaging`)
+   registers as `run-<pid>` during its prompt's turn, closes admission when that
+   turn ends, and runs the accepted messages as further turns;
+   `tests/headless_messaging.rs` covers it across real processes. One full-suite
+   run saw the peer's `Messaging::start` fail with `WouldBlock`: the directory
+   mutation lock is held across an fsync in `MutationGuard`, and the retry
+   budget was the 2s wire deadline. Directory operations now retry for
    `DIRECTORY_DEADLINE`; one later full run passed, which does not prove the
    flake is gone. That fix left both ends of a message exchange on the 2s wire
    deadline while the receiver's sender check could wait out the full directory

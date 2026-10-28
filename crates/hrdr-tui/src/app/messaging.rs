@@ -35,6 +35,20 @@ pub(crate) fn provisional_session_id() -> String {
     format!("new-{}", std::process::id())
 }
 
+/// How long after a failed start the first retry waits. Each further failure
+/// for the same id doubles it, up to [`MAX_START_RETRY_DELAY`].
+const START_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// The longest wait between retries of a start that keeps failing.
+const MAX_START_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A start that failed, and when to try that id again.
+struct FailedStart {
+    id: String,
+    retry_at: std::time::Instant,
+    /// The wait that produced `retry_at`; the next failure doubles it.
+    delay: std::time::Duration,
+}
+
 /// The messaging lifecycle for the session's main agent.
 pub(crate) struct MessagingState {
     enabled: bool,
@@ -43,8 +57,14 @@ pub(crate) struct MessagingState {
     slot: tokio::sync::watch::Sender<Option<Arc<hrdr_agent::messaging::Messaging>>>,
     /// The session id a start is in flight for.
     starting: Option<String>,
-    /// The session id whose start failed; not retried until the session changes.
-    failed: Option<String>,
+    /// The last start that failed. A session that is not published cannot be
+    /// found, so the start is retried, backing off, rather than given up.
+    failed: Option<FailedStart>,
+    /// The wait before the first retry; a test shortens it.
+    first_retry_delay: std::time::Duration,
+    /// Starts to fail before trying, so a test can drive the retry.
+    #[cfg(test)]
+    pub(crate) fail_next_starts: usize,
     /// Peer messages dropped by the closing runtime at exit, reported once the
     /// terminal is restored.
     pub(crate) undelivered_on_exit: usize,
@@ -58,6 +78,9 @@ impl MessagingState {
             slot: tokio::sync::watch::Sender::new(None),
             starting: None,
             failed: None,
+            first_retry_delay: START_RETRY_DELAY,
+            #[cfg(test)]
+            fail_next_starts: 0,
             undelivered_on_exit: 0,
         }
     }
@@ -96,6 +119,11 @@ impl MessagingState {
     #[cfg(test)]
     pub(crate) fn is_starting(&self) -> bool {
         self.starting.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_first_retry_delay(&mut self, delay: std::time::Duration) {
+        self.first_retry_delay = delay;
     }
 
     #[cfg(test)]
@@ -170,11 +198,28 @@ impl App {
             });
             return;
         }
-        if self.messaging.starting.is_some() || self.messaging.failed.as_ref() == Some(&wanted.id) {
+        let waiting_to_retry = self.messaging.failed.as_ref().is_some_and(|failed| {
+            failed.id == wanted.id && std::time::Instant::now() < failed.retry_at
+        });
+        if self.messaging.starting.is_some() || waiting_to_retry {
             return;
         }
         self.messaging.starting = Some(wanted.id.clone());
         let tx = self.tx.clone();
+        #[cfg(test)]
+        if self.messaging.fail_next_starts > 0 {
+            self.messaging.fail_next_starts -= 1;
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(TurnMsg::MessagingStarted(
+                        wanted,
+                        provisional,
+                        Err("injected start failure".to_string()),
+                    ))
+                    .await;
+            });
+            return;
+        }
         tokio::spawn(async move {
             let Published { id, name, cwd } = wanted.clone();
             let result = async {
@@ -222,8 +267,31 @@ impl App {
                 }
             }
             Err(error) => {
-                self.messaging.failed = Some(published.id);
-                self.system(format!("session messaging unavailable: {error}"));
+                // One notice per id: a retry that fails again backs off quietly.
+                let repeat = self
+                    .messaging
+                    .failed
+                    .as_ref()
+                    .filter(|failed| failed.id == published.id);
+                let delay = repeat.map_or(self.messaging.first_retry_delay, |failed| {
+                    (failed.delay * 2).min(MAX_START_RETRY_DELAY)
+                });
+                if repeat.is_none() {
+                    self.system(format!(
+                        "session messaging unavailable: {error} (retrying in the background)"
+                    ));
+                }
+                self.messaging.failed = Some(FailedStart {
+                    id: published.id,
+                    retry_at: std::time::Instant::now() + delay,
+                    delay,
+                });
+                // An idle loop does not tick: wake it when the retry is due.
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = tx.send(TurnMsg::MessagingRetry).await;
+                });
             }
         }
     }

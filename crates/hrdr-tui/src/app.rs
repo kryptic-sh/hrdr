@@ -305,6 +305,9 @@ pub(crate) enum TurnMsg {
     ),
     /// A peer message arrived; the loop iteration this wakes delivers it.
     PeerReady,
+    /// A failed messaging start is due a retry; the loop iteration this wakes
+    /// makes it.
+    MessagingRetry,
     /// An off-thread session save finished: `Ok(path)` once the snapshot is
     /// atomically on disk, or the error. Sent by the save task spawned by
     /// [`App::enqueue_save`]; the coalescer's in-flight flag clears here.
@@ -3687,7 +3690,7 @@ impl App {
             TurnMsg::MessagingRefreshed(runtime, published, provisional, result) => {
                 self.on_messaging_refreshed(runtime, published, provisional, result);
             }
-            TurnMsg::PeerReady => {}
+            TurnMsg::PeerReady | TurnMsg::MessagingRetry => {}
             TurnMsg::UpdatePrepared(result) => {
                 self.update_preparing = false;
                 match result {

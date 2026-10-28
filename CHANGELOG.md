@@ -14,7 +14,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   registers as it opens, under `new-<pid>`, and is renamed in place when its
   first message names it — the same endpoint, with any message already waiting
   kept. A peer message that wakes such a session claims its id before the turn,
-  as a typed message does. `Messaging::refresh` now takes the session id too
+  as a typed message does. A start that fails is retried in the background,
+  backing off, instead of leaving the session unlisted until its id changed; the
+  failure is announced once. `Messaging::refresh` now takes the session id too
   (`crates/hrdr-agent`, `crates/hrdr-tui`).
 
 ### Fixed
