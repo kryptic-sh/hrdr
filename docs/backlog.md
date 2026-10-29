@@ -3357,21 +3357,22 @@ AGENTS.md/commands and is re-asserted on `set_cwd`; attachment-store digest +
 length verification and 64-hex-only sweep; `Retry-After` parsing (strict,
 clamped, cannot stall or panic).
 
-**Coverage:** walked in full — hrdr-agent (agents*dir, commands, skills, trust,
-attachment_store, session load/save/locks/sweep/compression, auth_store, auth,
-oauth both flows + refresh coordinator, store_lock, transcript_log, registry,
-config, resolve, provider_catalog, prompt, turn_loop, delegation, hooks,
-history), hrdr-app (config/sessions/login/util), hrdr-editor, hrdr-llm (client,
-anthropic, codex, sse, capped_read, retry, types, media, pdf, fs, catalog),
-hrdr-tools (lib, sandbox, shell, web, memory, lsp, hooks, proc, guardrails,
-gate, mcp/*, the tool implementations), hrdr-tui (render paths, trust*prompt),
-`apps/hrdr/src/main.rs`. Skimmed, not line-by-line: `chatgpt_models.rs`
-account-catalog fetch, compaction summarization internals, budget.rs, MCP client
-wiring, the TUI's `app.rs` input-handler detail and selectors,
-`apps/hrdr/tests/*`beyond the headless suite. GAP: `hrdr-agent/src/prompt.rs`
-prompt _text_ — read, not audited line-by-line. (`hrdr-app/src/login.rs`, also
-listed here, was reviewed in full 2026-10-20.)`apps/hrdr/src/main.rs` beyond the
-trust gate was not audited by chunk 1 (covered by chunk 2).
+**Coverage:** walked in full — hrdr-agent (`agents_dir`, commands, skills,
+trust, attachment_store, session load/save/locks/sweep/compression, auth_store,
+auth, oauth both flows + refresh coordinator, store_lock, transcript_log,
+registry, config, resolve, provider_catalog, prompt, turn_loop, delegation,
+hooks, history), hrdr-app (config/sessions/login/util), hrdr-editor, hrdr-llm
+(client, anthropic, codex, sse, capped_read, retry, types, media, pdf, fs,
+catalog), hrdr-tools (lib, sandbox, shell, web, memory, lsp, hooks, proc,
+guardrails, gate, mcp/*, the tool implementations), hrdr-tui (render paths,
+`trust_prompt`), `apps/hrdr/src/main.rs`. Skimmed, not line-by-line:
+`chatgpt_models.rs` account-catalog fetch, compaction summarization internals,
+budget.rs, MCP client wiring, the TUI's `app.rs` input-handler detail and
+selectors, `apps/hrdr/tests/*` beyond the headless suite. GAP:
+`hrdr-agent/src/prompt.rs` prompt _text_ — read, not audited line-by-line.
+(`hrdr-app/src/login.rs`, also listed here, was reviewed in full 2026-10-20.)
+`apps/hrdr/src/main.rs` beyond the trust gate was not audited by chunk 1
+(covered by chunk 2).
 
 ## Performance review 2026-08-14
 
@@ -3862,7 +3863,7 @@ bounded and disappear if finding 5 lands.
 
 **Deliberate tradeoff noted (revisit with a benchmark):** attachment base64 is
 re-encoded every round `hrdr-llm/src/media.rs` — already recorded in the
-2026-08-04 perf section above; unchanged.
+Performance review 2026-08-28 above; unchanged.
 
 **Coverage:** hrdr-tools — all tools traced, sandbox process/bind-mount setup
 dominated by the spawned command itself (not traced in depth); hrdr-agent —
