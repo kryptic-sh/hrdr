@@ -1059,6 +1059,13 @@ live here:
 
 - **Tracked elsewhere, not here:** the Codex catalog compatibility pin
   (`CODEX_CATALOG_COMPAT_VERSION`) is GitHub issue #2, still open there.
+- **Line-number citations left in the dated review sections, found 2026-10-30.**
+  The 2026-08-28, 2026-08-30 and 2026-09-04 reviews (and a 2026-08-06 cleared
+  note) still cite `file.rs:NNN` ranges — e.g. `media.rs`, `gate.rs`,
+  `turn_loop.rs`, `pane.rs`, `registry.rs` — against the convention above;
+  `grep -nE '\.rs:[0-9]' docs/backlog.md` lists them. Each needs re-checking
+  against the current tree before it is rewritten as a symbol name, so it is a
+  sweep, not a find-and-replace. No decision needed.
 
 ## Deferred 2026-08-05
 
